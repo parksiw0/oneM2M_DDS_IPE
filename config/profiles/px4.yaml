@@ -1,0 +1,139 @@
+# PX4 SITL drone via uXRCE-DDS Agent — v2 dialect port of config/px4.yaml (v1).
+# Migration per DESIGN §18.2 / §19.4:
+#   semantic_category/resource_alias        -> alias (robot-rooted path)
+#   representation_policy latest_only       -> representation: latest  (FCNT items
+#                                              become CNT mni=1 latest; FCNT/SDT is opt-in, §0.2.4)
+#   representation_policy historical_only   -> representation: historical
+#   message_type                            -> type pin (load-probed, §3.2)
+#   timestamp_field/timestamp_format        -> source_ts { field, format: microseconds }
+#   filter.max_interval_sec / retry_delay_sec -> *_ms
+#   qos_profile px4_default                 -> qos: px4_default (BEST_EFFORT + TRANSIENT_LOCAL,
+#                                              PX4 uXRCE-DDS offered QoS)
+schema_version: 2
+
+ipe: { instance_id: px4-ipe }
+
+cse:
+  endpoint: http://localhost:3000
+  cse_base: TinyIoT
+  ae_name: ros2-ipe
+  origin: CAdmin
+  rvi: "3"
+  poa: http://localhost:5050
+
+notification_server: { host: 0.0.0.0, port: 5050 }
+
+robots:
+  - { id: px4, namespace: "" }
+
+discovery:
+  mode: config-only             # PX4 topic set is fixed; everything pinned below
+  deny: ["/rosout", "/parameter_events", "/tf", "/tf_static"]
+  refresh_sec: 5
+
+naming: { path_style: nested, sanitize: "_" }
+
+qos_profiles:
+  px4_default: { reliability: best_effort, durability: transient_local, history: keep_last, depth: 5 }
+  cmd_default: { reliability: reliable,    durability: volatile,        history: keep_last, depth: 10 }
+
+defaults:
+  topic_observe: { qos: px4_default, stale_after_ms: 5000 }
+  topic_command:
+    access: { enabled: false, confirm: required }
+    command: { max_age_ms: 5000 }
+
+bridge:
+  topics:
+    # --- latest-state (v1 FCNT entities -> CNT mni=1 latest) ----------------
+    - name: /fmu/out/battery_status_v1
+      type: px4_msgs/msg/BatteryStatus
+      direction: observe
+      representation: latest
+      alias: battery
+      source_ts: { field: timestamp, format: microseconds }
+      flexcontainer:                # v1 FCNT 복원 — 스키마 부재 시 CNT 자동 폴백(§9.4)
+        type: "r2d:bat"
+        cnd: "org.kor.ros2.drone.moduleclass.battery"
+        field_map: { vol: voltage_v, cur: current_a, rem: remaining, cct: cell_count, tmp: temperature }
+      filter:                       # >=1% charge change, forced refresh every 10s
+        type: delta
+        fields: [remaining]
+        min_change: 0.01
+        max_interval_ms: 10000
+    - name: /fmu/out/vehicle_local_position_v1
+      type: px4_msgs/msg/VehicleLocalPosition
+      direction: observe
+      representation: latest
+      alias: position
+      source_ts: { field: timestamp, format: microseconds }
+      flexcontainer:
+        type: "r2d:lps"
+        cnd: "org.kor.ros2.drone.moduleclass.localPose"
+        field_map: { posX: x, posY: y, posZ: z, velX: vx, velY: vy, velZ: vz, hdg: heading }
+      filter:                       # >=0.5m movement, forced refresh every 5s
+        type: delta
+        fields: [x, y, z]
+        min_change: 0.5
+        max_interval_ms: 5000
+
+    # --- historical (v1 CNT sensors/events) ---------------------------------
+    - name: /fmu/out/sensor_combined
+      type: px4_msgs/msg/SensorCombined
+      direction: observe
+      representation: historical
+      alias: imu
+      source_ts: { field: timestamp, format: microseconds }
+      selected_fields: [gyro_rad, accelerometer_m_s2]
+      filter:                       # 1s time window: per-axis mean/max/std (~250 -> 1 msg/s)
+        type: window
+        mode: time
+        size: 1.0
+        aggregations: [mean, max, std]
+        fields: [gyro_rad, accelerometer_m_s2]
+    - name: /fmu/out/vehicle_attitude
+      type: px4_msgs/msg/VehicleAttitude
+      direction: observe
+      representation: historical
+      alias: attitude
+      source_ts: { field: timestamp, format: microseconds }
+      selected_fields: [q]
+      filter:                       # quaternion delta >=0.05, forced every 2s
+        type: delta
+        fields: [q]
+        min_change: 0.05
+        max_interval_ms: 2000
+    - name: /fmu/out/vehicle_status_v4
+      type: px4_msgs/msg/VehicleStatus
+      direction: observe
+      representation: historical
+      alias: flightMode
+      source_ts: { field: timestamp, format: microseconds }
+      selected_fields: [nav_state, arming_state, failure_detector_status]
+
+    # --- command (v1 command_topics) ----------------------------------------
+    - name: /ipe/test_cmd
+      type: std_msgs/msg/String
+      direction: command
+      alias: test_cmd
+      qos: cmd_default
+      access: { enabled: true, confirm: auto }
+      command: { max_age_ms: 5000 }
+
+policy:
+  suitability: { high_rate_hz: 20, large_payload_bytes: 49152, realtime_critical_deny: true }
+  confirmation: auto
+  max_total_write_hz: 200
+  qos_strictness: reject
+
+dispatch: { drain_budget: 32 }
+storage: { state_db: px4_ipe_state.db, max_spool_entries: 10000, max_spool_mb: 64 }
+logging: { level: INFO, status_severity_min: info }
+
+recovery:
+  retry_count: 3
+  retry_delay_ms: 1000            # v1 retry_delay_sec: 1.0
+  on_failure: skip
+  catch_up_sec: 0
+  reconcile_sec: 0
+  dedup_retention_days: 7

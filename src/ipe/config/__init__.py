@@ -1,12 +1,9 @@
-"""Configuration loading, validation, and runtime lookup tables."""
+"""설정 로드·검증·해석."""
 
 from ipe.config.loader import ConfigError, load_config, validate_config
-from ipe.config.lookup import LookupTables, build_lookup_tables
 
 __all__ = [
     "ConfigError",
-    "LookupTables",
-    "build_lookup_tables",
     "load_config",
     "validate_config",
 ]
