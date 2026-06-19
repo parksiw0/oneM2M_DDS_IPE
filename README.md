@@ -6,8 +6,6 @@ A generic Interworking Proxy Entity (IPE) that bridges ROS2 robots to a oneM2M C
 - **Declarative config**: yaml — not code — defines what maps to which oneM2M resource. A single pattern rule expands across N robots.
 - **Lossless & recoverable**: Every message ends in a oneM2M operation or a status event. State is recovered across restarts and CSE outages.
 
-> Detailed design and rationale live in `docs/design/DESIGN.md` (v3). This README covers installation, configuration, and operation.
-
 ---
 
 ## Overview
@@ -74,10 +72,9 @@ ipe --config config/profiles/px4.yaml
 
 ## Configuration — connecting a robot via yaml
 
-A config file begins with `schema_version: 2`. One file describes one deployment and can hold a single robot or many.
+One file describes one deployment and can hold a single robot or many.
 
 ```yaml
-schema_version: 2
 cse: { endpoint: http://localhost:3000, cse_base: TinyIoT, ae_name: ros2-ipe, origin: "${IPE_CSE_ORIGIN}", rvi: "3" }
 robots: [ ... ]          # robot list
 discovery: { ... }       # interface discovery policy
@@ -164,7 +161,6 @@ actions:
 ### Example — single robot
 
 ```yaml
-schema_version: 2
 cse: { endpoint: http://localhost:3000, cse_base: TinyIoT, ae_name: ros2-ipe, origin: "${IPE_CSE_ORIGIN}", rvi: "3" }
 robots:
   - { id: tb3, namespace: "" }
@@ -186,7 +182,6 @@ bridge:
 ### Example — multi-robot (fleet)
 
 ```yaml
-schema_version: 2
 cse: { endpoint: http://localhost:3000, cse_base: TinyIoT, ae_name: ros2-ipe, origin: "${IPE_CSE_ORIGIN}", rvi: "3" }
 robots:
   - { id: r1, namespace: /robot1 }
@@ -214,14 +209,13 @@ To add a robot, append an entry to `robots` and make sure the `allow` glob cover
 
 | Symptom | Cause / fix |
 |---|---|
-| Fails immediately at boot | `schema_version` is not `2`, or missing |
 | `must have exactly one of 'name' or 'match'` | A bridge entry must specify exactly one of `name`/`match` |
 | Missing type under config-only | `name` entries under `config-only` require a `type` pin |
 | Fails on unset env var | The value is exactly `${VAR}` but the variable isn't exported (partial interpolation unsupported) |
 | QoS preset undefined | `qos: name` is not in `qos_profiles` |
 | Path collision | Final oneM2M paths overlap — disambiguate with `path`/`alias`/`{robot}` |
 
-For the full set of config keys, allowed values, and defaults, see `docs/design/DESIGN.md`.
+For the full set of config keys, allowed values, and defaults, see the schema in `src/ipe/config/schema.py`.
 
 ---
 

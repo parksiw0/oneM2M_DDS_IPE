@@ -1,4 +1,4 @@
-"""IPE 설정 YAML(schema_version: 2)의 Cerberus 스키마 — 유효한 v2 설정의 단일 기준.
+"""IPE 설정 YAML의 Cerberus 스키마 — 유효한 설정의 단일 기준.
 
 enum 값은 UPPERCASE로 검증한다(케이스 정규화는 loader가 검증 전에 수행).
 교차 필드 규칙은 여기가 아니라 loader에 있다.
@@ -187,7 +187,6 @@ DEFAULTS_SCHEMA: dict[str, Any] = {
 }
 
 CONFIG_SCHEMA: dict[str, Any] = {
-    "schema_version": {"type": "integer", "required": True, "allowed": [2]},
     "ipe": {
         "type": "dict",
         "required": False,

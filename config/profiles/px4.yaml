@@ -1,15 +1,4 @@
-# PX4 SITL drone via uXRCE-DDS Agent — v2 dialect port of config/px4.yaml (v1).
-# Migration per DESIGN §18.2 / §19.4:
-#   semantic_category/resource_alias        -> alias (robot-rooted path)
-#   representation_policy latest_only       -> representation: latest  (FCNT items
-#                                              become CNT mni=1 latest; FCNT/SDT is opt-in, §0.2.4)
-#   representation_policy historical_only   -> representation: historical
-#   message_type                            -> type pin (load-probed, §3.2)
-#   timestamp_field/timestamp_format        -> source_ts { field, format: microseconds }
-#   filter.max_interval_sec / retry_delay_sec -> *_ms
-#   qos_profile px4_default                 -> qos: px4_default (BEST_EFFORT + TRANSIENT_LOCAL,
-#                                              PX4 uXRCE-DDS offered QoS)
-schema_version: 2
+# PX4 SITL drone via uXRCE-DDS Agent.
 
 ipe: { instance_id: px4-ipe }
 

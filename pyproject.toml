@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "ipe"
 version = "0.1.0"
 description = "ROS2 to oneM2M Interworking Proxy Entity"
-readme = {text = "ROS2-oneM2M IPE implementation. See ../DDS/IPE_PHASE0_SETUP_SUMMARY.md", content-type = "text/plain"}
+readme = "README.md"
 requires-python = ">=3.10"
 authors = [{name = "acxrn"}]
 license = {text = "Proprietary"}
@@ -59,7 +59,6 @@ module = "cerberus.*"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
 addopts = "-v --strict-markers --tb=short"
 markers = [
     "integration: requires running TinyIoT CSE",

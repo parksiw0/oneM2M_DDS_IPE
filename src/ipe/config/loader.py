@@ -3,7 +3,7 @@
 `load_config`는 검증·케이스 정규화·env 치환이 끝난 설정 dict를 돌려준다.
 런타임 스펙 변환은 resolver 몫 — 로드 후 `resolve(config, discovered)`를 부른다.
 
-검증 파이프라인은 순서가 중요하다: schema_version 즉시 실패 → env 치환(B2) →
+검증 파이프라인은 순서가 중요하다: env 치환(B2) →
 QoS enum 케이스 정규화 → Cerberus 구조 검증+기본값(B7) → 의미론적 교차
 검사(DESIGN §18.4) → 타입 로드 프로브(§3.2, rosidl import 가능할 때만).
 """
@@ -51,14 +51,6 @@ def load_config(path: str | Path, env: Mapping[str, str] | None = None) -> dict[
 
 
 def validate_config(raw: dict[str, Any], env: Mapping[str, str] | None = None) -> dict[str, Any]:
-    sv = raw.get("schema_version")
-    if sv != 2:
-        raise ConfigError(
-            f"Unsupported or missing schema_version: {sv!r}. This loader requires "
-            f"`schema_version: 2`. Legacy (v1) configs must be migrated — see "
-            f"docs/design/DESIGN.md §18.2 for the v1->v2 value map."
-        )
-
     cfg = copy.deepcopy(raw)
     cfg = _substitute_env(cfg, os.environ if env is None else env)
     _normalize_qos_case(cfg)
