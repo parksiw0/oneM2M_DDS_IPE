@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 from ipe.config.loader import ConfigError, load_config
-from ipe.config.lookup import build_lookup_tables
-from ipe.ir import TopicIR
+from ipe.config.resolver import ResolveError, resolve
+from ipe.config.spec import QoSSpec, ResolvedConfig
 
 
 def setup_logging(level: str) -> None:
@@ -18,37 +18,60 @@ def setup_logging(level: str) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        prog="ipe",
-        description="ROS2 to oneM2M Interworking Proxy Entity",
-    )
-    parser.add_argument("--config", "-c", type=Path, required=True)
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Validate config and print mapping summary; do not start IPE",
-    )
-    parser.add_argument(
-        "--discover",
-        action="store_true",
-        help="Print discovered ROS2 topics and exit",
-    )
-    parser.add_argument(
-        "--bootstrap-only",
-        action="store_true",
-        help="Create AE/CNT/FCNT in CSE and exit; do not start ROS2 subscription",
-    )
-    parser.add_argument(
-        "--reset",
-        action="store_true",
-        help="DELETE existing AE in CSE before bootstrap (fresh aei capture)",
-    )
-    return parser.parse_args(argv)
+    p = argparse.ArgumentParser(prog="ipe", description="Generic ROS2 <-> oneM2M IPE")
+    p.add_argument("--config", "-c", type=Path, required=True)
+    p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    p.add_argument("--explain", action="store_true",
+                   help="Resolve config (no ROS2/CSE) and print the bridge plan per interface")
+    p.add_argument("--dry-run", action="store_true", help="Alias of --explain")
+    p.add_argument("--discover", action="store_true", help="Print discovered ROS2 graph and exit")
+    p.add_argument("--bootstrap-only", action="store_true", help="Create CSE resources and exit")
+    p.add_argument("--reset", action="store_true", help="Delete existing AE(s) before bootstrap")
+    return p.parse_args(argv)
+
+
+def _qos_str(q: QoSSpec) -> str:
+    parts = [q.reliability[:3], q.durability[:3], f"{q.history}/{q.depth}"]
+    if q.deadline_ms is not None:
+        parts.append(f"dl={q.deadline_ms}ms")
+    if q.lifespan_ms is not None:
+        parts.append(f"ls={q.lifespan_ms}ms")
+    if q.liveliness != "AUTOMATIC":
+        parts.append(f"liv={q.liveliness}")
+    return " ".join(parts)
+
+
+def explain(rc: ResolvedConfig, log: logging.Logger) -> None:
+    log.info("=== Bridge plan: %s -> AE %s @ %s (RVI %s) ===",
+             rc.instance_id, rc.cse.ae_name, rc.cse.endpoint, rc.cse.rvi)
+    log.info("robots: %s", ", ".join(f"{r.id}(ns='{r.namespace}')" for r in rc.robots.values()))
+    log.info("discovery: mode=%s", rc.discovery.get("mode"))
+
+    if rc.topics:
+        log.info("--- topics (%d) ---", len(rc.topics))
+    for t in sorted(rc.topics, key=lambda x: (x.robot_id, x.interface)):
+        branch = {"observe": "ros2Data", "command": "ros2Command", "both": "ros2Data+ros2Command"}[t.direction]
+        log.info("  [%s] %-32s %-9s -> %s/%s | %s | rep=%s | qos:%s | rule:%s%s",
+                 t.robot_id, t.interface, t.direction, branch, t.rel_path,
+                 t.msg_type or "(type@discovery)", t.representation, _qos_str(t.qos),
+                 t.source_rule, "  ACCESS:ON" if t.access_enabled else "")
+    if rc.services:
+        log.info("--- services (%d) ---", len(rc.services))
+    for s in sorted(rc.services, key=lambda x: (x.robot_id, x.interface)):
+        log.info("  [%s] %-32s -> services/%s | %s | timeout=%dms | rule:%s",
+                 s.robot_id, s.interface, s.rel_path, s.srv_type or "(type@discovery)",
+                 s.timeout_ms, s.source_rule)
+    if rc.actions:
+        log.info("--- actions (%d) ---", len(rc.actions))
+    for a in sorted(rc.actions, key=lambda x: (x.robot_id, x.interface)):
+        log.info("  [%s] %-32s -> actions/%s | %s | feedback=%s | rule:%s",
+                 a.robot_id, a.interface, a.rel_path, a.action_type or "(type@discovery)",
+                 a.feedback, a.source_rule)
+
+    pending = [s.interface for grp in (rc.topics, rc.services, rc.actions) for s in grp
+               if s.source_rule.startswith("AMBIGUOUS_TYPE")]
+    if pending:
+        log.warning("ambiguous types (refuse to bind until disambiguated): %s", pending)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -62,102 +85,64 @@ def main(argv: list[str] | None = None) -> int:
         log.error("Configuration error: %s", e)
         return 1
 
-    log.info("Configuration loaded: %s", args.config)
-    log.info("Platform: %s", config["platform"]["name"])
-    log.info("CSE endpoint: %s", config["cse"]["endpoint"])
-
-    tables = build_lookup_tables(config)
-    log.info("Lookup tables built: %s", tables)
-
-    if args.dry_run:
-        log.info("--- Topic mapping summary ---")
-        for topic in config.get("topics", []):
-            path = tables.get_resource_path(
-                topic["semantic_category"], topic["resource_alias"]
-            )
-            kind = "FCNT" if topic.get("flexcontainer") else "CNT"
-            log.info(
-                "  %-45s -> %s [%s, %s]",
-                topic["name"],
-                path,
-                kind,
-                topic["representation_policy"],
-            )
-        log.info("Dry run completed successfully.")
-        return 0
-
-    from ipe.runtime.lifecycle import BootstrapError, bootstrap
-
+    # 설정 시점 해석: 명시적 이름은 지금, 패턴은 디스커버리 때 확장된다.
+    # ROS2 없이 --explain을 돌리기엔 이것으로 충분하다.
     try:
-        ops = bootstrap(config, reset=args.reset)
-    except BootstrapError as e:
-        log.error("Bootstrap failed: %s", e)
-        return 2
-
-    if args.bootstrap_only:
-        log.info("Bootstrap-only mode: exiting after resource creation.")
-        return 0
-
-    try:
-        from ipe.adapter.ros2 import GenericROS2Adapter
-        from ipe.runtime.node import create_node, spin
-    except ImportError as e:
-        log.error("ROS2 import failed: %s", e)
-        log.error("Source ROS2: `source /opt/ros/humble/setup.bash`")
-        log.error("Source workspace: `source ~/px4_ros_ws/install/setup.bash`")
+        rc = resolve(config, discovered=None)
+    except ResolveError as e:
+        log.error("Resolution error: %s", e)
         return 1
 
-    node = create_node()
-    adapter = GenericROS2Adapter(node, tables)
-
-    if args.discover:
-        log.info("--- Discovered ROS2 topics ---")
-        for name, type_str in sorted(adapter.discover()):
-            log.info("  %-50s %s", name, type_str)
-        adapter.shutdown()
+    if args.explain or args.dry_run:
+        explain(rc, log)
         return 0
 
-    from ipe.core.policy import Op, Pipeline
+    if args.discover:
+        return _discover(log)
 
-    pipeline = Pipeline(config, tables.path_by_alias)
-    counters: dict[str, int] = {}
-    errors: dict[str, int] = {}
+    if args.reset:
+        _reset_ae(rc, log)   # 삭제 후 정상 부트스트랩으로 계속
 
-    def dispatch(op: Op) -> None:
-        try:
-            if op.kind == "create_cin":
-                r = ops.create_cin(op.path, op.content)
-                if r.status != 201:
-                    raise RuntimeError(f"CIN create failed: {r.status} {r.body!r}")
-            elif op.kind == "update_fcnt":
-                r = ops.update_fcnt(op.path, op.content)
-                if r.status not in (200, 204):
-                    raise RuntimeError(f"FCNT update failed: {r.status} {r.body!r}")
-            counters[op.topic] = counters.get(op.topic, 0) + 1
-            n = counters[op.topic]
-            if n in (1, 10, 100) or n % 500 == 0:
-                log.info("[%s #%d] %s %s", op.kind, n, op.topic, op.path)
-        except Exception as e:
-            errors[op.topic] = errors.get(op.topic, 0) + 1
-            if errors[op.topic] <= 3 or errors[op.topic] % 100 == 0:
-                log.warning("Dispatch error on %s (#%d): %s", op.topic, errors[op.topic], e)
+    # 런타임 import 실패는 조용한 no-op 대신 시끄럽게 실패시킨다.
+    from ipe.runtime.app import run
+    return run(rc, args)
 
-    def on_ir(ir: TopicIR) -> None:
-        for op in pipeline.process(ir):
-            dispatch(op)
 
-    adapter.bind_topics(on_ir)
-    log.info("Spinning... (Ctrl+C to stop)")
+def _discover(log: logging.Logger) -> int:
+    """그래프 스냅숏 1회 출력 — 설정 작성 전 어떤 인터페이스가 있는지 확인용."""
+    import rclpy
+    from rclpy.node import Node
+
+    from ipe.adapter.ros2 import GenericROS2Adapter
+
+    rclpy.init()
+    node = Node("ipe_discover")
     try:
-        spin(node)
-    except KeyboardInterrupt:
-        log.info("Interrupted by user")
+        import time
+        time.sleep(1.0)   # DDS 디스커버리 수렴 대기
+        snap = GenericROS2Adapter(node, lambda _ir: None, lambda *_: None).snapshot()
+        for kind in ("topics", "services", "actions"):
+            log.info("--- %s (%d) ---", kind, len(snap.get(kind, [])))
+            for name, types in sorted(snap.get(kind, [])):
+                log.info("  %-40s %s", name, ",".join(types))
     finally:
-        adapter.shutdown()
-        log.info("Final dispatch counts: %s", dict(sorted(counters.items())))
-        if errors:
-            log.info("Errors per topic: %s", dict(sorted(errors.items())))
+        node.destroy_node()
+        rclpy.shutdown()
     return 0
+
+
+def _reset_ae(rc, log: logging.Logger) -> None:
+    from ipe.onem2m.http_client import OneM2MHTTPClient
+
+    client = OneM2MHTTPClient(rc.cse.endpoint, origin=rc.cse.origin, rvi=rc.cse.rvi)
+    path = f"/{rc.cse.cse_base}/{rc.cse.ae_name}"
+    r = client.delete(path)
+    if r.status in (200, 204):
+        log.info("DELETED AE %s (reset)", path)
+    elif r.status == 404:
+        log.info("AE %s already absent (reset noop)", path)
+    else:
+        log.warning("AE reset DELETE %s -> HTTP %d", path, r.status)
 
 
 if __name__ == "__main__":
