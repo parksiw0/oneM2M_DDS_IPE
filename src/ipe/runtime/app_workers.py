@@ -11,11 +11,9 @@ import queue
 import time
 from typing import Any
 
-import requests
-
 from ipe.core.policy import Op
 from ipe.core.vocab import CLASS_TERMINAL
-from ipe.onem2m.http_client import OversizeError, classify
+from ipe.onem2m.client import OversizeError, TransportError, classify
 from ipe.runtime.dispatcher import InboundEvent
 
 log = logging.getLogger(__name__)
@@ -47,7 +45,7 @@ class WorkersMixin:
                 log.exception("outbound worker iteration failed (isolated)")
 
     def _send_with_retry(self, op: Op, retries: int, base_ms: int) -> None:
-        from ipe.onem2m.http_client import backoff_delays
+        from ipe.onem2m.client import backoff_delays
         delays = iter(backoff_delays(retries, base_ms))
         attempt = 0
         while True:
@@ -69,7 +67,7 @@ class WorkersMixin:
                     if r.created or r.duplicate:
                         return
                     failure = r.response
-            except (requests.exceptions.RequestException, OversizeError) as e:
+            except (TransportError, OversizeError) as e:
                 failure = e
             cls = classify(failure)
             if cls == "non_recoverable":
@@ -113,7 +111,7 @@ class WorkersMixin:
                         self.state.spool_delete([row["id"]])
                         continue
                     r_ok = r.created or r.duplicate
-            except (requests.exceptions.RequestException, OversizeError):
+            except (TransportError, OversizeError):
                 return   # CSE 불가 — 다음 유휴 사이클에 재시도
             if r_ok:
                 self.state.spool_delete([row["id"]])

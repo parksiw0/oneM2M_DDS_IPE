@@ -132,17 +132,23 @@ def _discover(log: logging.Logger) -> int:
 
 
 def _reset_ae(rc, log: logging.Logger) -> None:
-    from ipe.onem2m.http_client import OneM2MHTTPClient
+    from ipe.onem2m.client import TransportError, make_onem2m_client
 
-    client = OneM2MHTTPClient(rc.cse.endpoint, origin=rc.cse.origin, rvi=rc.cse.rvi)
-    path = f"/{rc.cse.cse_base}/{rc.cse.ae_name}"
-    r = client.delete(path)
-    if r.status in (200, 204):
-        log.info("DELETED AE %s (reset)", path)
-    elif r.status == 404:
-        log.info("AE %s already absent (reset noop)", path)
-    else:
-        log.warning("AE reset DELETE %s -> HTTP %d", path, r.status)
+    client = make_onem2m_client(rc, rc.cse.origin)
+    client.start()   # MQTT는 브로커 연결 (HTTP는 no-op)
+    try:
+        path = f"/{rc.cse.cse_base}/{rc.cse.ae_name}"
+        r = client.delete(path)
+        if r.status in (200, 204):
+            log.info("DELETED AE %s (reset)", path)
+        elif r.status == 404:
+            log.info("AE %s already absent (reset noop)", path)
+        else:
+            log.warning("AE reset DELETE %s -> status %d rsc=%s", path, r.status, r.rsc)
+    except TransportError as e:
+        log.warning("AE reset failed to reach CSE: %s", e)
+    finally:
+        client.stop()
 
 
 if __name__ == "__main__":

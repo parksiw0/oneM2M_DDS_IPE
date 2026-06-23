@@ -37,11 +37,13 @@ class ProvisionResult:
 
 
 class Provisioner:
-    def __init__(self, rc: ResolvedConfig, ops: Any, state: Any, poa_base: str) -> None:
+    def __init__(self, rc: ResolvedConfig, ops: Any, state: Any, poa_base: str,
+                 *, protocol: str = "http") -> None:
         self.rc = rc
         self.ops = ops
         self.state = state
         self.poa_base = poa_base.rstrip("/")
+        self.protocol = protocol
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -53,8 +55,10 @@ class Provisioner:
         """AE를 등록(또는 재사용)하고 aei를 영속화한다. aei는 절대 추측하지 않는다."""
         cse = self.rc.cse
         parent = f"/{cse.cse_base}"
+        # MQTT는 AE에 mqtt POA를 등록해 CSE가 NOTIFY 토픽을 알게 한다(HTTP는 nu가 URL).
+        poa = [self.poa_base] if self.protocol == "mqtt" else None
         path, aei = self.ops.ensure_ae(parent, cse.ae_name,
-                                       api=f"N{self.rc.instance_id}")
+                                       api=f"N{self.rc.instance_id}", poa=poa)
         kv_key = f"aei:{cse.ae_name}"
         if aei:
             self.state.set_kv(kv_key, aei)
@@ -187,12 +191,15 @@ class Provisioner:
     def _input_sub(self, res: ProvisionResult, cnt_path: str, kind: str,
                    robot_id: str, interface: str, rel_path: str) -> None:
         path_key = f"{kind}/{robot_id}/{rel_path}"
-        nu = f"{self.poa_base}/notify/{path_key}"
+        # mqtt: 모든 SUB가 단일 POA URI를 nu로 공유, 경로 구분은 sur (app이 별칭 등록)
+        nu = (self.poa_base if self.protocol == "mqtt"
+              else f"{self.poa_base}/notify/{path_key}")
         sub = self.ops.ensure_sub(cnt_path, "ipeSub", [nu], net=[3], nct=1)
         if not sub.ok:
             res.errors.append(f"SUB on {cnt_path} not active: {sub.detail}")
         res.routes[path_key] = {"kind": kind, "robot_id": robot_id,
-                                "interface": interface, "input_cnt_path": cnt_path}
+                                "interface": interface, "input_cnt_path": cnt_path,
+                                "sub_ri": sub.ri}
 
     def _provision_command(self, res: ProvisionResult, ae: str, t: Any) -> None:
         parent = self._ensure_chain(f"{ae}/ros2Command", t.rel_path)

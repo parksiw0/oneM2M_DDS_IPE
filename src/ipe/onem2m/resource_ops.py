@@ -13,9 +13,13 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-import requests
-
-from ipe.onem2m.http_client import OneM2MHTTPClient, OneM2MResponse, OversizeError, classify
+from ipe.onem2m.client import (
+    OneM2MClient,
+    OneM2MResponse,
+    OversizeError,
+    TransportError,
+    classify,
+)
 
 log = logging.getLogger(__name__)
 
@@ -69,24 +73,32 @@ class SubStatus:
     detail: str = ""
     response: OneM2MResponse | None = None   # 마지막 유효 응답 (create 또는 GET)
     classification: str | None = None        # 실패의 classify() 결과, ok면 None
+    ri: str | None = None                    # 생성된 SUB의 resourceId (MQTT sur 보조 별칭)
 
 
 class ResourceOps:
-    def __init__(self, client: OneM2MHTTPClient) -> None:
+    def __init__(self, client: OneM2MClient) -> None:
         self.client = client
 
     # -- AE ------------------------------------------------------------------
 
-    def ensure_ae(self, parent: str, name: str, api: str | None = None) -> tuple[str, str | None]:
+    def ensure_ae(self, parent: str, name: str, api: str | None = None,
+                  poa: list[str] | None = None) -> tuple[str, str | None]:
         """AE를 생성한다. origin 변형 탐색은 하지 않는다.
 
         (path, aei) 반환: 201이면 본문의 aei, 409면 None(호출자가 저장된
         aei를 읽거나 CAdmin으로 GET). aei는 본문에 절대 넣지 않는다 —
         tinyIoT가 origin에서 유도한다.
+
+        poa가 주어지면 AE에 pointOfAccess로 등록한다(MQTT 바인딩: CSE가 NOTIFY를
+        보낼 mqtt:// 토픽 대상). HTTP는 nu가 URL을 직접 실으므로 poa를 쓰지 않는다.
         """
         if api is None:
             api = f"N{name}"
-        body = {"m2m:ae": {"rn": name, "api": api, "rr": True, "srv": ["3"]}}
+        ae_body: dict[str, Any] = {"rn": name, "api": api, "rr": True, "srv": ["3"]}
+        if poa:
+            ae_body["poa"] = poa
+        body = {"m2m:ae": ae_body}
         r = self.client.create(parent, TY_AE, body)
         path = f"{parent.rstrip('/')}/{name}"
         if r.status == 201:
@@ -200,7 +212,7 @@ class ResourceOps:
         path = f"{parent.rstrip('/')}/{name}"
         try:
             r = self.client.create(parent, TY_SUB, body)
-        except (requests.exceptions.RequestException, OversizeError) as e:
+        except (TransportError, OversizeError) as e:
             return SubStatus(
                 path=path, ok=False, created=False, verified=False,
                 detail=f"create failed: {e}", classification=classify(e),
@@ -220,7 +232,7 @@ class ResourceOps:
 
         try:
             probe = self.client.get(path)
-        except (requests.exceptions.RequestException, OversizeError) as e:
+        except (TransportError, OversizeError) as e:
             return SubStatus(
                 path=path, ok=False, created=created, verified=False,
                 detail=f"post-create read failed: {e}", classification=classify(e),
@@ -235,7 +247,7 @@ class ResourceOps:
                 try:
                     self.client.delete(path)
                     r2 = self.client.create(parent, TY_SUB, body)
-                except (requests.exceptions.RequestException, OversizeError) as e:
+                except (TransportError, OversizeError) as e:
                     return SubStatus(path=path, ok=False, created=False, verified=False,
                                      detail=f"recreate failed: {e}",
                                      classification=classify(e))
@@ -245,7 +257,9 @@ class ResourceOps:
                                      response=r2, classification=classify(r2))
                 created = True
             log.info("%s SUB %s (verified)", "CREATED" if created else "EXISTS ", path)
-            return SubStatus(path=path, ok=True, created=created, verified=True, response=probe)
+            sub_ri = existing.get("ri") if isinstance(existing, dict) else None
+            return SubStatus(path=path, ok=True, created=created, verified=True,
+                             response=probe, ri=sub_ri)
         return SubStatus(
             path=path, ok=False, created=created, verified=False,
             detail=f"post-create read: HTTP {probe.status} rsc={probe.rsc}",

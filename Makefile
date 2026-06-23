@@ -1,22 +1,32 @@
-.PHONY: help install dev lint format clean run-dryrun run
+.PHONY: help venv install dev lint format clean run-dryrun run
 
 PYTHON := python3
+VENV := .venv
+VENV_PY := $(VENV)/bin/python
 
 help:
 	@echo "Available targets:"
-	@echo "  install          Install package (production)"
-	@echo "  dev              Install with dev dependencies"
+	@echo "  venv             Create .venv (--system-site-packages for rclpy) + install [mqtt,dev]"
+	@echo "  install          Install package + MQTT transport"
+	@echo "  dev              Install with dev + MQTT dependencies"
 	@echo "  lint             Run ruff and mypy"
 	@echo "  format           Auto-format code with ruff"
 	@echo "  clean            Remove build artifacts"
 	@echo "  run-dryrun       Validate config without running"
 	@echo "  run              Run IPE with config/profiles/px4.yaml"
 
+# 한 번에 환경 구성. ROS2 브리징까지 쓰려면 먼저 source /opt/ros/<distro>/setup.bash
+venv:
+	$(PYTHON) -m venv --system-site-packages $(VENV)
+	$(VENV_PY) -m pip install -U pip
+	$(VENV_PY) -m pip install -e ".[mqtt,dev]"
+	@echo "Done. Activate: source $(VENV)/bin/activate"
+
 install:
-	$(PYTHON) -m pip install -e .
+	$(PYTHON) -m pip install -e ".[mqtt]"
 
 dev:
-	$(PYTHON) -m pip install -e ".[dev]"
+	$(PYTHON) -m pip install -e ".[dev,mqtt]"
 
 lint:
 	ruff check src/

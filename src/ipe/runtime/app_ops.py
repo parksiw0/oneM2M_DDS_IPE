@@ -29,13 +29,24 @@ class OpsMixin:
             self.emit_event("actionStatus", "warning",
                             {"event": "timeout", "goalId": corr})
 
+    def _transport_status(self) -> dict[str, Any]:
+        st: dict[str, Any] = {"transport": self.protocol}
+        if self.protocol == "mqtt":
+            st["connected"] = {
+                "worker": getattr(self.worker_client, "connected", None),
+                "prov": getattr(self.prov_client, "connected", None),
+                "listener": getattr(getattr(self, "server", None), "connected", None),
+            }
+        return st
+
     def _heartbeat(self) -> None:
         self.emit_event("ipeHealth", "info",
                         {"event": "heartbeat",
                          "inbound": self.inbound.depths(),
                          "outbound": self.outbound.depths(),
                          "dropped": self.outbound.dropped_counters(),
-                         "spool": self.state.spool_counts()})
+                         "spool": self.state.spool_counts(),
+                         **self._transport_status()})
 
     def _discovery_refresh(self) -> None:
         try:
@@ -199,6 +210,7 @@ class OpsMixin:
             "budget_dropped": self._budget_dropped,
             "pending_confirm": dict(self._confirm_pending),
             "availability": {f"{k[1]}:{k[2]}": v["state"] for k, v in self._avail.items()},
+            **self._transport_status(),
         }
 
     # ------------------------------------------------------------------

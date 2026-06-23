@@ -169,15 +169,40 @@ class ActionSpec:
 # 최상위 해석 결과
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class MqttSpec:
+    """MQTT 바인딩 설정 (protocol: mqtt). 브로커 접속 + 토픽/QoS/TLS."""
+
+    host: str = "127.0.0.1"
+    port: int = 1883
+    client_id: str = "ros2-ipe"
+    keepalive: int = 60
+    qos: int = 1
+    clean_session: bool = False
+    topic_prefix: str = ""
+    response_timeout_ms: int = 5000
+    connect_timeout_ms: int = 10000
+    max_payload: int = 65536
+    tls: bool = False
+    tls_ca: str | None = None
+    tls_cert: str | None = None
+    tls_key: str | None = None
+    tls_insecure: bool = False
+    username: str | None = None
+    password: str | None = None
+
+
 @dataclass
 class CSESpec:
-    endpoint: str
-    cse_base: str
+    endpoint: str                        # http 바인딩 베이스 URL (mqtt면 빈 문자열)
+    cse_base: str                        # CSE 리소스 이름(CSE_BASE_NAME) — to 경로 루트
     ae_name: str
     protocol: str = "http"
+    cse_id: str = ""                     # MQTT 토픽 receiver(CSE_BASE_RI) — mqtt 필수
     origin: str = "CAdmin"
     rvi: str = "3"
     poa: str = ""
+    mqtt: MqttSpec | None = None
 
 
 @dataclass

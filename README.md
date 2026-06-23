@@ -43,9 +43,27 @@ The pip dependencies are just `pyyaml`, `requests`, and `cerberus`, installed au
 source /opt/ros/humble/setup.bash   # provides rclpy
 pip install .                        # base
 pip install ".[notification]"        # with the notification listener (flask)
+pip install ".[mqtt]"                # with the MQTT transport (paho-mqtt)
 ```
 
 Installing registers the `ipe` console command.
+
+### Build from source
+
+IPE is a pure-Python package — "building" means producing a wheel/sdist.
+
+```bash
+pip install build                   # build frontend (one-time)
+python -m build                     # writes dist/ipe-<ver>-py3-none-any.whl + .tar.gz
+pip install dist/ipe-*.whl          # install the built wheel
+```
+
+For development, an editable install is usually enough (also available as `make install`):
+
+```bash
+pip install -e .                    # editable, base deps
+pip install -e ".[dev]"             # editable, with lint/test tooling
+```
 
 ---
 
@@ -84,6 +102,32 @@ bridge:                  # interfaces to map
   services: [ ... ]
   actions: [ ... ]
 ```
+
+### Transport: HTTP or MQTT
+
+The IPE talks to the CSE over **HTTP** (default) or **MQTT**, selected by `cse.protocol`. Provisioning, observe/command/service/action, catch-up, and recovery all behave identically on both.
+
+```yaml
+cse:
+  protocol: mqtt           # http (default) | mqtt
+  cse_base: TinyIoT        # CSE resource name (used in resource addresses)
+  cse_id: tinyiot          # CSE-ID = MQTT topic segment (tinyIoT CSE_BASE_RI); required for mqtt
+  ae_name: ros2-ipe
+  origin: "${IPE_CSE_ORIGIN}"
+  mqtt:
+    host: 127.0.0.1
+    port: 1883
+    username: test
+    password: mqtt
+    qos: 1                 # 0 | 1 | 2
+    # optional: tls + tls_ca/tls_cert/tls_key/tls_insecure, client_id, keepalive,
+    # clean_session, response_timeout_ms, connect_timeout_ms, max_payload, topic_prefix
+```
+
+- **`cse_id` is required for MQTT** and is not the same as `cse_base`. It is the CSE-ID used as the MQTT topic receiver segment (tinyIoT's `CSE_BASE_RI`, e.g. `tinyiot`); `cse_base` is the CSE resource name used in addresses (e.g. `TinyIoT`). `endpoint` is only used for HTTP.
+- The IPE and the CSE both connect to an **MQTT broker** (e.g. Mosquitto) — not to each other. The tinyIoT CSE must be built with `ENABLE_MQTT` and pointed at the same broker. Install the transport with `pip install ".[mqtt]"`.
+- A single `protocol` governs **both** directions (requests and notifications); mixed HTTP/MQTT is not supported.
+- Under MQTT the AE's point-of-access is an `mqtt://` URI, so the HTTP `/healthz` and `/diag` endpoints are not served — connection state is reported in the `ipeHealth` heartbeat instead. `notification_server` applies to HTTP only.
 
 ### Declaring robots
 

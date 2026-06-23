@@ -38,6 +38,7 @@ from ipe.config.spec import (
     ActionSpec,
     CommandSafety,
     CSESpec,
+    MqttSpec,
     QoSSpec,
     ResolvedConfig,
     RobotSpec,
@@ -374,16 +375,42 @@ def _type_and_source(merged: dict[str, Any], types: list[str], src: str) -> tupl
 # 최상위 resolve
 # ---------------------------------------------------------------------------
 
+def _mqtt_spec(cse_c: dict[str, Any]) -> MqttSpec:
+    m = cse_c.get("mqtt") or {}
+    return MqttSpec(
+        host=m.get("host", "127.0.0.1"),
+        port=int(m.get("port", 1883)),
+        client_id=m.get("client_id", "ros2-ipe"),
+        keepalive=int(m.get("keepalive", 60)),
+        qos=int(m.get("qos", 1)),
+        clean_session=bool(m.get("clean_session", False)),
+        topic_prefix=m.get("topic_prefix", ""),
+        response_timeout_ms=int(m.get("response_timeout_ms", 5000)),
+        connect_timeout_ms=int(m.get("connect_timeout_ms", 10000)),
+        max_payload=int(m.get("max_payload", 65536)),
+        tls=bool(m.get("tls", False)),
+        tls_ca=m.get("tls_ca"),
+        tls_cert=m.get("tls_cert"),
+        tls_key=m.get("tls_key"),
+        tls_insecure=bool(m.get("tls_insecure", False)),
+        username=m.get("username"),
+        password=m.get("password"),
+    )
+
+
 def resolve(config: dict[str, Any], discovered: Discovered | None = None) -> ResolvedConfig:
     cse_c = config["cse"]
+    protocol = cse_c.get("protocol", "http")
     cse = CSESpec(
-        endpoint=cse_c["endpoint"],
+        endpoint=cse_c.get("endpoint", ""),
         cse_base=cse_c["cse_base"],
         ae_name=cse_c["ae_name"],
-        protocol=cse_c.get("protocol", "http"),
+        protocol=protocol,
+        cse_id=cse_c.get("cse_id", ""),
         origin=cse_c.get("origin", "CAdmin"),
         rvi=cse_c.get("rvi", "3"),
         poa=cse_c.get("poa", ""),
+        mqtt=_mqtt_spec(cse_c) if protocol == "mqtt" else None,
     )
     robots = []
     for r in config.get("robots", [{"id": "default"}]):

@@ -197,13 +197,43 @@ CONFIG_SCHEMA: dict[str, Any] = {
         "type": "dict",
         "required": True,
         "schema": {
-            "endpoint": {"type": "string", "required": True, "regex": r"^https?://.+"},
+            # endpoint는 http에서만 필수 — 교차검증은 loader._check_cse_protocol.
+            "endpoint": {"type": "string", "required": False, "regex": r"^https?://.+"},
             "cse_base": {"type": "string", "required": True, "empty": False},
             "ae_name": {"type": "string", "required": True, "empty": False},
             "protocol": {"type": "string", "allowed": ["http", "mqtt"], "default": "http"},
+            # MQTT 토픽 receiver 세그먼트(CSE-ID / CSE_BASE_RI). cse_base(CSE 리소스
+            # 이름)와 다를 수 있어 별도 필드 — mqtt에서 필수(loader 교차검증).
+            "cse_id": {"type": "string", "required": False},
             "origin": {"type": "string", "default": "CAdmin"},
             "rvi": {"type": "string", "default": "3"},
             "poa": {"type": "string", "required": False},
+            # MQTT 바인딩 설정 (protocol: mqtt 일 때만 사용)
+            "mqtt": {
+                "type": "dict",
+                "required": False,
+                "schema": {
+                    "host": {"type": "string", "default": "127.0.0.1"},
+                    "port": {"type": "integer", "min": 1, "max": 65535, "default": 1883},
+                    "client_id": {"type": "string", "default": "ros2-ipe"},
+                    "keepalive": {"type": "integer", "min": 1, "default": 60},
+                    "qos": {"type": "integer", "allowed": [0, 1, 2], "default": 1},
+                    "clean_session": {"type": "boolean", "default": False},
+                    "topic_prefix": {"type": "string", "default": ""},
+                    "response_timeout_ms": {"type": "integer", "min": 1, "default": 5000},
+                    "connect_timeout_ms": {"type": "integer", "min": 1, "default": 10000},
+                    # tinyIoT MAX_PAYLOAD_SIZE 와 동일 기본값
+                    "max_payload": {"type": "integer", "min": 1, "default": 65536},
+                    "tls": {"type": "boolean", "default": False},
+                    "tls_ca": {"type": "string", "required": False, "nullable": True},
+                    "tls_cert": {"type": "string", "required": False, "nullable": True},
+                    "tls_key": {"type": "string", "required": False, "nullable": True},
+                    "tls_insecure": {"type": "boolean", "default": False},
+                    "username": {"type": "string", "required": False, "nullable": True},
+                    "password": {"type": "string", "required": False, "nullable": True},
+                },
+                "default": {},
+            },
         },
     },
     "notification_server": {

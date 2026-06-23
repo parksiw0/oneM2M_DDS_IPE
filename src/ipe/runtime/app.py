@@ -21,7 +21,7 @@ from ipe.core.common import TokenBucket
 from ipe.core.policy import Pipeline
 from ipe.core.transaction import ActionTransactionManager, ServiceTransactionManager
 from ipe.onem2m.catchup import CatchUpSweeper
-from ipe.onem2m.http_client import OneM2MHTTPClient
+from ipe.onem2m.client import idify, make_onem2m_client
 from ipe.onem2m.notification_server import NotificationServer
 from ipe.onem2m.resource_ops import ResourceOps
 from ipe.runtime.dispatcher import RouteTable
@@ -56,16 +56,22 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
                                     control_maxsize=rec.get("control_lane_max", 64))
         self.outbound = OutboundQueue(maxsize=rec.get("outbound_max", 5000))
         self.routes = RouteTable()
-        self.poa = rc.cse.poa or f"http://127.0.0.1:{rc.notification_port}"
+        self.protocol = rc.cse.protocol
+        if self.protocol == "mqtt":
+            # tinyIoT는 POA URI 경로부를 NOTIFY 토픽으로 그대로 쓴다(aei 무관)
+            self.poa_path = idify(rc.cse.ae_name)
+            self.poa = f"mqtt://{rc.cse.mqtt.host}:{rc.cse.mqtt.port}/{self.poa_path}"
+        else:
+            self.poa_path = ""
+            self.poa = rc.cse.poa or f"http://127.0.0.1:{rc.notification_port}"
 
-        # 스레드(worker / provisioner)마다 Session 1개
-        self.worker_client = OneM2MHTTPClient(rc.cse.endpoint, origin=rc.cse.origin,
-                                              rvi=rc.cse.rvi)
+        # 전송 클라이언트: 스레드(worker / provisioner)마다 1개 (HTTP=Session, MQTT=연결)
+        self.worker_client = make_onem2m_client(rc, rc.cse.origin)
         self.worker_ops = ResourceOps(self.worker_client)
-        self.prov_client = OneM2MHTTPClient(rc.cse.endpoint, origin=rc.cse.origin,
-                                            rvi=rc.cse.rvi)
+        self.prov_client = make_onem2m_client(rc, rc.cse.origin)
         self.prov_ops = ResourceOps(self.prov_client)
-        self.provisioner = Provisioner(rc, self.prov_ops, self.state, self.poa)
+        self.provisioner = Provisioner(rc, self.prov_ops, self.state, self.poa,
+                                       protocol=self.protocol)
         self.catchup = CatchUpSweeper(self.state, self.prov_ops, self._catchup_admit)
 
         self.svc_tx = ServiceTransactionManager(self.state)
@@ -101,14 +107,16 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
 
     def run(self) -> int:
         rc = self.rc
-        log.info("IPE starting: %s -> %s (AE %s)", rc.instance_id,
-                 rc.cse.endpoint, rc.cse.ae_name)
+        log.info("IPE starting (%s): %s -> %s (AE %s)", self.protocol, rc.instance_id,
+                 rc.cse.endpoint or self.poa, rc.cse.ae_name)
 
-        # SUB 생성(vrq 검증) 전에 리스너가 떠 있어야 한다
-        self.server = NotificationServer(rc.notification_host, rc.notification_port,
-                                         on_notify=self._on_notify, diag_fn=self._diag)
+        # SUB 생성(vrq 검증) 전에 알림 리스너가 떠 있어야 한다 (MQTT는 SUBACK까지 블록)
+        self.server = self._make_listener()
         self.server.start()
         try:
+            # MQTT 전송은 브로커 연결이 필요(HTTP는 no-op)
+            self.worker_client.start()
+            self.prov_client.start()
             self.aei = self.provisioner.ensure_ae_identity()
             self.worker_client.origin = self.aei
             self.prov_client.origin = self.aei
@@ -126,11 +134,13 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
                                 {"event": "fcntFallback", "detail": fb})
         except Exception:
             log.exception("bootstrap failed")
+            self._stop_clients()
             self.server.stop()
             return 2
 
         if getattr(self.args, "bootstrap_only", False):
             log.info("bootstrap complete (--bootstrap-only)")
+            self._stop_clients()
             self.server.stop()
             return 0
 
@@ -194,12 +204,34 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
                 self.emit_event("ipeHealth", "error", {"event": "adapterError"})
         return self._graceful_shutdown()
 
+    def _make_listener(self) -> Any:
+        rc = self.rc
+        if self.protocol == "mqtt":
+            from ipe.onem2m.mqtt_listener import MQTTNotificationListener
+            return MQTTNotificationListener(
+                rc.cse.mqtt, rc.cse.cse_id, self.poa_path,
+                self._on_notify, self.routes.resolve_sur)
+        return NotificationServer(rc.notification_host, rc.notification_port,
+                                  on_notify=self._on_notify, diag_fn=self._diag)
+
+    def _stop_clients(self) -> None:
+        # stop()은 각 구현이 자체적으로 예외를 삼킨다(mqtt suppress, http session close)
+        for c in (getattr(self, "worker_client", None), getattr(self, "prov_client", None)):
+            if c is not None:
+                c.stop()
+
     def _absorb_provision(self, result: Any) -> None:
         self.path_map.update(result.path_map)
         self.status_paths.update(result.status_paths)
         for path_key, r in result.routes.items():
             self.routes.add(path_key, r["kind"], r["robot_id"], r["interface"])
             self.catchup.register(path_key, r["input_cnt_path"])
+            if self.protocol == "mqtt":
+                # MQTT NOTIFY는 sur(SUB 구조 경로)로 라우팅
+                cnt = r["input_cnt_path"].rstrip("/")
+                self.routes.add_alias((cnt + "/ipeSub").lstrip("/"), path_key)
+                if r.get("sub_ri"):
+                    self.routes.add_alias(r["sub_ri"], path_key)
 
     def _bind_all(self) -> None:
         for t in self.rc.topics:
@@ -282,7 +314,9 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
                                                if self.pipeline else {}),
                      self.adapter.shutdown,
                      self.executor.shutdown,
-                     self.node.destroy_node):
+                     self.node.destroy_node,
+                     self.worker_client.stop,
+                     self.prov_client.stop):
             try:
                 step()
             except Exception:

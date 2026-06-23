@@ -166,6 +166,7 @@ def _check_semantics(cfg: dict[str, Any]) -> None:
     if len(ids) != len(set(ids)):
         raise ConfigError(f"Duplicate robot id in 'robots': {ids}")
 
+    _check_cse_protocol(cfg)
     _check_patterns(cfg)
     _check_mode_semantics(cfg)
     _check_qos_references(cfg)
@@ -174,6 +175,28 @@ def _check_semantics(cfg: dict[str, Any]) -> None:
     _check_command_qos(cfg)
     _check_termination_invariant(cfg)
     _check_flexcontainer(cfg)
+
+
+def _check_cse_protocol(cfg: dict[str, Any]) -> None:
+    """프로토콜별 cse 요건 (단일 protocol 필드가 양방향 전송을 지배 — mixed 미지원).
+
+    http: endpoint 필수. mqtt: cse_id(토픽 receiver 세그먼트) 필수 — cse_base(CSE
+    리소스 이름)와 다를 수 있어 추측하지 않는다.
+    """
+    cse = cfg.get("cse", {})
+    proto = cse.get("protocol", "http")
+    if proto == "http" and not cse.get("endpoint"):
+        raise ConfigError(
+            "cse.endpoint is required when cse.protocol is 'http' "
+            "(e.g. http://localhost:3000)."
+        )
+    if proto == "mqtt" and not cse.get("cse_id"):
+        raise ConfigError(
+            "cse.cse_id is required when cse.protocol is 'mqtt' — it is the MQTT "
+            "topic receiver segment (CSE-ID / tinyIoT CSE_BASE_RI) and may differ "
+            "from cse.cse_base (the CSE resource name). "
+            "e.g. cse_base: TinyIoT, cse_id: tinyiot"
+        )
 
 
 def _check_flexcontainer(cfg: dict[str, Any]) -> None:

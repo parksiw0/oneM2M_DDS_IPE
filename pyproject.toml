@@ -32,6 +32,7 @@ dev = [
     "types-requests",
 ]
 notification = ["flask>=3.0"]
+mqtt = ["paho-mqtt>=2.1"]
 
 [project.scripts]
 ipe = "ipe.cli:main"

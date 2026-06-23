@@ -56,6 +56,9 @@ class RouteTable:
 
     def __init__(self) -> None:
         self._routes: dict[str, Route] = {}
+        # sur(구독 참조) -> path_key. MQTT NOTIFY는 nu URL 경로가 없어 path_key를
+        # 못 싣는다 — m2m:sgn.sur(구조 경로)로 라우팅한다(HTTP는 미사용).
+        self._by_sur: dict[str, str] = {}
         self._lock = threading.Lock()
 
     def add(self, path_key: str, kind: str, robot_id: str, interface: str,
@@ -64,6 +67,25 @@ class RouteTable:
             raise ValueError(f"unknown route kind: {kind!r}")
         with self._lock:
             self._routes[path_key] = Route(kind, robot_id, interface, dict(meta or {}))
+
+    @staticmethod
+    def _norm_sur(sur: str) -> str:
+        # tinyIoT sur는 선행 슬래시 없는 구조 경로지만 방어적으로 정규화한다
+        return sur.lstrip("/")
+
+    def add_alias(self, sur: str | None, path_key: str) -> None:
+        """sur -> path_key 별칭 등록(MQTT 라우팅). sur가 비면 무시."""
+        if not sur:
+            return
+        with self._lock:
+            self._by_sur[self._norm_sur(sur)] = path_key
+
+    def resolve_sur(self, sur: str | None) -> str | None:
+        """sur로 path_key를 찾는다. 없으면 None."""
+        if not sur:
+            return None
+        with self._lock:
+            return self._by_sur.get(self._norm_sur(sur))
 
     def remove(self, path_key: str) -> None:
         with self._lock:
