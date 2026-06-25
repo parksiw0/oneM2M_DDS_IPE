@@ -4,7 +4,7 @@
 블로킹하지 않고 CSE I/O도 하지 않는다 — 콜백 결과는 enqueue 전용 훅으로 넘긴다.
 
 Humble 주의점:
-- 이벤트 콜백 모듈은 `rclpy.qos_event` (Iron에서 개명).
+- 이벤트 콜백 모듈은 Humble=`rclpy.qos_event`, Iron+/Jazzy=`rclpy.event_handler` (_event_callbacks가 폴백).
 - Humble rclpy는 구독 콜백에 메시지별 publisher GID를 노출하지 않아,
   `direction: both`의 자기 에코 억제를 GID 비교 대신
   페이로드 해시 + 시간 창 매칭으로 구현했다.
@@ -42,6 +42,16 @@ def _load(kind: str, type_str: str) -> Any:
         return get_service(type_str)
     from rosidl_runtime_py.utilities import get_action
     return get_action(type_str)
+
+
+def _event_callbacks(kind: str) -> Any:
+    # 콜백 클래스가 Iron에서 rclpy.qos_event -> rclpy.event_handler로 개명됨 (Humble 폴백).
+    try:
+        from rclpy import event_handler as mod
+    except ImportError:
+        from rclpy import qos_event as mod
+    return getattr(mod, "SubscriptionEventCallbacks" if kind == "sub"
+                   else "PublisherEventCallbacks")
 
 
 # 액션 클라이언트 kwarg 이름은 채널 정본(spec.ACTION_QOS_CHANNELS)에서 파생 —
@@ -199,7 +209,7 @@ class GenericROS2Adapter:
     def _create_subscription_degrading(self, msg_class: Any, spec: TopicSpec,
                                        profile: Any, callback: Any) -> Any:
         """QoS 이벤트 콜백 등록 — 미지원 축은 하나씩 빼며 재시도(점진 강등)."""
-        from rclpy.qos_event import SubscriptionEventCallbacks
+        SubscriptionEventCallbacks = _event_callbacks("sub")
 
         key = (spec.robot_id, spec.interface)
 
@@ -316,7 +326,7 @@ class GenericROS2Adapter:
                         {"event": ev, "interface": spec.interface, "robot": spec.robot_id})
         profile = qosmod.build_qos_profile(resolved)
 
-        from rclpy.qos_event import PublisherEventCallbacks
+        PublisherEventCallbacks = _event_callbacks("pub")
 
         def incompat(info: Any) -> None:
             self._event("commandStatus", "error",
