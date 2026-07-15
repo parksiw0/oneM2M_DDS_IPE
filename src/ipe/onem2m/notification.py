@@ -1,7 +1,11 @@
-"""oneM2M 알림 파싱 (DESIGN §14.2/§14.3).
+"""oneM2M 알림 파싱 (DESIGN §14.2/§14.3, QoS_FCNT_설계서 P3).
 
 CIN 추출은 엄격한 경로 기반: ``m2m:sgn.nev.rep["m2m:cin"]``.
 rep 값에 키 추측 휴리스틱을 쓰지 않는다 — ``m2m:cin`` 키 아래가 아니면 무시.
+
+예외 하나: rep 루트가 ``m2m:`` 표준 접두사가 아닌 콜론 포함 특화 키
+(예 ``ros:tqos``)면 FCNT UPDATE의 net=1 NOTIFY다 — 그 내용을 ``fcnt``로,
+세대 번호 ``st``를 멱등 키 재료로 추출한다(qos_update 라우팅 입력).
 """
 
 from __future__ import annotations
@@ -27,6 +31,9 @@ class Notification:
     cin_ct: str | None
     con: dict[str, Any] | None
     raw: dict[str, Any]
+    fcnt_key: str | None = None          # 특화 rep 루트 키, 예 "ros:tqos"
+    fcnt: dict[str, Any] | None = None
+    st: int | None = None                # FCNT stateTag — 멱등 키 재료
 
 
 def _parse_con(con: Any) -> dict[str, Any] | None:
@@ -63,6 +70,8 @@ def parse_notification(body: Any) -> Notification | None:
     cin = rep.get("m2m:cin") if isinstance(rep, dict) else None
     if not isinstance(cin, dict):
         cin = {}
+    fcnt_key, fcnt = _specialisation_rep(rep) if not cin else (None, None)
+    st = fcnt.get("st") if fcnt else None
     return Notification(
         vrq=False,
         sur=sgn.get("sur"),
@@ -72,4 +81,18 @@ def parse_notification(body: Any) -> Notification | None:
         cin_ct=cin.get("ct"),
         con=_parse_con(cin.get("con")),
         raw=body,
+        fcnt_key=fcnt_key,
+        fcnt=fcnt,
+        st=st if isinstance(st, int) else None,
     )
+
+
+def _specialisation_rep(rep: Any) -> tuple[str | None, dict[str, Any] | None]:
+    """rep 루트가 특화 FCNT 키(콜론 포함, ``m2m:`` 아님)면 (키, 내용)."""
+    if not isinstance(rep, dict) or len(rep) != 1:
+        return None, None
+    key = next(iter(rep))
+    if ":" not in key or key.startswith("m2m:"):
+        return None, None
+    inner = rep[key]
+    return (key, inner) if isinstance(inner, dict) else (None, None)

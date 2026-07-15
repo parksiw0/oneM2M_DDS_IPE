@@ -100,6 +100,11 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
         self._budget_dropped = 0
         self._inflight: dict[tuple[str, str], set[str]] = {}          # (robot,iface) -> corr들
         self._avail: dict[tuple[str, str, str], dict[str, Any]] = {}  # churn 상태기계(§4.6)
+        # qos FCNT 게시 상태 (QoS_FCNT_설계서 §4.5.2)
+        self._qos_fcnt_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._qos_fcnt_last_pub: dict[tuple[str, str, str], float] = {}
+        self._qos_lbl_only: set[tuple[str, str, str]] = set()   # FCNT 생성 실패 키
+        self._qos_republish = threading.Event()   # CSE 재기동 → 전량 재게시
 
     # ------------------------------------------------------------------
     # 기동
@@ -132,6 +137,11 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
             for fb in result.fallbacks:
                 self.emit_event("provisioningStatus", "warning",
                                 {"event": "fcntFallback", "detail": fb})
+            for f in result.qos_fcnt_failed:
+                self.emit_event("provisioningStatus", "warning",
+                                {"event": "qosFcntUnavailable", "robot": f["robot"],
+                                 "interface": f["interface"],
+                                 "direction": f["direction"], "detail": f["error"]})
         except Exception:
             log.exception("bootstrap failed")
             self._stop_clients()
@@ -223,9 +233,12 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
     def _absorb_provision(self, result: Any) -> None:
         self.path_map.update(result.path_map)
         self.status_paths.update(result.status_paths)
+        for f in getattr(result, "qos_fcnt_failed", []):
+            self._qos_lbl_only.add((f["robot"], f["interface"], f["direction"]))
         for path_key, r in result.routes.items():
-            self.routes.add(path_key, r["kind"], r["robot_id"], r["interface"])
-            self.catchup.register(path_key, r["input_cnt_path"])
+            self.routes.add(path_key, r["kind"], r["robot_id"], r["interface"], meta=r)
+            if r["kind"] != "qos_update":
+                self.catchup.register(path_key, r["input_cnt_path"])
             if self.protocol == "mqtt":
                 # MQTT NOTIFY는 sur(SUB 구조 경로)로 라우팅
                 cnt = r["input_cnt_path"].rstrip("/")

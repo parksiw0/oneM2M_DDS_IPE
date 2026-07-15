@@ -132,6 +132,10 @@ class WorkersMixin:
                 if job == "reconcile":
                     restarted = self.provisioner.check_cse_identity()
                     self._absorb_provision(self.provisioner.provision_all())
+                    # 재프로비저닝 후 캐시 1회 무효화(§4.8.4) — 재생성된 qos
+                    # FCNT가 CREATE 초기 속성만 든 채 캐시에 가려지는 것을 막는다.
+                    # 게시는 executor 틱이 수행한다(스레드 소유권).
+                    self._qos_republish.set()
                     if restarted:
                         self.catchup.sweep("cse-restart")
                 elif job == "catchup":

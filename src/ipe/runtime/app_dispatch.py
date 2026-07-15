@@ -102,7 +102,8 @@ class DispatchMixin:
     def _status_category(kind: str) -> str:
         return {"command": "commandStatus", "service": "serviceStatus",
                 "action_goal": "actionStatus", "cancel": "actionStatus",
-                "decision": "provisioningStatus"}.get(kind, "ipeHealth")
+                "decision": "provisioningStatus",
+                "qos_update": "qosStatus"}.get(kind, "ipeHealth")
 
     # ------------------------------------------------------------------
     # guard 드레인 (executor 스레드, 예산 제한)
@@ -140,6 +141,8 @@ class DispatchMixin:
             self._dispatch_cancel(ev, corr)
         elif ev.kind == "decision":
             self._dispatch_decision(ev, corr)
+        elif ev.kind == "qos_update":
+            self._dispatch_qos_update(ev, corr)
         else:
             self.emit_event("ipeHealth", "warning",
                             {"event": "unhandledKind", "kind": ev.kind})
@@ -170,6 +173,7 @@ class DispatchMixin:
                 key = ("command", spec.robot_id, spec.interface)
                 self.specs_by_key[key] = spec
                 self._publish_contract_for(key, spec)
+            self._publish_qos_state(only_key=(spec.robot_id, spec.interface))
 
     # --- command ------------------------------------------------------
 
@@ -400,6 +404,109 @@ class DispatchMixin:
                                    "terminationReason": reason, "detail": detail},
                                   ev.robot_id, ev.interface, "actionStatus",
                                   CLASS_TERMINAL))
+
+    # --- qos_update (QoS_FCNT_설계서 §4.5.3) ---------------------------
+
+    _QOS_CF_ENUMS = {
+        "cfRlb": ("reliability", ("RELIABLE", "BEST_EFFORT")),
+        "cfDrb": ("durability", ("VOLATILE", "TRANSIENT_LOCAL")),
+        "cfHst": ("history", ("KEEP_LAST", "KEEP_ALL")),
+        "cfLiv": ("liveliness", ("AUTOMATIC", "MANUAL_BY_TOPIC")),
+    }
+    _QOS_CF_DURS = {"cfDdl": "deadline_ms", "cfLsp": "lifespan_ms",
+                    "cfLse": "liveliness_lease_duration_ms"}
+
+    def _parse_cf_update(self, payload: dict[str, Any],
+                         base: Any) -> tuple[Any | None, str]:
+        """NOTIFY rep의 cf* → 후보 QoSSpec. (None, 사유) = 도메인 위반."""
+        from dataclasses import replace
+        updates: dict[str, Any] = {}
+        for sn, (fld, allowed) in self._QOS_CF_ENUMS.items():
+            if sn not in payload:
+                continue
+            v = str(payload[sn]).upper()
+            if v not in allowed:
+                return None, f"{sn}: '{payload[sn]}' not in {allowed}"
+            updates[fld] = v
+        if "cfDpt" in payload:
+            d = payload["cfDpt"]
+            if not isinstance(d, int) or isinstance(d, bool) or d < 1:
+                return None, f"cfDpt: expected integer >= 1, got {d!r}"
+            updates["depth"] = d
+        for sn, fld in self._QOS_CF_DURS.items():
+            if sn not in payload:
+                continue
+            v = payload[sn]
+            if isinstance(v, str) and v.upper() == "INF":
+                updates[fld] = None
+            elif isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                updates[fld] = v
+            elif isinstance(v, str) and v.isdigit():
+                updates[fld] = int(v)
+            else:
+                return None, f"{sn}: expected 'INF' or decimal ms, got {v!r}"
+        cand = replace(base, **updates)
+        if cand.liveliness == "MANUAL_BY_TOPIC" \
+                and cand.liveliness_lease_duration_ms is None:
+            return None, "liveliness MANUAL_BY_TOPIC requires cfLse (B8)"
+        return cand, ""
+
+    def _dispatch_qos_update(self, ev: InboundEvent, corr: str) -> None:
+        from ipe.config.rules import command_qos_violation
+        now = time.time()
+        direction = (ev.meta or {}).get("direction", "observe")
+        key = (ev.robot_id, ev.interface)
+        spec_key = ("command" if direction == "command" else "observe",
+                    ev.robot_id, ev.interface)
+        spec = self.specs_by_key.get(spec_key)
+        payload = ev.payload or {}
+
+        def _reject(reason: str) -> None:
+            self.emit_event("qosStatus", "warning",
+                            {"event": "qosUpdateRejected", "interface": ev.interface,
+                             "robot": ev.robot_id, "direction": direction,
+                             "reason": reason})
+            # 원복: 직전 정본 레코드 재게시로 CSE의 cf*를 되돌린다
+            self._qos_fcnt_cache.pop((ev.robot_id, ev.interface, direction), None)
+            self._qos_fcnt_last_pub.pop((ev.robot_id, ev.interface, direction), None)
+            self._publish_qos_state(only_key=key)
+            self._finish(ev.robot_id, ev.interface, corr, "rejected", now)
+
+        if not self.rc.qos_fcnt.allow_update or spec is None:
+            _reject("qos update not allowed" if spec is not None else "notBound")
+            return
+        candidate, why = self._parse_cf_update(payload, spec.qos)
+        if candidate is None:
+            _reject(why)
+            return
+        if candidate == spec.qos:
+            # 에코 가드: 자기 총함수 게시(또는 무변경 UPDATE)의 NOTIFY
+            self._finish(ev.robot_id, ev.interface, corr, "succeeded", now)
+            return
+        if direction == "command":
+            violation = command_qos_violation(candidate.liveliness,
+                                              candidate.deadline_ms)
+            if violation:
+                _reject(f"command qos violation: {violation} (§8.5)")
+                return
+        ok, reasons = self.adapter.check_candidate(key, candidate, direction)
+        if not ok:
+            _reject(f"predicted incompatible: {'; '.join(reasons)}")
+            return
+        if reasons:
+            self.emit_event("qosStatus", "warning",
+                            {"event": "predictedIncompatible", "interface": ev.interface,
+                             "robot": ev.robot_id, "reasons": reasons})
+        if not self.adapter.rebind_interface(key, candidate):
+            _reject("rebind failed")
+            return
+        self._qos_fcnt_cache.pop((ev.robot_id, ev.interface, direction), None)
+        self._qos_fcnt_last_pub.pop((ev.robot_id, ev.interface, direction), None)
+        self._publish_qos_state(only_key=key)   # 새 cf*+ap* 총함수 게시 = CSE 수렴
+        self.emit_event("qosStatus", "info",
+                        {"event": "qosConfigUpdated", "interface": ev.interface,
+                         "robot": ev.robot_id, "direction": direction})
+        self._finish(ev.robot_id, ev.interface, corr, "succeeded", now)
 
     # ------------------------------------------------------------------
     # 타이머 (executor 스레드)

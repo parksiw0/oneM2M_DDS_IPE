@@ -354,3 +354,103 @@ def spec_to_metadata(spec: QoSSpec) -> dict[str, str]:
 def _dedupe(events: list[str]) -> list[str]:
     """순서 보존 중복 제거(이벤트는 어휘이지 카운트가 아니다)."""
     return list(dict.fromkeys(events))
+
+
+# ---------------------------------------------------------------------------
+# QoS flexContainer 레코드 (QoS_FCNT_설계서 §4.2)
+# ---------------------------------------------------------------------------
+
+QOS_FCNT_SVER = "1"
+
+# peers 원소 축 ↔ dvAxs 이름. RxO 참여 5축만 — history/depth는 인트로스펙션이
+# UNKNOWN/0을 보고하므로 peers에 싣지 않는다(§4.2.4).
+_PEER_AXES = (("rlb", "reliability"), ("drb", "durability"),
+              ("liv", "liveliness"), ("ddl", "deadline"), ("lse", "lease"))
+
+
+def _inf_ms(ms: int | None) -> str:
+    return "INF" if ms is None else str(ms)
+
+
+def _axes(prefix: str, spec: QoSSpec) -> dict[str, Any]:
+    return {
+        f"{prefix}Rlb": spec.reliability,
+        f"{prefix}Drb": spec.durability,
+        f"{prefix}Hst": spec.history,
+        f"{prefix}Dpt": spec.depth,
+        f"{prefix}Ddl": _inf_ms(spec.deadline_ms),
+        f"{prefix}Lsp": _inf_ms(spec.lifespan_ms),
+        f"{prefix}Liv": spec.liveliness,
+        f"{prefix}Lse": _inf_ms(spec.liveliness_lease_duration_ms),
+    }
+
+
+def spec_to_fcnt_attrs(
+    *,
+    direction: str,
+    interface: str,
+    robot_id: str,
+    configured: QoSSpec,
+    applied: QoSSpec | None = None,
+    msg_type: str | None = None,
+    smode: str | None = None,
+    events: list[str] | None = None,
+    peers: list[dict[str, Any]] | None = None,
+    peer_count: int | None = None,
+) -> dict[str, Any]:
+    """총함수 FCNT 레코드 합성 — 부분 레코드를 만들 수 없는 유일한 API.
+
+    tinyIoT UPDATE는 custom_attrs blob을 요청 포함분만으로 덮어쓰므로(T4)
+    IPE의 모든 게시는 전체 속성을 실어야 한다(§4.2.2 규칙 2). applied가
+    있으면(=바인딩 후 게시) ap*·evts·peers·pcnt·dvAxs를 빈 값이라도 실어
+    한번 쓴 속성이 생략으로 유실되는 일이 없게 한다.
+    """
+    rec: dict[str, Any] = {
+        "dir": direction, "iface": interface, "robot": robot_id,
+        "sver": QOS_FCNT_SVER,
+    }
+    if msg_type:
+        rec["rtype"] = msg_type
+    if configured.profile:
+        rec["pfRef"] = configured.profile
+    rec.update(_axes("cf", configured))
+    if smode:
+        rec["smode"] = smode
+    if applied is not None:
+        rec.update(_axes("ap", applied))
+        rec["evts"] = list(events or [])
+        ps = list(peers or [])
+        rec["peers"] = ps
+        rec["pcnt"] = peer_count if peer_count is not None else len(ps)
+        rec["dvAxs"] = divergent_axes(ps)
+    return rec
+
+
+def endpoint_to_peer(info: Any, ep: str) -> dict[str, Any]:
+    """TopicEndpointInfo -> peers 원소 (§4.2.4).
+
+    UNKNOWN/SYSTEM_DEFAULT/BEST_AVAILABLE은 관측 사실로 통과시킨다 —
+    조정 비교에서만 제외될 뿐 보고 가치는 있다.
+    """
+    q = info.qos_profile
+    node = getattr(info, "node_name", "") or ""
+    ns = (getattr(info, "node_namespace", "") or "").rstrip("/")
+    return {
+        "ep": ep,
+        "node": f"{ns}/{node}" if node else "",
+        "rlb": _policy_name(q.reliability),
+        "drb": _policy_name(q.durability),
+        "liv": _policy_name(q.liveliness),
+        "ddl": _inf_ms(duration_ms(q.deadline)),
+        "lse": _inf_ms(duration_ms(q.liveliness_lease_duration)),
+        "lsp": _inf_ms(duration_ms(q.lifespan)),
+    }
+
+
+def divergent_axes(peers: list[dict[str, Any]]) -> list[str]:
+    """엔드포인트 간 값이 갈리는 RxO 축 이름 목록 — 다중 발행자 상이의 요약."""
+    out: list[str] = []
+    for short, name in _PEER_AXES:
+        if len({p.get(short) for p in peers if p.get(short) is not None}) > 1:
+            out.append(name)
+    return out

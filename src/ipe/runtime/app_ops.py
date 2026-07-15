@@ -21,6 +21,15 @@ SEVERITY_ORDER = {"info": 0, "warning": 1, "error": 2}
 class OpsMixin:
     def _tick_1s(self) -> None:
         self.adapter.tick()
+        # matched 콜백(Iron+)의 재조정 트리거 + CSE 재기동 후 전량 재게시
+        for key in self.adapter.pop_qos_dirty():
+            self.adapter.refresh_qos(key)
+            self._publish_qos_state(only_key=key)
+        if self._qos_republish.is_set():
+            self._qos_republish.clear()
+            self._qos_fcnt_cache.clear()
+            self._qos_fcnt_last_pub.clear()
+            self._publish_qos_state()
         now = time.time()
         for corr in self.svc_tx.sweep_timeouts(now):
             self.emit_event("serviceStatus", "warning",
@@ -50,11 +59,13 @@ class OpsMixin:
 
     def _discovery_refresh(self) -> None:
         try:
-            self.adapter.rebind_changed()   # offered 변화 → QoS 재계산/재구독 (§8.2)
+            changed = self.adapter.rebind_changed()   # offered/requested 재조정 (§8.2)
             snap = self.adapter.snapshot()
         except Exception as e:
             log.warning("discovery snapshot failed: %s", e)
             return
+        if changed:
+            self._publish_qos_state()
         self._prov_jobs.put(("reconcile_discovery", snap))
 
     # ------------------------------------------------------------------
@@ -69,7 +80,7 @@ class OpsMixin:
     def _publish_contracts(self) -> None:
         for key, spec in list(self.specs_by_key.items()):
             self._publish_contract_for(key, spec)
-        self._publish_qos_labels()
+        self._publish_qos_state()
 
     def _publish_contract_for(self, key: tuple[str, str, str], spec: Any) -> None:
         kind, robot, iface = key
@@ -113,18 +124,60 @@ class OpsMixin:
             return make_input_example(get_action(spec.action_type).Goal)
         return None
 
-    def _publish_qos_labels(self) -> None:
-        """resolved QoS를 관측 CNT lbl로 기록(§8.6) — 소비 AE 참고용, 비강제."""
-        from ipe.core.qos import spec_to_metadata
-        for key, st in getattr(self.adapter, "observes", {}).items():
-            robot, iface = key
-            path = (self.path_map.get((robot, iface, "history"))
-                    or self.path_map.get((robot, iface, "latest")))
-            if path is None or st.applied_qos is None:
+    def _publish_qos_state(self, only_key: tuple[str, str] | None = None) -> None:
+        """qos FCNT 총함수 게시 (QoS_FCNT_설계서 §4.5.2).
+
+        어댑터의 QoS 상태 스냅숏을 방향별 전체 속성 레코드로 게시한다.
+        캐시 비교(불변이면 생략)와 키별 최소 간격이 플래핑을 막고,
+        lbl_compat면 기존 qos:* lbl 스킴을 포인터와 함께 병행 게시한다.
+        """
+        from ipe.core.qos import spec_to_fcnt_attrs, spec_to_metadata
+        qf = self.rc.qos_fcnt
+        smode = self.rc.policy.get("qos_strictness", "reject")
+        now = time.monotonic()
+        for stt in self.adapter.qos_states():
+            robot, iface, direction = stt["robot_id"], stt["interface"], stt["direction"]
+            if only_key is not None and (robot, iface) != only_key:
                 continue
-            labels = [f"qos:{k}={v}" for k, v in spec_to_metadata(st.applied_qos).items()]
-            self.outbound.put(Op("update_lbl", path, {"labels": labels},
-                                 robot, iface, "qosmeta", CLASS_OBSERVE_BULK),
+            view = "qosObserve" if direction == "observe" else "qosCommand"
+            fcnt_path = self.path_map.get((robot, iface, view))
+            applied = stt["applied"]
+
+            # lbl 병행(Phase 1) — 기존 스킴 유지: observe 실효값 + qosResource 포인터
+            if qf.lbl_compat and direction == "observe" and applied is not None:
+                lpath = (self.path_map.get((robot, iface, "history"))
+                         or self.path_map.get((robot, iface, "latest"))
+                         or self.path_map.get((robot, iface, "fcnt")))
+                if lpath is not None:
+                    labels = [f"qos:{k}={v}"
+                              for k, v in spec_to_metadata(applied).items()]
+                    if fcnt_path:
+                        labels.append(f"ipe:qosResource={fcnt_path}")
+                    self.outbound.put(Op("update_lbl", lpath, {"labels": labels},
+                                         robot, iface, "qosmeta", CLASS_OBSERVE_BULK),
+                                      CLASS_OBSERVE_BULK)
+
+            if not qf.enabled or fcnt_path is None or applied is None:
+                continue   # 비활성/lbl-only/미바인딩 — FCNT 게시 없음
+            spec = (self.specs_by_key.get((direction, robot, iface))
+                    or self.specs_by_key.get(("observe", robot, iface)))
+            rec = spec_to_fcnt_attrs(
+                direction=direction, interface=iface, robot_id=robot,
+                configured=stt["configured"], applied=applied,
+                msg_type=getattr(spec, "msg_type", None),
+                smode=smode if direction == "observe" else None,
+                events=stt["events"], peers=stt["peers"][:qf.peers_max],
+                peer_count=len(stt["peers"]))
+            ckey = (robot, iface, direction)
+            if self._qos_fcnt_cache.get(ckey) == rec:
+                continue
+            last = self._qos_fcnt_last_pub.get(ckey)
+            if last is not None and now - last < qf.publish_min_interval_ms / 1000.0:
+                continue   # 캐시 미갱신 — 다음 트리거가 재시도한다
+            self._qos_fcnt_cache[ckey] = rec
+            self._qos_fcnt_last_pub[ckey] = now
+            self.outbound.put(Op("update_fcnt", fcnt_path, {qf.type: rec},
+                                 robot, iface, view, CLASS_OBSERVE_BULK),
                               CLASS_OBSERVE_BULK)
 
     # ------------------------------------------------------------------

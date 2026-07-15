@@ -29,6 +29,8 @@ class QoSSpec:
     lifespan_ms: int | None = None
     liveliness: str = "AUTOMATIC"
     liveliness_lease_duration_ms: int | None = None
+    # 유래한 qos_profiles 프리셋 이름 — FCNT의 pfRef(정책 아님, 출처 표기)
+    profile: str | None = None
 
     def merged(self, override: dict[str, Any]) -> QoSSpec:
         """필드 단위 병합: 프리셋 값 위에 인라인 키가 덮어쓴다."""
@@ -170,6 +172,19 @@ class ActionSpec:
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
+class QosFcntSpec:
+    """qos_fcnt 설정 블록 (QoS_FCNT_설계서 §5.2)."""
+
+    enabled: bool = True
+    type: str = "ros:tqos"
+    cnd: str = "kr.ac.sejong.seslab.ros2.moduleclass.topicQos"
+    lbl_compat: bool = True
+    allow_update: bool = False
+    publish_min_interval_ms: int = 5000
+    peers_max: int = 8
+
+
+@dataclass(frozen=True)
 class MqttSpec:
     """MQTT 바인딩 설정 (protocol: mqtt). 브로커 접속 + 토픽/QoS/TLS."""
 
@@ -225,4 +240,5 @@ class ResolvedConfig:
     topics: list[TopicSpec] = field(default_factory=list)
     services: list[ServiceSpec] = field(default_factory=list)
     actions: list[ActionSpec] = field(default_factory=list)
+    qos_fcnt: QosFcntSpec = field(default_factory=QosFcntSpec)
     raw: dict[str, Any] = field(default_factory=dict)

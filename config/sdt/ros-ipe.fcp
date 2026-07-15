@@ -1,0 +1,40 @@
+// ros:tqos — ROS 2 토픽 QoS flexContainer 특화 (QoS_FCNT_설계서 부록 A).
+// 배포: tinyIoT/source/server/sdt_definitions/ 에 복사 후 CSE 재기동
+// (sdt_init은 기동 시 1회, 핫리로드 없음).
+// 식별자·속성은 src/ipe/core/qos.py(spec_to_fcnt_attrs)와 일치해야 한다.
+[
+    {
+        "type"  : "ros:tqos",
+        "lname" : "ros2TopicQos",
+        "cnd"   : "kr.ac.sejong.seslab.ros2.moduleclass.topicQos",
+        "attributes" : [
+            { "sname": "dir",   "lname": "direction",             "type": "string",          "car": "1",  "oc": "M", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "iface", "lname": "interfaceName",         "type": "string",          "car": "1",  "oc": "M", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "robot", "lname": "robotId",               "type": "string",          "car": "1",  "oc": "M", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "rtype", "lname": "rosMessageType",        "type": "string",          "car": "01", "oc": "O", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "pfRef", "lname": "profileRef",            "type": "string",          "car": "01", "oc": "O", "ou": "O", "od": "O", "annc": "NA" },
+            { "sname": "sver",  "lname": "schemaVersion",         "type": "string",          "car": "01", "oc": "O", "ou": "O", "od": "O", "annc": "NA" },
+            { "sname": "cfRlb", "lname": "configuredReliability", "type": "string",          "car": "1",  "oc": "M", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "cfDrb", "lname": "configuredDurability",  "type": "string",          "car": "1",  "oc": "M", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "cfHst", "lname": "configuredHistory",     "type": "string",          "car": "1",  "oc": "M", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "cfDpt", "lname": "configuredDepth",       "type": "positiveInteger", "car": "1",  "oc": "M", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "cfDdl", "lname": "configuredDeadlineMs",  "type": "string",          "car": "1",  "oc": "M", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "cfLsp", "lname": "configuredLifespanMs",  "type": "string",          "car": "1",  "oc": "M", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "cfLiv", "lname": "configuredLiveliness",  "type": "string",          "car": "1",  "oc": "M", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "cfLse", "lname": "configuredLeaseMs",     "type": "string",          "car": "1",  "oc": "M", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "apRlb", "lname": "appliedReliability",    "type": "string",          "car": "01", "oc": "O", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "apDrb", "lname": "appliedDurability",     "type": "string",          "car": "01", "oc": "O", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "apHst", "lname": "appliedHistory",        "type": "string",          "car": "01", "oc": "O", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "apDpt", "lname": "appliedDepth",          "type": "positiveInteger", "car": "01", "oc": "O", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "apDdl", "lname": "appliedDeadlineMs",     "type": "string",          "car": "01", "oc": "O", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "apLsp", "lname": "appliedLifespanMs",     "type": "string",          "car": "01", "oc": "O", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "apLiv", "lname": "appliedLiveliness",     "type": "string",          "car": "01", "oc": "O", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "apLse", "lname": "appliedLeaseMs",        "type": "string",          "car": "01", "oc": "O", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "smode", "lname": "strictnessMode",        "type": "string",          "car": "01", "oc": "O", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "evts",  "lname": "reconcileEvents",       "type": "list",            "car": "01", "oc": "O", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "peers", "lname": "peerEndpoints",         "type": "list",            "car": "01", "oc": "O", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "pcnt",  "lname": "peerCount",             "type": "nonNegInteger",   "car": "01", "oc": "O", "ou": "O", "od": "O", "annc": "OA" },
+            { "sname": "dvAxs", "lname": "divergentAxes",         "type": "list",            "car": "01", "oc": "O", "ou": "O", "od": "O", "annc": "OA" }
+        ]
+    }
+]

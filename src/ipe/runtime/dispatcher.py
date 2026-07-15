@@ -16,13 +16,15 @@ from ipe.onem2m.notification import Notification
 
 # kind -> CIN con 안의 상관 키. cancel은 goalId로 상관시키되 dedup은
 # (robot_id, goalId, event_id) 기준이다 — 그래서 모든 InboundEvent에
-# event_id가 실린다.
+# event_id가 실린다. qos_update는 CIN이 아니라 FCNT NOTIFY라 route()가
+# 특별 취급한다(멱등 키 = "sur:st=N", 설계서 §4.5.3).
 CORRELATION_FIELDS: dict[str, str] = {
     "command": "commandId",
     "service": "requestId",
     "action_goal": "goalId",
     "cancel": "goalId",
     "decision": "proposalId",
+    "qos_update": "st",
 }
 
 
@@ -38,6 +40,7 @@ class InboundEvent:
     ingest_monotonic: float | None = None   # 수락 시각(단조) — dispatch 신선도 게이트 입력
     dedup_corr: str | None = None            # admission이 실제 사용한 멱등 키(드레인과 일치 필수)
     spec: Any = None                          # _bind_* 내부 이벤트의 운반체
+    meta: dict[str, Any] | None = None        # Route.meta 사본 (qos_update: direction)
 
 
 @dataclass
@@ -108,6 +111,16 @@ class RouteTable:
             r = self._routes.get(path_key)
         if r is None:
             return None
+        if r.kind == "qos_update":
+            if notif.fcnt is None:
+                return None   # 특화 rep가 아닌 NOTIFY(예: 검증)는 소비하지 않는다
+            event_id = (f"{notif.sur or path_key}:st={notif.st}"
+                        if notif.st is not None else notif.cin_ri)
+            return InboundEvent(
+                kind=r.kind, robot_id=r.robot_id, interface=r.interface,
+                correlation_id=None, event_id=event_id, payload=notif.fcnt,
+                ct=None, meta=dict(r.meta),
+            )
         corr = None
         if notif.con is not None:
             corr = notif.con.get(CORRELATION_FIELDS[r.kind])
@@ -119,4 +132,5 @@ class RouteTable:
             event_id=notif.cin_ri,
             payload=notif.con,
             ct=notif.cin_ct,
+            meta=dict(r.meta) if r.meta else None,
         )

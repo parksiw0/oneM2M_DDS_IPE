@@ -54,6 +54,31 @@ def _event_callbacks(kind: str) -> Any:
                    else "PublisherEventCallbacks")
 
 
+def _supported_axes(cb_cls: Any, axes: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """콜백 클래스 시그니처에 없는 축 제거 — Humble에는 matched/incompatible_type
+    kwarg 자체가 없어 생성자가 TypeError를 낸다(§4.6.1의 배포판 격차)."""
+    import inspect
+    params = inspect.signature(cb_cls.__init__).parameters
+    return ({k: v for k, v in axes.items() if k in params},
+            [k for k in axes if k not in params])
+
+
+def _qos_event_fields(info: Any) -> dict[str, Any]:
+    """incompatible 계열 상태 구조체 → 구조화 필드(policy/total_count, §4.6.1)."""
+    out: dict[str, Any] = {"info": str(info)}
+    tc = getattr(info, "total_count", None)
+    if tc is not None:
+        out["total_count"] = tc
+    kind = getattr(info, "last_policy_kind", None)
+    if kind is not None:
+        try:
+            from rclpy.qos import qos_policy_name_from_kind
+            out["policy"] = qos_policy_name_from_kind(kind)
+        except Exception:
+            out["policy"] = str(kind)
+    return out
+
+
 # 액션 클라이언트 kwarg 이름은 채널 정본(spec.ACTION_QOS_CHANNELS)에서 파생 —
 # 채널 추가 시 spec 한 곳만 고친다. 미지 채널은 기존처럼 KeyError로 드러난다.
 _ACTION_CHAN_KWARG = {ch: f"{ch}_qos_profile" for ch in ACTION_QOS_CHANNELS}
@@ -63,10 +88,12 @@ _ACTION_CHAN_KWARG = {ch: f"{ch}_qos_profile" for ch in ACTION_QOS_CHANNELS}
 class _ObserveState:
     spec: TopicSpec
     subscription: Any
-    applied_qos: Any = None              # reconcile 결과 — rebind 비교 기준
+    applied_qos: Any = None              # reconcile+guard 결과 — rebind 비교 기준
     seq: int = 0
     last_arrival_mono: float | None = None
     stale_flagged: bool = False
+    offered_peers: list[dict[str, Any]] = field(default_factory=list)
+    events: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -74,9 +101,12 @@ class _CommandState:
     spec: TopicSpec
     publisher: Any
     msg_class: Any
+    applied_qos: Any = None
     last_publish_mono: float | None = None
     watchdog_fired: bool = False
     recent_hashes: list[tuple[str, float]] = field(default_factory=list)
+    requested_peers: list[dict[str, Any]] = field(default_factory=list)
+    events: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -105,6 +135,8 @@ class GenericROS2Adapter:
         self.actions: dict[tuple[str, str], _ActionState] = {}
         self._reentrant = None
         self._qos_event_last: dict[tuple[str, str], float] = {}
+        self._qos_dirty: set[tuple[str, str]] = set()
+        self._qos_dirty_last: dict[tuple[str, str], float] = {}
 
     def _load_or_report(self, kind: str, type_str: str,
                         spec: TopicSpec | ServiceSpec | ActionSpec) -> Any | None:
@@ -152,8 +184,8 @@ class GenericROS2Adapter:
         if msg_class is None:
             return False
 
-        offered = [i.qos_profile for i in
-                   self.node.get_publishers_info_by_topic(spec.interface)]
+        infos = self.node.get_publishers_info_by_topic(spec.interface)
+        offered = [i.qos_profile for i in infos]
         resolved, events = qosmod.reconcile_observe(offered, spec.qos,
                                                     has_explicit=True)
         # observe에서 offered보다 엄격한 deadline/lease/liveliness는 매칭을 0으로 만든다
@@ -179,32 +211,160 @@ class GenericROS2Adapter:
         sub = self._create_subscription_degrading(msg_class, spec, profile, callback)
         if sub is None:
             return False
-        self.observes[key] = _ObserveState(spec=spec, subscription=sub,
-                                           applied_qos=resolved)
+        self.observes[key] = _ObserveState(
+            spec=spec, subscription=sub, applied_qos=resolved,
+            offered_peers=[qosmod.endpoint_to_peer(i, "pub") for i in infos],
+            events=list(dict.fromkeys([*events, *strict_events])))
         log.info("observe bound: %s [%s] (%s)", spec.interface, spec.msg_type, spec.robot_id)
         return True
 
     def rebind_changed(self) -> int:
-        """offered 집합 변화 감지 → weakest 재계산 → 달라진 구독 재생성 (§8.2).
-        executor 스레드 전용. seq는 보존한다(소비자 정렬 키 연속성)."""
+        """디스커버리 변화 재조정 — observe·command 전 키 refresh (§8.2, 설계서 결정 #9).
+        executor 스레드 전용. 반환값은 상태(applied/peers/events)가 변한 키 수."""
         changed = 0
-        for key, st in list(self.observes.items()):
-            offered = [i.qos_profile for i in
-                       self.node.get_publishers_info_by_topic(st.spec.interface)]
-            if not offered:
-                continue   # publisher 부재는 변화가 아니다 — fallback 유지
-            new_spec, _ = qosmod.reconcile_observe(offered, st.spec.qos, has_explicit=True)
-            if new_spec == st.applied_qos:
-                continue
-            seq = st.seq
-            self.unbind_observe(key)
-            if self.bind_observe(st.spec):
-                self.observes[key].seq = seq
-                self._event("qosStatus", "warning",
-                            {"event": "qosRebind", "interface": st.spec.interface,
-                             "robot": st.spec.robot_id})
+        for key in list(self.observes.keys() | self.commands.keys()):
+            if self.refresh_qos(key):
                 changed += 1
         return changed
+
+    def refresh_qos(self, key: tuple[str, str]) -> bool:
+        """한 키의 offered/requested 재조회 → peers 갱신 + 실효값 변화 시 재바인딩.
+        True = 게시할 변화가 있음."""
+        changed = False
+        if key in self.observes:
+            changed = self._refresh_observe(key)
+        if key in self.commands:
+            changed = self._refresh_command(key) or changed
+        return changed
+
+    def _refresh_observe(self, key: tuple[str, str]) -> bool:
+        st = self.observes[key]
+        infos = self.node.get_publishers_info_by_topic(st.spec.interface)
+        peers = [qosmod.endpoint_to_peer(i, "pub") for i in infos]
+        changed = peers != st.offered_peers
+        st.offered_peers = peers
+        if not infos:
+            return changed   # publisher 부재는 변화가 아니다 — fallback 유지
+        offered = [i.qos_profile for i in infos]
+        new_spec, events = qosmod.reconcile_observe(offered, st.spec.qos,
+                                                    has_explicit=True)
+        # applied_qos는 가드 적용 후 값 — 같은 기준으로 비교해야 demote 강등
+        # 토픽이 offered 불변인데도 폴마다 rebind를 반복하지 않는다
+        guarded_new, strict_events = qosmod.strictness_guard(new_spec, offered,
+                                                             self.qos_strictness)
+        if guarded_new == st.applied_qos:
+            ev_all = list(dict.fromkeys([*events, *strict_events]))
+            if ev_all != st.events:
+                st.events = ev_all
+                changed = True
+            return changed
+        seq = st.seq
+        self.unbind_observe(key)
+        if self.bind_observe(st.spec):
+            self.observes[key].seq = seq
+            self._event("qosStatus", "warning",
+                        {"event": "qosRebind", "interface": st.spec.interface,
+                         "robot": st.spec.robot_id})
+        return True
+
+    def _refresh_command(self, key: tuple[str, str]) -> bool:
+        st = self.commands[key]
+        infos = self.node.get_subscriptions_info_by_topic(st.spec.interface)
+        peers = [qosmod.endpoint_to_peer(i, "sub") for i in infos]
+        changed = peers != st.requested_peers
+        st.requested_peers = peers
+        if not infos:
+            return changed   # subscriber 부재 — fallback 유지
+        new_spec, events = qosmod.reconcile_command(
+            [i.qos_profile for i in infos], st.spec.qos)
+        if new_spec == st.applied_qos:
+            ev_all = list(dict.fromkeys(events))
+            if ev_all != st.events:
+                st.events = ev_all
+                changed = True
+            return changed
+        self.unbind_command(key)
+        if self.bind_command(st.spec):
+            self._event("qosStatus", "warning",
+                        {"event": "qosRebind", "interface": st.spec.interface,
+                         "robot": st.spec.robot_id, "direction": "command"})
+        return True
+
+    def check_candidate(self, key: tuple[str, str], candidate: Any,
+                        direction: str) -> tuple[bool, list[str]]:
+        """qos_update 후보의 예측 판정(§4.5.3-3) — reconcile+guard 재실행 후
+        check_compatible. (False, 이유)=거부, (True, 이유)=수락(+경고)."""
+        iface = key[1]
+        if direction == "observe":
+            offered = [i.qos_profile for i in
+                       self.node.get_publishers_info_by_topic(iface)]
+            resolved, _ = qosmod.reconcile_observe(offered, candidate,
+                                                   has_explicit=True)
+            guarded, strict = qosmod.strictness_guard(resolved, offered,
+                                                      self.qos_strictness)
+            if strict and self.qos_strictness == "reject":
+                return False, strict
+            profile = qosmod.build_qos_profile(guarded)
+            pairs = [(o, profile) for o in offered]
+        else:
+            requested = [i.qos_profile for i in
+                         self.node.get_subscriptions_info_by_topic(iface)]
+            resolved, _ = qosmod.reconcile_command(requested, candidate)
+            profile = qosmod.build_qos_profile(resolved)
+            pairs = [(profile, r) for r in requested]
+        warnings: list[str] = []
+        for pub_q, sub_q in pairs:
+            ok, reasons = qosmod.check_compatible(pub_q, sub_q)
+            if not ok:
+                return False, reasons
+            warnings.extend(reasons)
+        return True, list(dict.fromkeys(warnings))
+
+    def rebind_interface(self, key: tuple[str, str], new_qos: Any) -> bool:
+        """qos_update 수락 경로(§4.5.3) — 설정 QoS 교체 후 단건 재바인딩.
+        observe는 seq를 보존한다. direction=both면 양방향 모두 재생성."""
+        ok = True
+        ost = self.observes.get(key)
+        if ost is not None:
+            ost.spec.qos = new_qos
+            seq = ost.seq
+            self.unbind_observe(key)
+            if self.bind_observe(ost.spec):
+                self.observes[key].seq = seq
+            else:
+                ok = False
+        cst = self.commands.get(key)
+        if cst is not None:
+            cst.spec.qos = new_qos
+            self.unbind_command(key)
+            ok = self.bind_command(cst.spec) and ok
+        return ok
+
+    def qos_states(self) -> list[dict[str, Any]]:
+        """게시 입력 QoSStateIR 스냅숏 — 방향별 1건 (direction=both는 2건)."""
+        out: list[dict[str, Any]] = []
+        for (robot, iface), st in self.observes.items():
+            out.append({"robot_id": robot, "interface": iface, "direction": "observe",
+                        "configured": st.spec.qos, "applied": st.applied_qos,
+                        "peers": list(st.offered_peers), "events": list(st.events)})
+        for (robot, iface), st in self.commands.items():
+            out.append({"robot_id": robot, "interface": iface, "direction": "command",
+                        "configured": st.spec.qos, "applied": st.applied_qos,
+                        "peers": list(st.requested_peers), "events": list(st.events)})
+        return out
+
+    def pop_qos_dirty(self) -> set[tuple[str, str]]:
+        """matched 콜백이 표시한 재조정 대상 키를 소비한다(Iron+, §4.6.1)."""
+        dirty, self._qos_dirty = self._qos_dirty, set()
+        return dirty
+
+    def _mark_qos_dirty(self, key: tuple[str, str]) -> None:
+        now = time.monotonic()
+        last = self._qos_dirty_last.get(key)
+        if last is not None and now - last < QOS_EVENT_COALESCE_SEC:
+            return
+        self._qos_dirty_last[key] = now
+        self._qos_dirty.add(key)
 
     def _create_subscription_degrading(self, msg_class: Any, spec: TopicSpec,
                                        profile: Any, callback: Any) -> Any:
@@ -217,13 +377,21 @@ class GenericROS2Adapter:
             def cb(info: Any) -> None:
                 self._event("qosStatus", "warning",
                             {"event": name, "interface": spec.interface,
-                             "robot": spec.robot_id, "info": str(info)})
+                             "robot": spec.robot_id, **_qos_event_fields(info)})
             return cb
 
         axes = {"deadline": _mk("deadlineMissed"),
                 "liveliness": _mk("livelinessChanged"),
                 "incompatible_qos": _mk("qosMismatch"),
-                "message_lost": _mk("messageLost")}
+                "message_lost": _mk("messageLost"),
+                "incompatible_type": _mk("incompatibleType"),
+                # matched(Iron+)는 CIN을 내지 않는 내부 재조정 트리거(§4.6.1)
+                "matched": lambda _info: self._mark_qos_dirty(key)}
+        axes, unsupported = _supported_axes(SubscriptionEventCallbacks, axes)
+        for axis in unsupported:
+            self._event("qosStatus", "warning",
+                        {"event": "eventCallbackUnsupported", "axis": axis,
+                         "interface": spec.interface, "robot": spec.robot_id})
         while True:
             try:
                 return self.node.create_subscription(
@@ -306,6 +474,11 @@ class GenericROS2Adapter:
         if st is not None:
             self.node.destroy_subscription(st.subscription)
 
+    def unbind_command(self, key: tuple[str, str]) -> None:
+        st = self.commands.pop(key, None)
+        if st is not None:
+            self.node.destroy_publisher(st.publisher)
+
     # ------------------------------------------------------------------
     # command (strongest-requested QoS)
     # ------------------------------------------------------------------
@@ -318,30 +491,58 @@ class GenericROS2Adapter:
         if msg_class is None:
             return False
 
-        requested = [i.qos_profile for i in
-                     self.node.get_subscriptions_info_by_topic(spec.interface)]
+        infos = self.node.get_subscriptions_info_by_topic(spec.interface)
+        requested = [i.qos_profile for i in infos]
         resolved, events = qosmod.reconcile_command(requested, spec.qos)
         for ev in events:
             self._event("qosStatus", "warning",
                         {"event": ev, "interface": spec.interface, "robot": spec.robot_id})
         profile = qosmod.build_qos_profile(resolved)
-
-        PublisherEventCallbacks = _event_callbacks("pub")
-
-        def incompat(info: Any) -> None:
-            self._event("commandStatus", "error",
-                        {"event": "incompatibleQoS", "interface": spec.interface,
-                         "robot": spec.robot_id, "info": str(info)})
-
-        try:
-            pub = self.node.create_publisher(
-                msg_class, spec.interface, profile,
-                event_callbacks=PublisherEventCallbacks(incompatible_qos=incompat))
-        except Exception:
-            pub = self.node.create_publisher(msg_class, spec.interface, profile)
-        self.commands[key] = _CommandState(spec=spec, publisher=pub, msg_class=msg_class)
+        pub = self._create_publisher_degrading(msg_class, spec, profile, key)
+        self.commands[key] = _CommandState(
+            spec=spec, publisher=pub, msg_class=msg_class, applied_qos=resolved,
+            requested_peers=[qosmod.endpoint_to_peer(i, "sub") for i in infos],
+            events=list(events))
         log.info("command bound: %s [%s] (%s)", spec.interface, spec.msg_type, spec.robot_id)
         return True
+
+    def _create_publisher_degrading(self, msg_class: Any, spec: TopicSpec,
+                                    profile: Any, key: tuple[str, str]) -> Any:
+        """발행자 생성 — 구독과 동일한 이벤트 축 점진 강등(§4.6.1).
+        LivelinessLost는 의도적으로 미등록: command liveliness는 AUTOMATIC
+        고정이라 lost == IPE 프로세스 정지와 동치다."""
+        PublisherEventCallbacks = _event_callbacks("pub")
+
+        def _mk(category: str, severity: str, name: str) -> Callable[[Any], None]:
+            def cb(info: Any) -> None:
+                self._event(category, severity,
+                            {"event": name, "interface": spec.interface,
+                             "robot": spec.robot_id, **_qos_event_fields(info)})
+            return cb
+
+        axes = {"incompatible_qos": _mk("commandStatus", "error", "incompatibleQoS"),
+                "deadline": _mk("qosStatus", "warning", "offeredDeadlineMissed"),
+                "incompatible_type": _mk("qosStatus", "warning", "incompatibleType"),
+                "matched": lambda _info: self._mark_qos_dirty(key)}
+        axes, unsupported = _supported_axes(PublisherEventCallbacks, axes)
+        for axis in unsupported:
+            self._event("qosStatus", "warning",
+                        {"event": "eventCallbackUnsupported", "axis": axis,
+                         "interface": spec.interface, "robot": spec.robot_id})
+        while axes:
+            try:
+                return self.node.create_publisher(
+                    msg_class, spec.interface, profile,
+                    event_callbacks=PublisherEventCallbacks(**axes))
+            except Exception as e:
+                if "UnsupportedEventType" not in type(e).__name__:
+                    break
+                dropped = next(iter(axes))
+                axes.pop(dropped)
+                self._event("qosStatus", "warning",
+                            {"event": "eventCallbackUnsupported", "axis": dropped,
+                             "interface": spec.interface, "robot": spec.robot_id})
+        return self.node.create_publisher(msg_class, spec.interface, profile)
 
     def publish_command(self, spec: TopicSpec, canonical: dict[str, Any]) -> bool:
         key = (spec.robot_id, spec.interface)
