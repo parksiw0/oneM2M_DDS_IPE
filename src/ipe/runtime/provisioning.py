@@ -34,6 +34,8 @@ class ProvisionResult:
     status_paths: dict[str, str] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     fallbacks: list[str] = field(default_factory=list)   # FCNT→CNT 폴백 등 비치명 이탈
+    # qos FCNT 생성 실패 → 해당 인터페이스는 lbl-only 모드 (§4.5.1)
+    qos_fcnt_failed: list[dict[str, Any]] = field(default_factory=list)
 
 
 class Provisioner:
@@ -150,20 +152,52 @@ class Provisioner:
         rep = t.representation
         if rep in ("latest",):
             if t.flexcontainer and self._try_fcnt_leaf(res, base, t):
-                return
-            path = self._ensure_chain(base, t.rel_path, mni=1)
-            res.path_map[(t.robot_id, t.interface, "latest")] = path
+                # FCNT 표현 토픽도 qos가 붙는다(T2: FCNT 자식 허용) — 3.5절 #2 해소
+                node = res.path_map[(t.robot_id, t.interface, "fcnt")]
+            else:
+                node = self._ensure_chain(base, t.rel_path, mni=1)
+                res.path_map[(t.robot_id, t.interface, "latest")] = node
         elif rep == "both":
-            parent = self._ensure_chain(base, t.rel_path)
+            node = self._ensure_chain(base, t.rel_path)
             # CNT 이름에 latest/oldest/la/ol 금지 — tinyIoT 가상 리소스 예약어(rn invalid 405)
-            if not (t.flexcontainer and self._try_fcnt_child(res, parent, t)):
+            if not (t.flexcontainer and self._try_fcnt_child(res, node, t)):
                 res.path_map[(t.robot_id, t.interface, "latest")] = \
-                    self.ops.ensure_cnt(parent, "last", mni=1)
+                    self.ops.ensure_cnt(node, "last", mni=1)
             res.path_map[(t.robot_id, t.interface, "history")] = \
-                self.ops.ensure_cnt(parent, "hist")
+                self.ops.ensure_cnt(node, "hist")
         else:   # historical | sampled
-            path = self._ensure_chain(base, t.rel_path)
-            res.path_map[(t.robot_id, t.interface, "history")] = path
+            node = self._ensure_chain(base, t.rel_path)
+            res.path_map[(t.robot_id, t.interface, "history")] = node
+        self._provision_qos_fcnt(res, node, t, "observe")
+
+    def _provision_qos_fcnt(self, res: ProvisionResult, node: str, t: Any,
+                            direction: str) -> None:
+        """인터페이스 노드 아래 rn='qos' FCNT — 배치 단일 규칙(§4.4).
+        실패는 치명 아님: lbl-only 모드로 기록하고 계속 간다(§4.5.1)."""
+        qf = self.rc.qos_fcnt
+        if not qf.enabled:
+            return
+        from ipe.core.qos import spec_to_fcnt_attrs
+        attrs = spec_to_fcnt_attrs(
+            direction=direction, interface=t.interface, robot_id=t.robot_id,
+            configured=t.qos, msg_type=t.msg_type,
+            smode=(self.rc.policy.get("qos_strictness", "reject")
+                   if direction == "observe" else None))
+        attrs["lbl"] = ["Iwked-Technology:ROS2", "Iwked-Entity-Type:topic",
+                        f"Iwked-Entity-ID:{t.interface}"]
+        view = "qosObserve" if direction == "observe" else "qosCommand"
+        try:
+            path = self.ops.ensure_fcnt(node, "qos", qf.cnd, qf.type, attrs)
+        except Exception as e:
+            res.qos_fcnt_failed.append({"robot": t.robot_id, "interface": t.interface,
+                                        "direction": direction, "error": str(e)})
+            return
+        res.path_map[(t.robot_id, t.interface, view)] = path
+        if qf.allow_update:
+            self._input_sub(res, path, "qos_update", t.robot_id, t.interface,
+                            f"{direction}/{t.rel_path}", net=[1])
+            res.routes[f"qos_update/{t.robot_id}/{direction}/{t.rel_path}"][
+                "direction"] = direction
 
     def _try_fcnt_leaf(self, res: ProvisionResult, base: str, t: Any) -> bool:
         segs = [x for x in t.rel_path.split("/") if x]
@@ -189,12 +223,15 @@ class Provisioner:
         return True
 
     def _input_sub(self, res: ProvisionResult, cnt_path: str, kind: str,
-                   robot_id: str, interface: str, rel_path: str) -> None:
+                   robot_id: str, interface: str, rel_path: str,
+                   net: list[int] | None = None) -> None:
         path_key = f"{kind}/{robot_id}/{rel_path}"
         # mqtt: 모든 SUB가 단일 POA URI를 nu로 공유, 경로 구분은 sur (app이 별칭 등록)
         nu = (self.poa_base if self.protocol == "mqtt"
               else f"{self.poa_base}/notify/{path_key}")
-        sub = self.ops.ensure_sub(cnt_path, "ipeSub", [nu], net=[3], nct=1)
+        # qos FCNT SUB에 atr 필터 금지(T9) — net만 제어한다
+        sub = self.ops.ensure_sub(cnt_path, "ipeSub", [nu],
+                                  net=net if net is not None else [3], nct=1)
         if not sub.ok:
             res.errors.append(f"SUB on {cnt_path} not active: {sub.detail}")
         res.routes[path_key] = {"kind": kind, "robot_id": robot_id,
@@ -207,6 +244,7 @@ class Provisioner:
         self.ops.ensure_cnt(parent, "publishStatus")
         res.path_map[(t.robot_id, t.interface, "publishStatus")] = f"{parent}/publishStatus"
         self._input_sub(res, req, "command", t.robot_id, t.interface, t.rel_path)
+        self._provision_qos_fcnt(res, parent, t, "command")
 
     def _provision_service(self, res: ProvisionResult, ae: str, s: Any) -> None:
         parent = self._ensure_chain(f"{ae}/services", s.rel_path)

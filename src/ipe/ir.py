@@ -22,3 +22,19 @@ class TopicIR(TypedDict):
     seq: int                     # (robot, interface)별 단조 증가 시퀀스
     payload: dict[str, Any]      # 파싱된 메시지 필드 (rosidl dict 형태)
     metadata: dict[str, Any]     # source_node, qos, sim_time 플래그 등
+
+
+class QoSStateIR(TypedDict):
+    """어댑터 -> 앱 QoS 상태 운반 계약 (QoS_FCNT_설계서 §5.2).
+
+    qos FCNT 게시의 입력이며 TopicIR.metadata에는 싣지 않는다(CIN마다
+    QoS를 나르지 않음).
+    """
+
+    robot_id: str
+    interface: str
+    direction: str               # "observe" | "command"
+    configured: Any              # QoSSpec (YAML 해석 결과)
+    applied: Any                 # QoSSpec | None — 바인딩 전 None
+    peers: list[dict[str, Any]]  # core.qos.endpoint_to_peer 원소
+    events: list[str]            # 마지막 조정·가드 어휘 (§4.6.2)

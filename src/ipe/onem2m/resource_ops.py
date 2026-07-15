@@ -268,11 +268,34 @@ class ResourceOps:
 
     # -- 기타 ----------------------------------------------------------------
 
+    @staticmethod
+    def _lbl_key(label: str) -> str:
+        """'k=v' 라벨의 병합 키('k='). '='가 없는 라벨은 라벨 전체가 키다."""
+        head, sep, _ = label.partition("=")
+        return head + sep
+
     def update_lbl(
         self, path: str, labels: list[str], ty_key: str = "m2m:cnt"
     ) -> OneM2MResponse:
-        """lbl 속성만 UPDATE한다(가용성 표시)."""
-        return self.client.update(path, {ty_key: {"lbl": labels}})
+        """lbl을 키 단위 병합으로 UPDATE — 같은 'k=' 라벨만 교체, 나머지 보존.
+
+        oneM2M UPDATE는 lbl 전체를 교체하므로 통짜 전송은 qos:*와
+        ipe:available=*이 서로를 지우는 경합이 된다(설계서 3.5절 #3).
+        루트 키는 RETRIEVE 응답에서 감지한다(FCNT 특화 키 포함).
+        """
+        existing: list[str] = []
+        try:
+            r = self.client.get(path)
+        except (TransportError, OversizeError):
+            r = None
+        if r is not None and r.ok and isinstance(r.body, dict) and r.body:
+            ty_key = next(iter(r.body))
+            inner = r.body.get(ty_key)
+            if isinstance(inner, dict) and isinstance(inner.get("lbl"), list):
+                existing = [x for x in inner["lbl"] if isinstance(x, str)]
+        new_keys = {self._lbl_key(lb) for lb in labels}
+        merged = [lb for lb in existing if self._lbl_key(lb) not in new_keys] + labels
+        return self.client.update(path, {ty_key: {"lbl": merged}})
 
     def retrieve(self, path: str) -> OneM2MResponse:
         return self.client.get(path)

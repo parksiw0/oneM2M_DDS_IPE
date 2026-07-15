@@ -399,6 +399,22 @@ CONFIG_SCHEMA: dict[str, Any] = {
         "schema": {"enabled": {"type": "boolean", "default": False}},
         "default": {},
     },
+    # QoS flexContainer 게시 (QoS_FCNT_설계서 §4~5)
+    "qos_fcnt": {
+        "type": "dict",
+        "required": False,
+        "schema": {
+            "enabled": {"type": "boolean", "default": True},
+            "type": {"type": "string", "empty": False, "default": "ros:tqos"},
+            "cnd": {"type": "string", "empty": False,
+                    "default": "kr.ac.sejong.seslab.ros2.moduleclass.topicQos"},
+            "lbl_compat": {"type": "boolean", "default": True},
+            "allow_update": {"type": "boolean", "default": False},
+            "publish_min_interval_ms": {"type": "integer", "min": 0, "default": 5000},
+            "peers_max": {"type": "integer", "min": 0, "default": 8},
+        },
+        "default": {},
+    },
     "expose": {"type": "list", "required": False, "default": []},  # 예약 필드(D2)
 }
 

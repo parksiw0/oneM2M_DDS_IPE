@@ -39,6 +39,7 @@ from ipe.config.spec import (
     CommandSafety,
     CSESpec,
     MqttSpec,
+    QosFcntSpec,
     QoSSpec,
     ResolvedConfig,
     RobotSpec,
@@ -90,7 +91,8 @@ def _builtin_denied(kind: str, interface: str) -> bool:
 def _parse_qos_profiles(raw: dict[str, Any]) -> dict[str, QoSSpec]:
     out: dict[str, QoSSpec] = {}
     for name, d in raw.items():
-        out[name] = QoSSpec().merged(d)  # 내장 기본값 위에 프로파일 키가 덮어씀
+        # 내장 기본값 위에 프로파일 키가 덮어씀; profile=출처 이름(pfRef)
+        out[name] = QoSSpec(profile=name).merged(d)
     return out
 
 
@@ -442,6 +444,17 @@ def resolve(config: dict[str, Any], discovered: Discovered | None = None) -> Res
 
     _check_collisions(topics, services, actions, by_id, cse.ae_name)
 
+    qf = config.get("qos_fcnt", {})
+    qos_fcnt = QosFcntSpec(
+        enabled=bool(qf.get("enabled", True)),
+        type=qf.get("type", "ros:tqos"),
+        cnd=qf.get("cnd", "kr.ac.sejong.seslab.ros2.moduleclass.topicQos"),
+        lbl_compat=bool(qf.get("lbl_compat", True)),
+        allow_update=bool(qf.get("allow_update", False)),
+        publish_min_interval_ms=int(qf.get("publish_min_interval_ms", 5000)),
+        peers_max=int(qf.get("peers_max", 8)),
+    )
+
     return ResolvedConfig(
         instance_id=config.get("ipe", {}).get("instance_id", "ros2-ipe"),
         cse=cse,
@@ -461,6 +474,7 @@ def resolve(config: dict[str, Any], discovered: Discovered | None = None) -> Res
         topics=topics,
         services=services,
         actions=actions,
+        qos_fcnt=qos_fcnt,
         raw=config,
     )
 
@@ -688,11 +702,13 @@ def _check_collisions(
 
     for t in topics:
         who = f"{t.interface} (robot={t.robot_id})"
-        views = ("", "/latest", "/history") if t.representation == "both" else ("",)
+        # "/qos" 뷰는 qos FCNT 자리(QoS_FCNT_설계서 §4.4) — 사용자 경로의 선점을 조기 검출
+        views = (("", "/latest", "/history", "/qos")
+                 if t.representation == "both" else ("", "/qos"))
         if t.direction in ("observe", "both"):
             chk(t.robot_id, "ros2Data", t.rel_path, who, views)
         if t.direction in ("command", "both"):
-            chk(t.robot_id, "ros2Command", t.rel_path, who)
+            chk(t.robot_id, "ros2Command", t.rel_path, who, ("", "/qos"))
     for s in services:
         chk(s.robot_id, "services", s.rel_path, f"{s.interface} (robot={s.robot_id})")
     for a in actions:
