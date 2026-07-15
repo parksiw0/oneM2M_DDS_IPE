@@ -1,0 +1,141 @@
+# TurtleBot3 Burger 데모 — 터틀봇 토픽 전체(config-only), 토픽별 QoS 명시.
+# PC 실행: bash tools/run_ipe_humble.sh (Humble 컨테이너). 로봇 env: tools/tb3_env.sh.
+# 사전 조건: tinyIoT에 config/sdt/ros-ipe.fcp 배포 후 재시작.
+# /rosout·/parameter_events는 제외 — IPE 노드 자신도 발행하는 인프라 토픽이라 자기 관측 루프가 생김.
+
+ipe: { instance_id: tb3-ipe }
+
+cse:
+  endpoint: http://localhost:3000
+  cse_base: TinyIoT
+  ae_name: tb3-ipe
+  origin: CAdmin
+  rvi: "3"
+  poa: http://127.0.0.1:5050
+
+notification_server: { host: 0.0.0.0, port: 5050 }
+
+robots:
+  - { id: tb3, namespace: "" }
+
+discovery:
+  mode: config-only            # 아래 명시 토픽만 브리지
+  refresh_sec: 5               # offered QoS 재조정 폴 주기
+  domain_id: 30                # 기록용 — 실제 적용은 ROS_DOMAIN_ID env
+
+naming: { path_style: nested, sanitize: "_" }
+
+storage: { state_db: tb3_ipe_state.db }
+
+qos_profiles:
+  sensor_stream:               # 센서류: 유실 허용, 최신성 우선
+    reliability: BEST_EFFORT
+    durability: VOLATILE
+    history: KEEP_LAST
+    depth: 5
+  state_reliable:              # 저주기 상태류: 신뢰 전달
+    reliability: RELIABLE
+    durability: VOLATILE
+    history: KEEP_LAST
+    depth: 10
+  latched_state:               # 래치 토픽: TL이어야 과거 샘플(1회 발행분)을 받음
+    reliability: RELIABLE
+    durability: TRANSIENT_LOCAL
+    history: KEEP_LAST
+    depth: 1
+  cmd_reliable:                # 명령 발행 (유한 deadline·MANUAL liveliness는 §8.5 금지)
+    reliability: RELIABLE
+    durability: VOLATILE
+    history: KEEP_LAST
+    depth: 1
+
+qos_fcnt:
+  allow_update: false          # 원격 QoS 변경 데모 시 true
+
+bridge:
+  topics:
+    # --- 관측: 센서 스트림 ---
+    - name: /scan
+      type: sensor_msgs/msg/LaserScan
+      qos: sensor_stream
+      representation: sampled
+      sample: { rate_hz: 0.5 }
+    - name: /odom
+      type: nav_msgs/msg/Odometry
+      qos: { profile: sensor_stream, depth: 10 }   # 인라인 오버라이드 → pfRef 유지 데모
+      representation: sampled
+      sample: { rate_hz: 2 }
+    - name: /imu
+      type: sensor_msgs/msg/Imu
+      qos: sensor_stream
+      representation: sampled
+      sample: { rate_hz: 1 }
+    - name: /magnetic_field
+      type: sensor_msgs/msg/MagneticField
+      qos: sensor_stream
+      representation: sampled
+      sample: { rate_hz: 1 }
+    - name: /joint_states
+      type: sensor_msgs/msg/JointState
+      qos: sensor_stream
+      representation: sampled
+      sample: { rate_hz: 1 }
+    - name: /sensor_state
+      type: turtlebot3_msgs/msg/SensorState
+      qos: sensor_stream
+      representation: sampled
+      sample: { rate_hz: 1 }
+    - name: /tf
+      type: tf2_msgs/msg/TFMessage
+      qos: sensor_stream
+      representation: sampled
+      sample: { rate_hz: 1 }
+    # --- 관측: 저주기 상태 ---
+    - name: /battery_state
+      type: sensor_msgs/msg/BatteryState
+      qos: state_reliable
+      representation: sampled
+      sample: { rate_hz: 0.2 }
+      stale_after_ms: 15000
+    # --- 관측: 래치(1회 발행) — stale 워치독 무의미하므로 0 ---
+    - name: /tf_static
+      type: tf2_msgs/msg/TFMessage
+      qos: latched_state
+      representation: latest
+      stale_after_ms: 0
+    - name: /robot_description         # URDF 통짜 문자열 — 크면 payloadOversize 경고 가능
+      type: std_msgs/msg/String
+      qos: latched_state
+      representation: latest
+      stale_after_ms: 0
+    # --- 명령 ---
+    - name: /cmd_vel
+      type: geometry_msgs/msg/Twist
+      direction: command
+      qos: cmd_reliable
+      access: { enabled: true }
+      command:
+        rate_limit_hz: 10
+        clamp:                              # Burger 물리 한계
+          linear.x: [-0.22, 0.22]
+          angular.z: [-2.84, 2.84]
+        watchdog_ms: 500                    # 명령 두절 시 정지 페이로드
+        max_age_ms: 2000                    # 낡은 명령 폐기
+    - name: /motor_power
+      type: std_msgs/msg/Bool
+      direction: command
+      qos: cmd_reliable
+      access: { enabled: true }
+      command: { rate_limit_hz: 2 }         # 워치독 없음 — Bool() 재발행이 모터 off가 됨
+    - name: /sound
+      type: turtlebot3_msgs/msg/Sound
+      direction: command
+      qos: cmd_reliable
+      access: { enabled: true }
+      command: { rate_limit_hz: 2 }
+    - name: /reset
+      type: std_msgs/msg/Empty
+      direction: command
+      qos: cmd_reliable
+      access: { enabled: true }
+      command: { rate_limit_hz: 1 }
