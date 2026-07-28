@@ -137,6 +137,19 @@ class GenericROS2Adapter:
         self._qos_event_last: dict[tuple[str, str], float] = {}
         self._qos_dirty: set[tuple[str, str]] = set()
         self._qos_dirty_last: dict[tuple[str, str], float] = {}
+        self._unsupported_event_axes_reported: set[tuple[str, str]] = set()
+
+    def _report_unsupported_event_axis(self, endpoint: str, axis: str) -> None:
+        """배포판 기능 차이는 장애가 아니므로 축별 한 번만 INFO로 기록한다."""
+        key = (endpoint, axis)
+        if key in self._unsupported_event_axes_reported:
+            return
+        self._unsupported_event_axes_reported.add(key)
+        log.info(
+            "ROS 2 %s QoS event axis '%s' is unavailable in this rclpy; disabled",
+            endpoint,
+            axis,
+        )
 
     def _load_or_report(self, kind: str, type_str: str,
                         spec: TopicSpec | ServiceSpec | ActionSpec) -> Any | None:
@@ -201,7 +214,8 @@ class GenericROS2Adapter:
             return False
         resolved = guarded
         for ev in events:
-            self._event("qosStatus", "warning",
+            severity = "info" if ev == "noPublisherFallback" else "warning"
+            self._event("qosStatus", severity,
                         {"event": ev, "interface": spec.interface, "robot": spec.robot_id})
         profile = qosmod.build_qos_profile(resolved)
 
@@ -373,15 +387,15 @@ class GenericROS2Adapter:
 
         key = (spec.robot_id, spec.interface)
 
-        def _mk(name: str) -> Callable[[Any], None]:
+        def _mk(name: str, severity: str = "warning") -> Callable[[Any], None]:
             def cb(info: Any) -> None:
-                self._event("qosStatus", "warning",
+                self._event("qosStatus", severity,
                             {"event": name, "interface": spec.interface,
                              "robot": spec.robot_id, **_qos_event_fields(info)})
             return cb
 
         axes = {"deadline": _mk("deadlineMissed"),
-                "liveliness": _mk("livelinessChanged"),
+                "liveliness": _mk("livelinessChanged", "info"),
                 "incompatible_qos": _mk("qosMismatch"),
                 "message_lost": _mk("messageLost"),
                 "incompatible_type": _mk("incompatibleType"),
@@ -389,9 +403,7 @@ class GenericROS2Adapter:
                 "matched": lambda _info: self._mark_qos_dirty(key)}
         axes, unsupported = _supported_axes(SubscriptionEventCallbacks, axes)
         for axis in unsupported:
-            self._event("qosStatus", "warning",
-                        {"event": "eventCallbackUnsupported", "axis": axis,
-                         "interface": spec.interface, "robot": spec.robot_id})
+            self._report_unsupported_event_axis("subscription", axis)
         while True:
             try:
                 return self.node.create_subscription(
@@ -402,9 +414,7 @@ class GenericROS2Adapter:
                 if "UnsupportedEventType" in name and axes:
                     dropped = next(iter(axes))
                     axes.pop(dropped)
-                    self._event("qosStatus", "warning",
-                                {"event": "eventCallbackUnsupported", "axis": dropped,
-                                 "interface": spec.interface, "robot": spec.robot_id})
+                    self._report_unsupported_event_axis("subscription", dropped)
                     continue
                 self._event("provisioningStatus", "error",
                             {"event": "subscribeFailed", "interface": spec.interface,
@@ -495,7 +505,8 @@ class GenericROS2Adapter:
         requested = [i.qos_profile for i in infos]
         resolved, events = qosmod.reconcile_command(requested, spec.qos)
         for ev in events:
-            self._event("qosStatus", "warning",
+            severity = "info" if ev == "noSubscriberFallback" else "warning"
+            self._event("qosStatus", severity,
                         {"event": ev, "interface": spec.interface, "robot": spec.robot_id})
         profile = qosmod.build_qos_profile(resolved)
         pub = self._create_publisher_degrading(msg_class, spec, profile, key)
@@ -526,9 +537,7 @@ class GenericROS2Adapter:
                 "matched": lambda _info: self._mark_qos_dirty(key)}
         axes, unsupported = _supported_axes(PublisherEventCallbacks, axes)
         for axis in unsupported:
-            self._event("qosStatus", "warning",
-                        {"event": "eventCallbackUnsupported", "axis": axis,
-                         "interface": spec.interface, "robot": spec.robot_id})
+            self._report_unsupported_event_axis("publisher", axis)
         while axes:
             try:
                 return self.node.create_publisher(
@@ -539,9 +548,7 @@ class GenericROS2Adapter:
                     break
                 dropped = next(iter(axes))
                 axes.pop(dropped)
-                self._event("qosStatus", "warning",
-                            {"event": "eventCallbackUnsupported", "axis": dropped,
-                             "interface": spec.interface, "robot": spec.robot_id})
+                self._report_unsupported_event_axis("publisher", dropped)
         return self.node.create_publisher(msg_class, spec.interface, profile)
 
     def publish_command(self, spec: TopicSpec, canonical: dict[str, Any]) -> bool:

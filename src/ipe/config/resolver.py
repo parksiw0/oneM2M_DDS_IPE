@@ -204,7 +204,11 @@ def _candidates(
     disc = dict(discovered.get(kind, []) if discovered else [])
 
     for name, rule in explicit.items():
-        if _builtin_denied(kind, name) or _denied(name, deny):
+        # config-only에서는 명시 목록 자체가 전체 권위다. 내장 auto-discovery
+        # deny(파라미터 서비스 등)를 의도적으로 재정의하는 정상 사용이므로 매
+        # refresh마다 경고하지 않는다. 사용자가 적은 deny와 충돌하면 계속 경고한다.
+        builtin_conflict = mode != "config-only" and _builtin_denied(kind, name)
+        if builtin_conflict or _denied(name, deny):
             log.warning(
                 "explicit %s entry '%s' matches a deny pattern — explicit names are "
                 "never denied (§5.2); remove the entry to stop bridging it", kind, name,

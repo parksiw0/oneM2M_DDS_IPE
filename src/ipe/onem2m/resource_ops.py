@@ -67,7 +67,7 @@ class SubStatus:
     이벤트를 낼 수 있게 한다(실패는 409 스킵이 아니다)."""
 
     path: str
-    ok: bool                 # SUB 존재 + 생성 후 읽기 성공
+    ok: bool                 # SUB 존재 확인(직접 GET 또는 부모 child index)
     created: bool            # 이번 호출에서 201 (기존재 시 False)
     verified: bool           # 생성 후 GET이 SUB를 반환
     detail: str = ""
@@ -187,6 +187,67 @@ class ResourceOps:
 
     # -- SUB -----------------------------------------------------------------
 
+    @staticmethod
+    def _sub_child_ref(body: Any, name: str) -> dict[str, Any] | None:
+        """rcn=5 부모 응답에서 이름이 같은 SUB child reference를 찾는다.
+
+        tinyIoT는 이미 존재하는 SUB를 다시 CREATE하면 PostgreSQL의 URI unique
+        위반을 409/4105가 아니라 HTTP 500 ``DB store fail``로 돌려준다. 게다가
+        일부 빌드는 SUB 직접 RETRIEVE를 4004로 거절한다. 부모의 ``ch``는 이
+        경우에도 정상이므로 CREATE 전에 이 인덱스를 멱등성 근거로 사용한다.
+        """
+        if not isinstance(body, dict):
+            return None
+        for resource in body.values():
+            if not isinstance(resource, dict):
+                continue
+            children = resource.get("ch")
+            if not isinstance(children, list):
+                continue
+            for child in children:
+                if not isinstance(child, dict):
+                    continue
+                child_name = child.get("nm") or child.get("rn")
+                child_type = child.get("typ", child.get("ty"))
+                if child_name == name and child_type in (TY_SUB, str(TY_SUB)):
+                    return child
+        return None
+
+    def _find_indexed_sub(
+        self, parent: str, name: str
+    ) -> tuple[dict[str, Any] | None, OneM2MResponse | None]:
+        try:
+            probe = self.client.get(parent, params={"rcn": 5})
+        except (TransportError, OversizeError):
+            return None, None
+        if not probe.ok:
+            return None, probe
+        return self._sub_child_ref(probe.body, name), probe
+
+    @staticmethod
+    def _indexed_sub_status(
+        path: str,
+        created: bool,
+        child: dict[str, Any],
+        response: OneM2MResponse | None,
+    ) -> SubStatus:
+        # tinyIoT의 ch 표현에는 보통 ri가 없지만 구현별 확장 필드는 보존한다.
+        ri = child.get("ri") if isinstance(child, dict) else None
+        log.info(
+            "%s SUB %s (confirmed by parent child index)",
+            "CREATED" if created else "EXISTS ",
+            path,
+        )
+        return SubStatus(
+            path=path,
+            ok=True,
+            created=created,
+            verified=False,
+            detail="confirmed by parent child index; direct SUB retrieval unavailable",
+            response=response,
+            ri=ri,
+        )
+
     def ensure_sub(
         self,
         parent: str,
@@ -195,11 +256,13 @@ class ResourceOps:
         net: list[int] | None = None,
         nct: int = 1,
     ) -> SubStatus:
-        """구독을 생성하고 생성 후 읽기로 확인한다. 예외 대신 SubStatus를
+        """구독을 조회/생성하고 생성 후 읽기로 확인한다. 예외 대신 SubStatus를
         반환해 프로비저닝이 실패를 provisioningStatus 이벤트로 보고한다.
 
         nct=1(전체 리소스)이 알림의 con 전달을 보장한다. nu에는 포트를
         명시해야 한다 — tinyIoT의 기본 포트 처리 코드는 동작하지 않는다.
+        SUB만은 create-first를 쓰지 않는다. tinyIoT가 중복 URI를 409가 아닌
+        500으로 잘못 매핑하므로 direct GET, 부모 child index 순으로 먼저 찾는다.
         """
         body = {
             "m2m:sub": {
@@ -210,33 +273,65 @@ class ResourceOps:
             }
         }
         path = f"{parent.rstrip('/')}/{name}"
+
+        # 표준 CSE에서는 직접 RETRIEVE로 속성까지 검증할 수 있다.
         try:
-            r = self.client.create(parent, TY_SUB, body)
+            preflight = self.client.get(path)
         except (TransportError, OversizeError) as e:
             return SubStatus(
                 path=path, ok=False, created=False, verified=False,
-                detail=f"create failed: {e}", classification=classify(e),
+                detail=f"pre-create read failed: {e}", classification=classify(e),
             )
-
-        if r.status == 201:
-            created = True
-        elif _is_duplicate(r):
+        if preflight.ok:
             created = False
+            probe = preflight
         else:
-            # 예: 5204 vrq 검증 실패가 HTTP 500으로 매핑되는 경우
-            return SubStatus(
-                path=path, ok=False, created=False, verified=False,
-                detail=f"create rejected: HTTP {r.status} rsc={r.rsc} body={r.body!r}",
-                response=r, classification=classify(r),
-            )
+            # tinyIoT 호환: SUB 직접 GET이 4004여도 부모 rcn=5의 ch에는 존재한다.
+            child, parent_probe = self._find_indexed_sub(parent, name)
+            if child is not None:
+                return self._indexed_sub_status(path, False, child, parent_probe)
 
-        try:
-            probe = self.client.get(path)
-        except (TransportError, OversizeError) as e:
-            return SubStatus(
-                path=path, ok=False, created=created, verified=False,
-                detail=f"post-create read failed: {e}", classification=classify(e),
-            )
+            try:
+                r = self.client.create(parent, TY_SUB, body)
+            except (TransportError, OversizeError) as e:
+                return SubStatus(
+                    path=path, ok=False, created=False, verified=False,
+                    detail=f"create failed: {e}", classification=classify(e),
+                )
+
+            if r.status == 201:
+                created = True
+            elif _is_duplicate(r):
+                created = False
+            else:
+                # CREATE 사이의 race 또는 tinyIoT의 duplicate->500 오매핑도
+                # 부모 인덱스에 실제 SUB가 있으면 멱등 성공으로 복구한다.
+                child, parent_probe = self._find_indexed_sub(parent, name)
+                if child is not None:
+                    return self._indexed_sub_status(path, False, child, parent_probe)
+                return SubStatus(
+                    path=path, ok=False, created=False, verified=False,
+                    detail=f"create rejected: HTTP {r.status} rsc={r.rsc} body={r.body!r}",
+                    response=r, classification=classify(r),
+                )
+
+            try:
+                probe = self.client.get(path)
+            except (TransportError, OversizeError) as e:
+                return SubStatus(
+                    path=path, ok=False, created=created, verified=False,
+                    detail=f"post-create read failed: {e}", classification=classify(e),
+                )
+
+            if not probe.ok:
+                child, parent_probe = self._find_indexed_sub(parent, name)
+                if child is not None:
+                    return self._indexed_sub_status(path, created, child, parent_probe)
+                return SubStatus(
+                    path=path, ok=False, created=created, verified=False,
+                    detail=f"post-create read: HTTP {probe.status} rsc={probe.rsc}",
+                    response=probe, classification=classify(probe),
+                )
         if probe.ok:
             # 검증은 존재가 아니라 속성 일치 — 잔존 SUB의 nu가 다르면 알림이
             # 미등록 라우트로 떨어져 무음 손실된다
@@ -260,11 +355,7 @@ class ResourceOps:
             sub_ri = existing.get("ri") if isinstance(existing, dict) else None
             return SubStatus(path=path, ok=True, created=created, verified=True,
                              response=probe, ri=sub_ri)
-        return SubStatus(
-            path=path, ok=False, created=created, verified=False,
-            detail=f"post-create read: HTTP {probe.status} rsc={probe.rsc}",
-            response=probe, classification=classify(probe),
-        )
+        raise AssertionError("SUB probe must be successful at this point")
 
     # -- 기타 ----------------------------------------------------------------
 

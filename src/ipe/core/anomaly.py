@@ -11,7 +11,7 @@ import logging
 from collections import deque
 from typing import Any
 
-from ipe.core.common import as_numbers
+from ipe.core.common import as_numbers, get_path
 
 log = logging.getLogger(__name__)
 
@@ -26,7 +26,10 @@ def flatten_numbers(fields: dict[str, Any], names: list[str]) -> list[float] | N
     """지정 필드를 고정 길이 수치 벡터로 평탄화. 수치가 없으면 None(판정 불가=정상)."""
     out: list[float] = []
     for name in names:
-        nums = as_numbers(fields.get(name))
+        found, value = get_path(fields, name)
+        if not found:
+            return None
+        nums = as_numbers(value)
         if nums is None:
             return None
         out.extend(nums)

@@ -4,6 +4,7 @@ import statistics
 from typing import Any
 
 from ipe.core.common import as_numbers as _as_numbers
+from ipe.core.common import get_path
 
 
 def _max_abs_delta(old: list[float], new: list[float]) -> float:
@@ -32,9 +33,10 @@ class DeltaFilter:
         names = monitored if monitored else list(fields.keys())
         current: dict[str, list[float]] = {}
         for name in names:
-            if name not in fields:
+            found, value = get_path(fields, name)
+            if not found:
                 continue
-            nums = _as_numbers(fields[name])
+            nums = _as_numbers(value)
             if nums is not None:
                 current[name] = nums
 
@@ -107,11 +109,13 @@ class WindowAggregator:
             st = self._buf[key] = self._new(ts)
 
         names = monitored if monitored else list(fields.keys())
-        st["last"] = {k: fields[k] for k in names if k in fields}
+        st["last"] = {}
         for name in names:
-            if name not in fields:
+            found, value = get_path(fields, name)
+            if not found:
                 continue
-            nums = _as_numbers(fields[name])
+            st["last"][name] = value
+            nums = _as_numbers(value)
             if nums is not None:
                 st["vecs"].setdefault(name, []).append(nums)
         st["n"] += 1
