@@ -50,7 +50,7 @@ from ipe.config.spec import (
 
 log = logging.getLogger("ipe.config.resolver")
 
-Discovered = dict[str, list[tuple[str, list[str]]]]
+Discovered = dict[str, Any]
 
 
 class ResolveError(Exception):
@@ -79,6 +79,8 @@ _PARAM_SERVICE_SUFFIXES = frozenset({
 def _builtin_denied(kind: str, interface: str) -> bool:
     segs = [s for s in interface.split("/") if s]
     if any(s.startswith("_") for s in segs):
+        return True
+    if kind == "topics" and interface in ("/rosout", "/parameter_events"):
         return True
     return kind == "services" and bool(segs) and segs[-1] in _PARAM_SERVICE_SUFFIXES
 
@@ -248,6 +250,7 @@ def _robot_for(
     robots: list[RobotSpec],
     by_id: dict[str, RobotSpec],
     strict: bool,
+    owner_namespaces: list[str] | None = None,
 ) -> RobotSpec:
     rid = merged.get("robot")
     if rid:
@@ -275,6 +278,25 @@ def _robot_for(
         log.info("dynamic robot '%s' registered from {robot} capture (interface '%s')",
                  cap, interface)
         return dyn
+    # 설정 비의존 discovery에서는 원격 endpoint node namespace가 robot 경계다.
+    # root namespace('/')는 robot 식별 정보를 주지 않으므로 catch-all robot을 쓴다.
+    namespaces = sorted({x.rstrip("/") for x in (owner_namespaces or [])
+                         if x and x != "/"}, key=len, reverse=True)
+    if len(namespaces) == 1:
+        namespace = namespaces[0]
+        for robot in robots:
+            if robot.namespace.rstrip("/") == namespace:
+                return robot
+        if not strict:
+            robot_id = sanitize_segment(namespace.strip("/").replace("/", "_"))
+            if robot_id in by_id:
+                return by_id[robot_id]
+            dyn = RobotSpec(id=robot_id, namespace=namespace)
+            by_id[robot_id] = dyn
+            robots.append(dyn)
+            log.info("dynamic robot '%s' registered from endpoint namespace '%s'",
+                     robot_id, namespace)
+            return dyn
     return resolve_robot(interface, robots)
 
 
@@ -525,11 +547,17 @@ def _iter_candidates(kind, rules, discovered, ctx: _Ctx, dblock, check=None):
         if hit is None:
             continue
         merged, caps, src = hit
+        if kind == "topics" and "direction" not in merged and discovered is not None:
+            direction = discovered.get("topic_directions", {}).get(interface)
+            if direction in ("observe", "command", "both"):
+                merged["direction"] = direction
         block = dblock(merged) if callable(dblock) else dblock
         merged = _deep_merge(block, merged)
         if check is not None:
             check(interface, merged)
-        robot = _robot_for(merged, interface, caps, ctx.robots, ctx.by_id, ctx.strict)
+        owners = ((discovered or {}).get("owners", {}).get(kind, {}).get(interface, []))
+        robot = _robot_for(merged, interface, caps, ctx.robots, ctx.by_id, ctx.strict,
+                           owner_namespaces=owners)
         rel, leaf = _rel_path(robot, interface, merged, ctx.naming, caps)
         yield interface, types, merged, caps, src, robot, rel, leaf
 
@@ -584,6 +612,9 @@ def _resolve_topics(rules, discovered, ctx: _Ctx) -> list[TopicSpec]:
 
         mtype, source_rule = _type_and_source(merged, types, src)
         enabled, confirm = _access(merged, ctx.default_confirm)
+        if (src == "discovery-default" and direction in ("command", "both")
+                and "access" not in merged):
+            enabled = True
         out.append(TopicSpec(
             robot_id=robot.id,
             interface=interface,

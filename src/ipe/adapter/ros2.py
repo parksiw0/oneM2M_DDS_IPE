@@ -139,6 +139,16 @@ class GenericROS2Adapter:
         self._qos_dirty_last: dict[tuple[str, str], float] = {}
         self._unsupported_event_axes_reported: set[tuple[str, str]] = set()
 
+    @staticmethod
+    def type_available(kind: str, type_str: str | None) -> bool:
+        if not type_str:
+            return False
+        try:
+            _load(kind, type_str)
+            return True
+        except Exception:
+            return False
+
     def _report_unsupported_event_axis(self, endpoint: str, axis: str) -> None:
         """배포판 기능 차이는 장애가 아니므로 축별 한 번만 INFO로 기록한다."""
         key = (endpoint, axis)
@@ -166,23 +176,112 @@ class GenericROS2Adapter:
     # 디스커버리 (폴링 스냅숏)
     # ------------------------------------------------------------------
 
-    def snapshot(self) -> dict[str, list[tuple[str, list[str]]]]:
-        from rclpy.action import get_action_names_and_types
+    def snapshot(self) -> dict[str, Any]:
+        """애플리케이션 endpoint를 만들기 전의 ROS graph snapshot.
 
-        topics = self.node.get_topic_names_and_types()
+        topic 방향은 원격 Publisher/Subscription endpoint 수로 계산한다. IPE
+        자신의 rosout/parameter endpoint는 제외해 graph가 자기 자신 때문에
+        준비 완료로 오판되지 않게 한다.
+        """
+        from rclpy.action import get_action_names_and_types
+        try:
+            from rclpy.action import get_action_server_names_and_types_by_node
+        except ImportError:  # 구형 rclpy는 전역 action 목록만 제공한다.
+            get_action_server_names_and_types_by_node = None
+
+        own_name = self.node.get_name()
+        own_ns = self.node.get_namespace()
+
+        def remote(info: Any) -> bool:
+            return not (getattr(info, "node_name", None) == own_name
+                        and getattr(info, "node_namespace", None) == own_ns)
+
+        topics: list[tuple[str, list[str]]] = []
+        topic_directions: dict[str, str] = {}
+        topic_owners: dict[str, list[str]] = {}
+        for name, types in self.node.get_topic_names_and_types():
+            if "/_action/" in name:
+                continue
+            try:
+                publishers = [x for x in self.node.get_publishers_info_by_topic(name)
+                              if remote(x)]
+                subscriptions = [x for x in self.node.get_subscriptions_info_by_topic(name)
+                                 if remote(x)]
+            except Exception:
+                publishers, subscriptions = [], []
+            if not publishers and not subscriptions:
+                continue
+            topic_directions[name] = (
+                "both" if publishers and subscriptions
+                else "observe" if publishers else "command"
+            )
+            namespaces = {getattr(x, "node_namespace", "")
+                          for x in (*publishers, *subscriptions)}
+            topic_owners[name] = sorted(x for x in namespaces if x)
+            topics.append((name, list(types)))
+
         services = self.node.get_service_names_and_types()
+        try:
+            own_services = {
+                name for name, _types in
+                self.node.get_service_names_and_types_by_node(own_name, own_ns)
+            }
+        except Exception:
+            own_services = set()
+        # 같은 이름을 원격 node도 제공하는 드문 경우를 보존한다.
+        remote_services: set[str] = set()
+        service_owners: dict[str, set[str]] = {}
+        try:
+            for node_name, node_ns in self.node.get_node_names_and_namespaces():
+                if node_name == own_name and node_ns == own_ns:
+                    continue
+                try:
+                    for name, _types in self.node.get_service_names_and_types_by_node(
+                            node_name, node_ns):
+                        remote_services.add(name)
+                        service_owners.setdefault(name, set()).add(node_ns)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        services = [(name, types) for name, types in services
+                    if name not in own_services or name in remote_services]
         try:
             actions = get_action_names_and_types(self.node)
         except Exception:
             actions = []
-        action_names = {n for n, _ in actions}
-        # 액션 내부 엔티티(/_action/)는 topics/services에서 숨긴다
-        topics = [(n, t) for n, t in topics if "/_action/" not in n]
+        action_owners: dict[str, set[str]] = {}
+        if get_action_server_names_and_types_by_node is not None:
+            remote_actions: set[str] = set()
+            try:
+                for node_name, node_ns in self.node.get_node_names_and_namespaces():
+                    if node_name == own_name and node_ns == own_ns:
+                        continue
+                    try:
+                        for name, _types in get_action_server_names_and_types_by_node(
+                                self.node, node_name, node_ns):
+                            remote_actions.add(name)
+                            action_owners.setdefault(name, set()).add(node_ns)
+                    except Exception:
+                        continue
+                actions = [(name, types) for name, types in actions
+                           if name in remote_actions]
+            except Exception:
+                pass
+        # 액션 내부 엔티티(/_action/)는 service에서도 숨긴다.
         services = [(n, t) for n, t in services if "/_action/" not in n]
         return {
-            "topics": [(n, list(t)) for n, t in topics],
+            "topics": topics,
             "services": [(n, list(t)) for n, t in services],
-            "actions": [(n, list(t)) for n, t in actions if n in action_names],
+            "actions": [(n, list(t)) for n, t in actions],
+            "topic_directions": topic_directions,
+            "owners": {
+                "topics": topic_owners,
+                "services": {k: sorted(x for x in v if x)
+                             for k, v in service_owners.items()},
+                "actions": {k: sorted(x for x in v if x)
+                            for k, v in action_owners.items()},
+            },
         }
 
     # ------------------------------------------------------------------
@@ -592,6 +691,11 @@ class GenericROS2Adapter:
         self.services[key] = {"spec": spec, "client": client, "srv_class": srv_class}
         return True
 
+    def unbind_service(self, key: tuple[str, str]) -> None:
+        entry = self.services.pop(key, None)
+        if entry is not None:
+            self.node.destroy_client(entry["client"])
+
     def server_available(self, kind: str, key: tuple[str, str]) -> bool:
         if kind == "service":
             entry = self.services.get(key)
@@ -647,6 +751,11 @@ class GenericROS2Adapter:
         client = ActionClient(self.node, action_class, spec.interface, **kwargs)
         self.actions[key] = _ActionState(spec=spec, client=client, action_class=action_class)
         return True
+
+    def unbind_action(self, key: tuple[str, str]) -> None:
+        state = self.actions.pop(key, None)
+        if state is not None:
+            state.client.destroy()
 
     def send_goal(
         self,

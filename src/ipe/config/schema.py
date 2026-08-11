@@ -275,6 +275,13 @@ CONFIG_SCHEMA: dict[str, Any] = {
             "deny": {"type": "list", "schema": {"type": "string"}, "default": []},
             "refresh_sec": {"type": ["integer", "float"], "min": 0, "default": 5},
             "vanish_grace_polls": {"type": "integer", "min": 1, "default": 2},  # 소멸 디바운스
+            "graph_settle_timeout_sec": {
+                "type": ["integer", "float"], "min": 0.1, "default": 10,
+            },
+            "graph_stable_polls": {"type": "integer", "min": 1, "default": 2},
+            "graph_poll_sec": {
+                "type": ["integer", "float"], "min": 0.05, "default": 0.5,
+            },
         },
         "default": {},
     },
