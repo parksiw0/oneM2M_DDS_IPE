@@ -79,7 +79,7 @@ def test_endpoint_namespace_creates_a_robot_boundary_without_yaml():
 
     rc = resolve(raw, discovered=snap)
 
-    assert "tb3" in rc.robots
+    assert set(rc.robots) == {"tb3"}
     assert rc.topics[0].robot_id == "tb3"
     assert rc.topics[0].rel_path == "scan"
 
@@ -119,6 +119,30 @@ def test_fallback_robot_prefix_is_not_duplicated_in_resource_name(
     assert topics[prefixed_interface].robot_id == robot_id
     assert topics[prefixed_interface].rel_path == expected_leaf
     assert topics["/scan"].rel_path == "scan"
+
+
+def test_interface_namespace_is_robot_fallback_when_rmw_hides_node_owner():
+    raw = validate_config(discovery_runtime_config(_args(), {}))
+    snap = {
+        "topics": [
+            ("/warehouse_bot_7/camera/status", ["std_msgs/msg/String"]),
+        ],
+        "services": [], "actions": [],
+        "topic_directions": {
+            "/warehouse_bot_7/camera/status": "observe",
+        },
+        "owners": {
+            "topics": {
+                "/warehouse_bot_7/camera/status": [],
+            },
+        },
+    }
+
+    rc = resolve(raw, discovered=snap)
+
+    assert set(rc.robots) == {"warehouse_bot_7"}
+    assert rc.topics[0].robot_id == "warehouse_bot_7"
+    assert rc.topics[0].rel_path == "camera__status"
 
 
 def test_action_server_namespace_creates_the_same_robot_boundary():

@@ -196,6 +196,23 @@ class GenericROS2Adapter:
             return not (getattr(info, "node_name", None) == own_name
                         and getattr(info, "node_namespace", None) == own_ns)
 
+        def usable_namespace(value: Any) -> bool:
+            namespace = str(value or "")
+            return bool(namespace and namespace != "/"
+                        and namespace != "_NODE_NAMESPACE_UNKNOWN_")
+
+        try:
+            remote_nodes = [
+                (node_name, node_ns)
+                for node_name, node_ns in self.node.get_node_names_and_namespaces()
+                if not (node_name == own_name and node_ns == own_ns)
+            ]
+        except Exception:
+            remote_nodes = []
+        graph_namespaces = sorted({node_ns for _node_name, node_ns in remote_nodes
+                                   if usable_namespace(node_ns)})
+        graph_namespace = graph_namespaces[0] if len(graph_namespaces) == 1 else None
+
         topics: list[tuple[str, list[str]]] = []
         topic_directions: dict[str, str] = {}
         topic_owners: dict[str, list[str]] = {}
@@ -217,7 +234,13 @@ class GenericROS2Adapter:
             )
             namespaces = {getattr(x, "node_namespace", "")
                           for x in (*publishers, *subscriptions)}
-            topic_owners[name] = sorted(x for x in namespaces if x)
+            owners = sorted(x for x in namespaces if usable_namespace(x))
+            # 일부 RMW는 endpoint info의 node namespace를 UNKNOWN으로 주지만
+            # node graph에는 올바른 namespace를 제공한다. 전체 원격 graph에서
+            # 하나의 namespace만 명확할 때에만 안전하게 보완한다.
+            if not owners and graph_namespace:
+                owners = [graph_namespace]
+            topic_owners[name] = owners
             topics.append((name, list(types)))
 
         services = self.node.get_service_names_and_types()
@@ -232,9 +255,7 @@ class GenericROS2Adapter:
         remote_services: set[str] = set()
         service_owners: dict[str, set[str]] = {}
         try:
-            for node_name, node_ns in self.node.get_node_names_and_namespaces():
-                if node_name == own_name and node_ns == own_ns:
-                    continue
+            for node_name, node_ns in remote_nodes:
                 try:
                     for name, _types in self.node.get_service_names_and_types_by_node(
                             node_name, node_ns):
@@ -254,9 +275,7 @@ class GenericROS2Adapter:
         if get_action_server_names_and_types_by_node is not None:
             remote_actions: set[str] = set()
             try:
-                for node_name, node_ns in self.node.get_node_names_and_namespaces():
-                    if node_name == own_name and node_ns == own_ns:
-                        continue
+                for node_name, node_ns in remote_nodes:
                     try:
                         for name, _types in get_action_server_names_and_types_by_node(
                                 self.node, node_name, node_ns):
@@ -277,9 +296,9 @@ class GenericROS2Adapter:
             "topic_directions": topic_directions,
             "owners": {
                 "topics": topic_owners,
-                "services": {k: sorted(x for x in v if x)
+                "services": {k: sorted(x for x in v if usable_namespace(x))
                              for k, v in service_owners.items()},
-                "actions": {k: sorted(x for x in v if x)
+                "actions": {k: sorted(x for x in v if usable_namespace(x))
                             for k, v in action_owners.items()},
             },
         }

@@ -251,6 +251,7 @@ def _robot_for(
     by_id: dict[str, RobotSpec],
     strict: bool,
     owner_namespaces: list[str] | None = None,
+    infer_interface_namespace: bool = False,
 ) -> RobotSpec:
     rid = merged.get("robot")
     if rid:
@@ -297,7 +298,24 @@ def _robot_for(
             log.info("dynamic robot '%s' registered from endpoint namespace '%s'",
                      robot_id, namespace)
             return dyn
-    return resolve_robot(interface, robots)
+    fallback = resolve_robot(interface, robots)
+    # 일부 RMW는 endpoint의 node namespace를 UNKNOWN으로만 제공한다. 설정 없는
+    # 자동 Discovery에서는 /{robot}/... 형태의 ROS 이름이 가진 첫 namespace를
+    # robot 경계로 사용할 수 있다. 단일 세그먼트(/scan)는 추론하지 않는다.
+    parts = [part for part in interface.strip("/").split("/") if part]
+    if (infer_interface_namespace and not strict and len(parts) > 1
+            and fallback.id == "robot" and not fallback.namespace):
+        namespace = f"/{parts[0]}"
+        robot_id = sanitize_segment(parts[0])
+        if robot_id in by_id:
+            return by_id[robot_id]
+        dyn = RobotSpec(id=robot_id, namespace=namespace)
+        by_id[robot_id] = dyn
+        robots.append(dyn)
+        log.info("dynamic robot '%s' inferred from interface namespace '%s'",
+                 robot_id, namespace)
+        return dyn
+    return fallback
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +479,15 @@ def resolve(config: dict[str, Any], discovered: Discovered | None = None) -> Res
     actions = _resolve_actions(bridge.get("actions", []), discovered, ctx)
 
     _check_collisions(topics, services, actions, by_id, cse.ae_name)
+    if discovered is not None and mode == "auto-expose":
+        # 설정 없는 실행에서는 실제 Binding Plan에 포함된 Robot만 Skeleton을
+        # 만든다. Namespace에서 동적으로 식별된 경우 기본 catch-all Robot은
+        # 리소스 트리에 남기지 않는다.
+        used_robot_ids = {
+            spec.robot_id for group in (topics, services, actions) for spec in group
+        }
+        by_id = {robot_id: robot for robot_id, robot in by_id.items()
+                 if robot_id in used_robot_ids}
 
     qf = config.get("qos_fcnt", {})
     qos_fcnt = QosFcntSpec(
@@ -557,7 +584,8 @@ def _iter_candidates(kind, rules, discovered, ctx: _Ctx, dblock, check=None):
             check(interface, merged)
         owners = ((discovered or {}).get("owners", {}).get(kind, {}).get(interface, []))
         robot = _robot_for(merged, interface, caps, ctx.robots, ctx.by_id, ctx.strict,
-                           owner_namespaces=owners)
+                           owner_namespaces=owners,
+                           infer_interface_namespace=(src == "discovery-default"))
         rel, leaf = _rel_path(robot, interface, merged, ctx.naming, caps)
         yield interface, types, merged, caps, src, robot, rel, leaf
 

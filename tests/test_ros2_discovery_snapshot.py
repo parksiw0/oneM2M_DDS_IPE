@@ -87,3 +87,46 @@ def test_snapshot_reports_remote_direction_and_robot_owners(monkeypatch):
         "services": {"/reset": ["/tb3"]},
         "actions": {"/navigate": ["/tb3"]},
     }
+
+
+def test_snapshot_recovers_unknown_endpoint_namespace_from_unambiguous_graph(monkeypatch):
+    class UnknownEndpointNode(_GraphNode):
+        def get_topic_names_and_types(self):
+            return [("/warehouse_bot_7/camera/status", ["std_msgs/msg/String"])]
+
+        def get_publishers_info_by_topic(self, _name):
+            return [SimpleNamespace(
+                node_name="_NODE_NAME_UNKNOWN_",
+                node_namespace="_NODE_NAMESPACE_UNKNOWN_",
+            )]
+
+        def get_subscriptions_info_by_topic(self, _name):
+            return []
+
+        def get_service_names_and_types(self):
+            return []
+
+        def get_service_names_and_types_by_node(self, _node_name, _node_ns):
+            return []
+
+        def get_node_names_and_namespaces(self):
+            return [
+                (self.get_name(), self.get_namespace()),
+                ("integration_publisher", "/warehouse_bot_7"),
+            ]
+
+    monkeypatch.setattr(rclpy.action, "get_action_names_and_types", lambda _node: [])
+    monkeypatch.setattr(
+        rclpy.action,
+        "get_action_server_names_and_types_by_node",
+        lambda _node, _node_name, _node_ns: [],
+    )
+    adapter = GenericROS2Adapter(
+        UnknownEndpointNode(), lambda _ir: None, lambda *_args: None,
+    )
+
+    snapshot = adapter.snapshot()
+
+    assert snapshot["owners"]["topics"] == {
+        "/warehouse_bot_7/camera/status": ["/warehouse_bot_7"],
+    }
