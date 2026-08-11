@@ -33,9 +33,10 @@ def host_timezone() -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run ROS2-oneM2M IPE with the selected YAML profile",
+        description="Run the discovery-driven ROS2-oneM2M IPE",
         epilog=(
-            "Examples: main.py turtlebot3.yaml | "
+            "Examples: main.py --ros-peer 192.168.219.106 | "
+            "main.py turtlebot3.yaml | "
             "main.py turtlebot3_report_motion | "
             "main.py config/profiles/turtlebot3.yaml --explain"
         ),
@@ -44,8 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
         "config",
         nargs="?",
         help=(
-            "profile filename under config/profiles (extension optional), "
-            "or a path relative to this repository"
+            "optional legacy/profile YAML. When omitted, the live ROS 2 graph is authoritative"
         ),
     )
 
@@ -67,10 +67,19 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         help="Set IPE log verbosity",
     )
+    ipe_options.add_argument("--cse-endpoint", help="oneM2M HTTP binding endpoint")
+    ipe_options.add_argument("--cse-base", help="CSEBase resource name")
+    ipe_options.add_argument("--ae-name", help="IPE AE resource name")
+    ipe_options.add_argument("--instance-id", help="IPE instance identifier")
+    ipe_options.add_argument("--robot-id", help="Fallback Robot ID for a root namespace")
+    ipe_options.add_argument("--robot-namespace", help="ROS namespace owned by --robot-id")
+    ipe_options.add_argument("--domain-id", type=int, help="ROS_DOMAIN_ID")
+    ipe_options.add_argument("--ros-peer", help="Cyclone DDS unicast discovery peer IP")
+    ipe_options.add_argument("--refresh-sec", type=float, help="ROS Graph reconcile interval")
     ipe_options.add_argument(
         "--explain",
         action="store_true",
-        help="Print the resolved bridge plan without connecting to ROS2 or the CSE",
+        help="Print the resolved or discovered Binding Plan and exit",
     )
     ipe_options.add_argument(
         "--dry-run",
@@ -100,6 +109,13 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     ipe_args: list[str] = []
     if args.log_level:
         ipe_args.extend(["--log-level", args.log_level])
+    for name in (
+        "cse_endpoint", "cse_base", "ae_name", "instance_id", "robot_id",
+        "robot_namespace", "domain_id", "ros_peer", "refresh_sec",
+    ):
+        value = getattr(args, name)
+        if value is not None:
+            ipe_args.extend([f"--{name.replace('_', '-')}", str(value)])
     for name in ("explain", "dry_run", "discover", "bootstrap_only", "reset"):
         if getattr(args, name):
             ipe_args.append(f"--{name.replace('_', '-')}")
@@ -117,27 +133,6 @@ def available_profiles() -> list[str]:
             if profile.is_file()
         }
     )
-
-
-def print_missing_config_help() -> None:
-    print("오류: 실행할 YAML 프로파일 이름을 입력하지 않았습니다.", file=sys.stderr)
-    print("", file=sys.stderr)
-    print("사용법:", file=sys.stderr)
-    print("  python3 main.py <프로파일명> [IPE 옵션]", file=sys.stderr)
-    print("", file=sys.stderr)
-    print("예시:", file=sys.stderr)
-    print("  python3 main.py turtlebot3_report_motion", file=sys.stderr)
-    print("  python3 main.py turtlebot3_qos_ok --explain", file=sys.stderr)
-
-    profiles = available_profiles()
-    if profiles:
-        print("", file=sys.stderr)
-        print("사용 가능한 프로파일 (config/profiles):", file=sys.stderr)
-        for profile in profiles:
-            print(f"  - {profile}", file=sys.stderr)
-
-    print("", file=sys.stderr)
-    print("전체 도움말: python3 main.py --help", file=sys.stderr)
 
 
 def resolve_config(value: str) -> tuple[Path, Path]:
@@ -162,7 +157,7 @@ def resolve_config(value: str) -> tuple[Path, Path]:
 
 def docker_command(
     image: str,
-    relative_config: Path,
+    relative_config: Path | None,
     ipe_args: list[str],
     *,
     tty: bool,
@@ -192,11 +187,11 @@ def docker_command(
             "python3",
             "-m",
             "ipe",
-            "--config",
-            f"/ws/{relative_config.as_posix()}",
-            *ipe_args,
         ]
     )
+    if relative_config is not None:
+        command.extend(["--config", f"/ws/{relative_config.as_posix()}"])
+    command.extend(ipe_args)
     return command
 
 
@@ -226,21 +221,24 @@ def ensure_image(image: str) -> None:
     )
 
 
-def native_command(config: Path, ipe_args: list[str]) -> tuple[list[str], dict[str, str]]:
+def native_command(config: Path | None, ipe_args: list[str]) -> tuple[list[str], dict[str, str]]:
     env = os.environ.copy()
     src = str(ROOT / "src")
     env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-    return [sys.executable, "-m", "ipe", "--config", str(config), *ipe_args], env
+    command = [sys.executable, "-m", "ipe"]
+    if config is not None:
+        command.extend(["--config", str(config)])
+    command.extend(ipe_args)
+    return command, env
 
 
 def main(argv: list[str] | None = None) -> int:
     args, ipe_args = parse_args(argv)
-    if args.config is None:
-        print_missing_config_help()
-        return 2
-
     try:
-        config, relative = resolve_config(args.config)
+        if args.config is None:
+            config, relative = None, None
+        else:
+            config, relative = resolve_config(args.config)
         if args.native:
             command, env = native_command(config, ipe_args)
         else:
@@ -257,7 +255,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     mode = "native" if args.native else f"docker:{args.image}"
-    print(f"IPE config={relative.as_posix()} runtime={mode}", flush=True)
+    source = relative.as_posix() if relative is not None else "ROS 2 graph (no YAML)"
+    print(f"IPE source={source} runtime={mode}", flush=True)
     os.execvpe(command[0], command, env)
     return 0
 

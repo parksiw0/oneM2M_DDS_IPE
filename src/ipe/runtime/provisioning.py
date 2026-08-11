@@ -131,6 +131,8 @@ class Provisioner:
             return res
 
         for t in rc.topics:
+            if not t.msg_type:  # ambiguous/missing type는 다음 graph 세대까지 defer
+                continue
             try:
                 if t.direction in ("observe", "both"):
                     self._provision_observe(res, ae, t)
@@ -139,16 +141,21 @@ class Provisioner:
             except Exception as e:
                 res.errors.append(f"topic {t.interface}: {e}")
         for s in rc.services:
+            if not s.srv_type:
+                continue
             try:
                 self._provision_service(res, ae, s)
             except Exception as e:
                 res.errors.append(f"service {s.interface}: {e}")
         for a in rc.actions:
+            if not a.action_type:
+                continue
             try:
                 self._provision_action(res, ae, a)
             except Exception as e:
                 res.errors.append(f"action {a.interface}: {e}")
         if res.errors:
+            res.ok = False
             log.warning("provisioning completed with %d error(s)", len(res.errors))
         return res
 
@@ -290,3 +297,34 @@ class Provisioner:
                                        f"ipe:lastSeen={last_seen}"])
         except Exception as e:
             log.warning("availability label update failed for %s: %s", path, e)
+
+    def remove_interface(self, kind: str, spec: Any) -> list[str]:
+        """활성 generation에서 빠진 interface subtree를 제거한다.
+
+        호출자는 새 generation을 먼저 활성화해야 한다(make-before-break).
+        """
+        ae = self._ae_root()
+        branches: list[str]
+        if kind == "topic":
+            branches = []
+            if spec.direction in ("observe", "both"):
+                branches.append("ros2Data")
+            if spec.direction in ("command", "both"):
+                branches.append("ros2Command")
+        elif kind == "service":
+            branches = ["services"]
+        elif kind == "action":
+            branches = ["actions"]
+        else:
+            raise ValueError(f"unknown interface kind: {kind}")
+
+        removed: list[str] = []
+        for branch in branches:
+            path = f"{self._branch_root(ae, spec.robot_id, branch)}/{spec.rel_path}"
+            response = self.ops.delete_resource(path)
+            if response.ok or response.status == 404:
+                removed.append(path)
+            else:
+                log.warning("resource removal failed for %s: status=%s rsc=%s",
+                            path, response.status, response.rsc)
+        return removed

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import logging
+import os
 import sys
 from pathlib import Path
 
-from ipe.config.loader import ConfigError, load_config
+from ipe.config.loader import ConfigError, load_config, validate_config
 from ipe.config.resolver import ResolveError, resolve
+from ipe.config.runtime_config import discovery_runtime_config
 from ipe.config.spec import QoSSpec, ResolvedConfig
 
 
@@ -19,7 +22,19 @@ def setup_logging(level: str) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="ipe", description="Generic ROS2 <-> oneM2M IPE")
-    p.add_argument("--config", "-c", type=Path, required=True)
+    p.add_argument(
+        "--config", "-c", type=Path,
+        help="Optional deployment YAML. Without it, interfaces come from the ROS 2 graph.",
+    )
+    p.add_argument("--cse-endpoint", help="oneM2M HTTP binding endpoint")
+    p.add_argument("--cse-base", help="CSEBase resource name")
+    p.add_argument("--ae-name", help="IPE AE resource name")
+    p.add_argument("--instance-id", help="IPE instance identifier")
+    p.add_argument("--robot-id", help="Robot CNT name for an un-namespaced ROS graph")
+    p.add_argument("--robot-namespace", help="ROS namespace owned by --robot-id")
+    p.add_argument("--domain-id", type=int, help="ROS_DOMAIN_ID")
+    p.add_argument("--ros-peer", help="Cyclone DDS unicast discovery peer IP")
+    p.add_argument("--refresh-sec", type=float, help="ROS graph reconcile interval")
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     p.add_argument("--explain", action="store_true",
                    help="Resolve config (no ROS2/CSE) and print the bridge plan per interface")
@@ -80,7 +95,8 @@ def main(argv: list[str] | None = None) -> int:
     log = logging.getLogger("ipe")
 
     try:
-        config = load_config(args.config)
+        config = (load_config(args.config) if args.config is not None
+                  else validate_config(discovery_runtime_config(args)))
     except ConfigError as e:
         log.error("Configuration error: %s", e)
         return 1
@@ -93,12 +109,21 @@ def main(argv: list[str] | None = None) -> int:
         log.error("Resolution error: %s", e)
         return 1
 
+    try:
+        _configure_ros_environment(args, rc)
+    except ConfigError as e:
+        log.error("Configuration error: %s", e)
+        return 1
+    args.configless = args.config is None
+
     if args.explain or args.dry_run:
+        if args.configless:
+            return _discover(log, rc, explain_plan=True)
         explain(rc, log)
         return 0
 
     if args.discover:
-        return _discover(log)
+        return _discover(log, rc)
 
     if args.reset:
         _reset_ae(rc, log)   # 삭제 후 정상 부트스트랩으로 계속
@@ -108,25 +133,66 @@ def main(argv: list[str] | None = None) -> int:
     return run(rc, args)
 
 
-def _discover(log: logging.Logger) -> int:
-    """그래프 스냅숏 1회 출력 — 설정 작성 전 어떤 인터페이스가 있는지 확인용."""
+def _configure_ros_environment(args: argparse.Namespace, rc: ResolvedConfig) -> None:
+    """rclpy.init() 전에 DDS Domain과 선택적 Cyclone DDS peer를 적용한다."""
+    domain_id = args.domain_id
+    if domain_id is None:
+        domain_id = int(rc.discovery.get("domain_id", os.environ.get("ROS_DOMAIN_ID", 0)))
+    os.environ["ROS_DOMAIN_ID"] = str(domain_id)
+
+    peer = args.ros_peer or os.environ.get("IPE_ROS_PEER")
+    if not peer:
+        return
+    try:
+        ipaddress.ip_address(peer)
+    except ValueError as e:
+        raise ConfigError(f"--ros-peer must be an IP address: {peer!r}") from e
+    os.environ["CYCLONEDDS_URI"] = (
+        "<CycloneDDS><Domain><Discovery><Peers>"
+        f'<Peer address="{peer}"/>'
+        "</Peers></Discovery></Domain></CycloneDDS>"
+    )
+
+
+def _discover(log: logging.Logger, rc: ResolvedConfig, *, explain_plan: bool = False) -> int:
+    """수렴한 graph 또는 graph에서 계산한 DesiredBindingPlan을 출력한다."""
     import rclpy
     from rclpy.node import Node
 
     from ipe.adapter.ros2 import GenericROS2Adapter
+    from ipe.runtime.discovery import GraphNotReady, await_graph_convergence
 
     rclpy.init()
-    node = Node("ipe_discover")
     try:
-        import time
-        time.sleep(1.0)   # DDS 디스커버리 수렴 대기
-        snap = GenericROS2Adapter(node, lambda _ir: None, lambda *_: None).snapshot()
+        try:
+            node = Node("ipe_discover", enable_rosout=False,
+                        start_parameter_services=False)
+        except TypeError:
+            node = Node("ipe_discover")
+        adapter = GenericROS2Adapter(node, lambda _ir: None, lambda *_: None)
+        disc = rc.discovery
+        state = await_graph_convergence(
+            adapter.snapshot,
+            timeout_sec=float(disc.get("graph_settle_timeout_sec", 10)),
+            stable_polls=int(disc.get("graph_stable_polls", 2)),
+            poll_sec=float(disc.get("graph_poll_sec", 0.5)),
+        )
+        snap = state.snapshot
+        if explain_plan:
+            explain(resolve(rc.raw, discovered=snap), log)
+            return 0
         for kind in ("topics", "services", "actions"):
             log.info("--- %s (%d) ---", kind, len(snap.get(kind, [])))
             for name, types in sorted(snap.get(kind, [])):
-                log.info("  %-40s %s", name, ",".join(types))
+                direction = snap.get("topic_directions", {}).get(name)
+                suffix = f" [{direction}]" if direction else ""
+                log.info("  %-40s %s%s", name, ",".join(types), suffix)
+    except GraphNotReady as e:
+        log.error("Discovery not ready: %s", e)
+        return 2
     finally:
-        node.destroy_node()
+        if "node" in locals():
+            node.destroy_node()
         rclpy.shutdown()
     return 0
 

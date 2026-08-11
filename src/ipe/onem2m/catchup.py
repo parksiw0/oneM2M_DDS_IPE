@@ -28,6 +28,10 @@ class CatchUpSweeper:
     def register(self, path_key: str, cnt_path: str) -> None:
         self.input_cnts[path_key] = cnt_path
 
+    def replace(self, input_cnts: dict[str, str]) -> None:
+        """활성 binding generation의 입력 CNT 집합으로 원자적 참조를 교체한다."""
+        self.input_cnts = dict(input_cnts)
+
     def mark_processed(self, path_key: str, ct: str | None) -> None:
         """마커 전진 — 리스너도 수락된 NOTIFY마다 호출하므로 정상 운영 중에는
         스윕 윈도가 작게 유지된다."""

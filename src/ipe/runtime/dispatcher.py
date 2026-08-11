@@ -71,6 +71,15 @@ class RouteTable:
         with self._lock:
             self._routes[path_key] = Route(kind, robot_id, interface, dict(meta or {}))
 
+    def replace(self, routes: dict[str, Route], aliases: dict[str, str] | None = None) -> None:
+        """route와 sur 별칭을 한 lock 구간에서 generation 단위로 교체한다."""
+        if any(route.kind not in CORRELATION_FIELDS for route in routes.values()):
+            raise ValueError("replacement contains an unknown route kind")
+        normalized = {self._norm_sur(k): v for k, v in (aliases or {}).items()}
+        with self._lock:
+            self._routes = dict(routes)
+            self._by_sur = normalized
+
     @staticmethod
     def _norm_sur(sur: str) -> str:
         # tinyIoT sur는 선행 슬래시 없는 구조 경로지만 방어적으로 정규화한다

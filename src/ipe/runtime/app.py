@@ -14,7 +14,7 @@ import threading
 import time
 from typing import Any
 
-
+from ipe.config.resolver import resolve
 from ipe.config.spec import ResolvedConfig
 from ipe.core.command import CommandDispatchManager
 from ipe.core.common import TokenBucket
@@ -24,7 +24,9 @@ from ipe.onem2m.catchup import CatchUpSweeper
 from ipe.onem2m.client import idify, make_onem2m_client
 from ipe.onem2m.notification_server import NotificationServer
 from ipe.onem2m.resource_ops import ResourceOps
-from ipe.runtime.dispatcher import RouteTable
+from ipe.runtime.dispatcher import Route, RouteTable
+from ipe.runtime.discovery import GraphNotReady, await_graph_convergence
+from ipe.runtime.lifecycle import IPEHealth, IPEPhase, IPEState, Lifecycle
 from ipe.runtime.provisioning import Provisioner
 from ipe.runtime.queues import (
     CLASS_TERMINAL,
@@ -52,6 +54,7 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
             rc.storage.get("state_db", "ipe_state.db"),
             max_spool_entries=rc.storage.get("max_spool_entries", 10000),
             max_spool_mb=rc.storage.get("max_spool_mb", 64))
+        self.lifecycle = Lifecycle(self.state)
         self.inbound = InboundQueue(maxsize=rec.get("inbound_max", 1000),
                                     control_maxsize=rec.get("control_lane_max", 64))
         self.outbound = OutboundQueue(maxsize=rec.get("outbound_max", 5000))
@@ -100,6 +103,7 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
         self._budget_dropped = 0
         self._inflight: dict[tuple[str, str], set[str]] = {}          # (robot,iface) -> corr들
         self._avail: dict[tuple[str, str, str], dict[str, Any]] = {}  # churn 상태기계(§4.6)
+        self._plan_misses: dict[tuple[str, str, str], int] = {}
         # qos FCNT 게시 상태 (QoS_FCNT_설계서 §4.5.2)
         self._qos_fcnt_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._qos_fcnt_last_pub: dict[tuple[str, str, str], float] = {}
@@ -114,23 +118,54 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
         rc = self.rc
         log.info("IPE starting (%s): %s -> %s (AE %s)", self.protocol, rc.instance_id,
                  rc.cse.endpoint or self.poa, rc.cse.ae_name)
+        self.lifecycle.set(IPEState.PREPARING, IPEPhase.VALIDATING_CONFIG)
 
-        # SUB 생성(vrq 검증) 전에 알림 리스너가 떠 있어야 한다 (MQTT는 SUBACK까지 블록)
-        self.server = self._make_listener()
-        self.server.start()
+        # S1: SUB 검증을 받을 listener와 oneM2M 전송만 준비한다. route는 비어 있다.
         try:
-            # MQTT 전송은 브로커 연결이 필요(HTTP는 no-op)
+            self.server = self._make_listener()
+            self.server.start()
             self.worker_client.start()
             self.prov_client.start()
+            self.lifecycle.set(IPEState.PREPARING, IPEPhase.TRANSPORT_READY)
+
+            # S2-S3: application endpoint 없이 DDS Domain에 참여하고 graph 수렴을 기다린다.
+            self._init_ros()
+            self.lifecycle.set(IPEState.PREPARING, IPEPhase.DDS_JOINED)
+            disc = rc.discovery
+            discovered = await_graph_convergence(
+                self.adapter.snapshot,
+                timeout_sec=float(disc.get("graph_settle_timeout_sec", 10)),
+                stable_polls=int(disc.get("graph_stable_polls", 2)),
+                poll_sec=float(disc.get("graph_poll_sec", 0.5)),
+                spin_once=lambda timeout: self.executor.spin_once(timeout_sec=timeout),
+            )
+            self.lifecycle.set(
+                IPEState.PREPARING, IPEPhase.GRAPH_DISCOVERED,
+                detail=f"samples={discovered.samples}, elapsed={discovered.elapsed_sec:.2f}s")
+
+            # S4: graph snapshot이 인터페이스 목록의 단일 권위다.
+            resolved = resolve(rc.raw, discovered=discovered.snapshot)
+            self._defer_unloadable_types(resolved)
+            self.rc = resolved
+            self.provisioner.rc = resolved
+            rc = resolved
+            counts = self._binding_counts()
+            if not any(counts.values()):
+                raise GraphNotReady("ROS graph converged but has no bindable interfaces")
+            self.lifecycle.set(
+                IPEState.PREPARING, IPEPhase.BINDING_PLAN_RESOLVED,
+                detail=str(counts))
+
+            # S5-S7: AE/CSE identity 뒤에만 robot 리소스와 SUB를 staged 생성한다.
             self.aei = self.provisioner.ensure_ae_identity()
             self.worker_client.origin = self.aei
             self.prov_client.origin = self.aei
             self.provisioner.check_cse_identity()
+            self.lifecycle.set(IPEState.PREPARING, IPEPhase.AE_REGISTERED)
             result = self.provisioner.provision_all()
-            self._absorb_provision(result)
             if not result.ok:
-                log.error("provisioning failed: %s", result.errors)
-                return 2
+                raise RuntimeError(f"provisioning failed: {result.errors}")
+            self.lifecycle.set(IPEState.PREPARING, IPEPhase.CSE_RESOURCES_PREPARED)
             for err in result.errors:
                 self.emit_event("provisioningStatus", "error",
                                 {"event": "provisionError", "detail": err})
@@ -142,31 +177,35 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
                                 {"event": "qosFcntUnavailable", "robot": f["robot"],
                                  "interface": f["interface"],
                                  "direction": f["direction"], "detail": f["error"]})
-        except Exception:
+            self.lifecycle.set(IPEState.PREPARED, IPEPhase.CSE_PROVISIONED)
+        except Exception as e:
+            self.lifecycle.set(IPEState.NOT_READY, self.lifecycle_phase,
+                               health=IPEHealth.FAILED, detail=str(e))
             log.exception("bootstrap failed")
-            self._stop_clients()
-            self.server.stop()
-            return 2
+            return self._abort_bootstrap()
 
         if getattr(self.args, "bootstrap_only", False):
             log.info("bootstrap complete (--bootstrap-only)")
-            self._stop_clients()
-            self.server.stop()
-            return 0
+            self.lifecycle.set(IPEState.STOPPED, IPEPhase.IDLE)
+            return self._abort_bootstrap(code=0)
 
-        import rclpy
-        from rclpy.executors import SingleThreadedExecutor
-        from rclpy.node import Node
+        # S8: staged CSE plan을 Pipeline에 주입한 뒤 ROS endpoint를 생성한다.
+        self.path_map.update(result.path_map)
+        large = rc.policy.get("suitability", {}).get("large_payload_bytes", 49152)
+        self.pipeline = Pipeline(rc.topics, self.path_map, large_payload_bytes=large)
+        bufs = self.state.get_kv("anomaly_bufs")
+        if bufs:
+            self.pipeline.anomaly.restore(bufs)
+        self.lifecycle.set(IPEState.PREPARED, IPEPhase.BINDING, next_generation=True)
+        if not self._bind_all():
+            self.lifecycle.set(IPEState.NOT_READY, IPEPhase.BINDING,
+                               health=IPEHealth.FAILED, detail="ROS endpoint rollback")
+            return self._abort_bootstrap()
 
-        rclpy.init()
-        self.node = Node("ros2_onem2m_ipe")
-        from ipe.adapter.ros2 import GenericROS2Adapter
-        self.adapter = GenericROS2Adapter(
-            self.node, self._on_topic_ir, self.emit_event,
-            qos_strictness=rc.policy.get("qos_strictness", "reject"))
-        self.executor = SingleThreadedExecutor()
-        self.executor.add_node(self.node)
-        self.guard = self.node.create_guard_condition(self._drain_inbound)
+        # S8.5: endpoint가 모두 준비된 뒤 route와 binding generation을 활성화한다.
+        self._absorb_provision(result)
+        self.lifecycle.set(IPEState.PREPARED, IPEPhase.BINDING_READY)
+
         self.node.create_timer(1.0, self._tick_1s)
         self.node.create_timer(float(rc.logging.get("heartbeat_sec", 30) or 30),
                                self._heartbeat)
@@ -180,12 +219,6 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
         if rcs > 0:
             self.node.create_timer(rcs, lambda: self._prov_jobs.put(("reconcile", None)))
 
-        large = rc.policy.get("suitability", {}).get("large_payload_bytes", 49152)
-        self.pipeline = Pipeline(rc.topics, self.path_map, large_payload_bytes=large)
-        bufs = self.state.get_kv("anomaly_bufs")
-        if bufs:
-            self.pipeline.anomaly.restore(bufs)   # 워밍업 공백 제거(§7.4)
-        self._bind_all()
         self._publish_contracts()
 
         self.worker_thread = threading.Thread(target=self._outbound_worker,
@@ -203,6 +236,9 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
 
         counts = {k: sum(1 for key in self.specs_by_key if key[0] == k)
                   for k in ("observe", "command", "service", "action")}
+        self.lifecycle.set(IPEState.RUNNING, IPEPhase.IDLE, health=IPEHealth.HEALTHY)
+        self.emit_event("ipeHealth", "info",
+                        {"event": "running", **self.lifecycle.snapshot.__dict__})
         log.info("IPE running %s", counts)
 
         # 콜백 예외는 격리한다 — spin 루프는 죽으면 안 된다
@@ -213,6 +249,81 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
                 log.exception("executor callback raised (isolated)")
                 self.emit_event("ipeHealth", "error", {"event": "adapterError"})
         return self._graceful_shutdown()
+
+    @property
+    def lifecycle_phase(self) -> IPEPhase:
+        return IPEPhase(self.lifecycle.snapshot.ipe_phase)
+
+    def _binding_counts(self) -> dict[str, int]:
+        return {
+            "topics": sum(1 for x in self.rc.topics if x.msg_type),
+            "services": sum(1 for x in self.rc.services if x.srv_type),
+            "actions": sum(1 for x in self.rc.actions if x.action_type),
+        }
+
+    def _defer_unloadable_types(self, rc: ResolvedConfig) -> None:
+        """로컬 type support가 없는 항목은 실패시키지 않고 다음 세대로 defer."""
+        groups = ((rc.topics, "msg_type", "msg"),
+                  (rc.services, "srv_type", "srv"),
+                  (rc.actions, "action_type", "action"))
+        for items, attr, kind in groups:
+            kept = []
+            for spec in items:
+                type_name = getattr(spec, attr)
+                if type_name and self.adapter.type_available(kind, type_name):
+                    kept.append(spec)
+                else:
+                    log.warning("binding deferred (type support unavailable): %s [%s]",
+                                spec.interface, type_name or "ambiguous")
+            items[:] = kept
+
+    def _init_ros(self) -> None:
+        import rclpy
+        from rclpy.executors import SingleThreadedExecutor
+        from rclpy.node import Node
+
+        rclpy.init()
+        try:
+            self.node = Node("ros2_onem2m_ipe", enable_rosout=False,
+                             start_parameter_services=False)
+        except TypeError:  # 구형 rclpy 호환
+            self.node = Node("ros2_onem2m_ipe")
+        from ipe.adapter.ros2 import GenericROS2Adapter
+        self.adapter = GenericROS2Adapter(
+            self.node, self._on_topic_ir, self.emit_event,
+            qos_strictness=self.rc.policy.get("qos_strictness", "reject"))
+        self.executor = SingleThreadedExecutor()
+        self.executor.add_node(self.node)
+        self.guard = self.node.create_guard_condition(self._drain_inbound)
+
+    def _abort_bootstrap(self, code: int = 2) -> int:
+        server = getattr(self, "server", None)
+        if server is not None:
+            server.stop()
+        if self.adapter is not None:
+            try:
+                self.adapter.shutdown()
+            except Exception:
+                pass
+        if self.executor is not None:
+            try:
+                self.executor.shutdown()
+            except Exception:
+                pass
+        if self.node is not None:
+            try:
+                self.node.destroy_node()
+            except Exception:
+                pass
+        try:
+            import rclpy
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception:
+            pass
+        self._stop_clients()
+        self.state.close()
+        return code
 
     def _make_listener(self) -> Any:
         rc = self.rc
@@ -231,35 +342,59 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
                 c.stop()
 
     def _absorb_provision(self, result: Any) -> None:
+        self.path_map.clear()
         self.path_map.update(result.path_map)
+        self.status_paths.clear()
         self.status_paths.update(result.status_paths)
         for f in getattr(result, "qos_fcnt_failed", []):
             self._qos_lbl_only.add((f["robot"], f["interface"], f["direction"]))
+        routes: dict[str, Route] = {}
+        aliases: dict[str, str] = {}
+        catchup_inputs: dict[str, str] = {}
         for path_key, r in result.routes.items():
-            self.routes.add(path_key, r["kind"], r["robot_id"], r["interface"], meta=r)
+            routes[path_key] = Route(r["kind"], r["robot_id"], r["interface"], dict(r))
             if r["kind"] != "qos_update":
-                self.catchup.register(path_key, r["input_cnt_path"])
+                catchup_inputs[path_key] = r["input_cnt_path"]
             if self.protocol == "mqtt":
                 # MQTT NOTIFY는 sur(SUB 구조 경로)로 라우팅
                 cnt = r["input_cnt_path"].rstrip("/")
-                self.routes.add_alias((cnt + "/ipeSub").lstrip("/"), path_key)
+                aliases[(cnt + "/ipeSub").lstrip("/")] = path_key
                 if r.get("sub_ri"):
-                    self.routes.add_alias(r["sub_ri"], path_key)
+                    aliases[r["sub_ri"]] = path_key
+        self.routes.replace(routes, aliases)
+        self.catchup.replace(catchup_inputs)
 
-    def _bind_all(self) -> None:
+    def _bind_all(self) -> bool:
+        ok = True
         for t in self.rc.topics:
             if t.direction in ("observe", "both") and t.msg_type:
                 if self.adapter.bind_observe(t):
                     self.specs_by_key[("observe", t.robot_id, t.interface)] = t
+                else:
+                    ok = False
             if t.direction in ("command", "both") and t.access_enabled and t.msg_type:
                 if self.adapter.bind_command(t):
                     self.specs_by_key[("command", t.robot_id, t.interface)] = t
+                else:
+                    ok = False
         for s in self.rc.services:
-            if s.srv_type and self.adapter.bind_service(s):
-                self.specs_by_key[("service", s.robot_id, s.interface)] = s
+            if s.srv_type:
+                if self.adapter.bind_service(s):
+                    self.specs_by_key[("service", s.robot_id, s.interface)] = s
+                else:
+                    ok = False
         for a in self.rc.actions:
-            if a.action_type and self.adapter.bind_action(a):
-                self.specs_by_key[("action", a.robot_id, a.interface)] = a
+            if a.action_type:
+                if self.adapter.bind_action(a):
+                    self.specs_by_key[("action", a.robot_id, a.interface)] = a
+                else:
+                    ok = False
+        if not ok:
+            # generation 활성화 전이므로 새 endpoint만 제거하면 기존 route에는
+            # 영향이 없다. 초기 기동에서는 이 generation 전체를 폐기한다.
+            self.adapter.shutdown()
+            self.specs_by_key.clear()
+        return ok
 
     # ------------------------------------------------------------------
     # observe 경로 (executor 스레드)
@@ -340,6 +475,7 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
                 rclpy.shutdown()
         except Exception:
             log.exception("rclpy shutdown failed")
+        self.lifecycle.set(IPEState.STOPPED, IPEPhase.IDLE)
         self.state.close()
         log.info("shutdown complete")
         return 0
