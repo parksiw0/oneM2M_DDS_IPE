@@ -84,6 +84,43 @@ def test_endpoint_namespace_creates_a_robot_boundary_without_yaml():
     assert rc.topics[0].rel_path == "scan"
 
 
+@pytest.mark.parametrize(
+    ("robot_id", "prefixed_interface", "expected_leaf"),
+    [
+        ("tb3", "/tb3/mock_scan", "mock_scan"),
+        ("warehouse_bot_7", "/warehouse_bot_7/camera/status", "camera__status"),
+    ],
+)
+def test_fallback_robot_prefix_is_not_duplicated_in_resource_name(
+    robot_id, prefixed_interface, expected_leaf,
+):
+    raw = validate_config(discovery_runtime_config(_args(robot_id=robot_id), {}))
+    snap = {
+        "topics": [
+            (prefixed_interface, ["std_msgs/msg/String"]),
+            ("/scan", ["sensor_msgs/msg/LaserScan"]),
+        ],
+        "services": [], "actions": [],
+        "topic_directions": {
+            prefixed_interface: "observe",
+            "/scan": "observe",
+        },
+        "owners": {
+            "topics": {
+                prefixed_interface: ["/"],
+                "/scan": ["/"],
+            },
+        },
+    }
+
+    rc = resolve(raw, discovered=snap)
+    topics = {topic.interface: topic for topic in rc.topics}
+
+    assert topics[prefixed_interface].robot_id == robot_id
+    assert topics[prefixed_interface].rel_path == expected_leaf
+    assert topics["/scan"].rel_path == "scan"
+
+
 def test_action_server_namespace_creates_the_same_robot_boundary():
     raw = validate_config(discovery_runtime_config(_args(), {}))
     snap = {

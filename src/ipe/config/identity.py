@@ -179,6 +179,11 @@ def interface_segments(
         rel = interface[len(ns):]
     rel = rel.strip("/")
     parts = [p for p in rel.split("/") if p] or [interface.strip("/").replace("/", sanitize)]
+    # root namespace에서 광고된 endpoint는 namespace만으로 robot을 식별할 수
+    # 없어 --robot-id fallback을 사용한다. 이때 ROS 이름 자체가
+    # /{robot_id}/... 형태라면 robot CNT 아래에 같은 경계를 반복하지 않는다.
+    if not ns and len(parts) > 1 and parts[0] == robot.id:
+        parts = parts[1:]
 
     if path_style == "flat":
         joined = "__".join(parts)
