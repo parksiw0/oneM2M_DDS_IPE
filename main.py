@@ -13,7 +13,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parent
 PROFILE_DIR = ROOT / "config" / "profiles"
 DEFAULT_IMAGE = "ipe:humble"

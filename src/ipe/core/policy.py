@@ -23,7 +23,6 @@ from ipe.core.payload import (
     build_fcnt_update,
     build_reference_content,
 )
-from ipe.ir import TopicIR
 
 # 큐 클래스 문자열을 의도적으로 로컬에 중복 정의 — core가 runtime.queues에
 # 의존하지 않게 하기 위함. 값은 runtime 쪽 클래스 이름과 일치해야 한다.
@@ -32,6 +31,7 @@ from ipe.core.vocab import (
     CLASS_OBSERVE_LATEST as QUEUE_OBSERVE_LATEST,
     CLASS_TERMINAL as QUEUE_TERMINAL,
 )
+from ipe.ir import TopicIR
 
 # representation별로 path_map에 있어야 하는 뷰 — 프로비저닝과의 계약.
 VIEWS_BY_REPRESENTATION: dict[str, tuple[str, ...]] = {
@@ -90,6 +90,10 @@ class Pipeline:
     def add_spec(self, spec: TopicSpec) -> None:
         """디스커버리로 늦게 합류한 토픽 등록 — executor 스레드에서만 호출."""
         self._specs[(spec.robot_id, spec.interface)] = spec
+
+    def remove_spec(self, robot_id: str, interface: str) -> None:
+        """소멸 확정된 graph interface를 활성 파이프라인에서 제거한다."""
+        self._specs.pop((robot_id, interface), None)
 
     def process(self, ir: TopicIR) -> list[Op]:
         key = (ir["robot_id"], ir["interface_name"])

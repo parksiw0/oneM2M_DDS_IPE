@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-
 ROOT = Path(__file__).parents[1]
 SPEC = importlib.util.spec_from_file_location("ipe_main_launcher", ROOT / "main.py")
 assert SPEC is not None and SPEC.loader is not None

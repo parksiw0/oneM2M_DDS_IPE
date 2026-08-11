@@ -39,6 +39,7 @@ class PendingBindingPlan:
     provision: Any
     additions: list[tuple[PlanKey, Any]]
     removals: list[tuple[PlanKey, Any]]
+    base_generation: int | None = None
 
 
 __all__ = ["PendingBindingPlan", "PlanKey", "append_spec", "binding_map", "set_spec"]

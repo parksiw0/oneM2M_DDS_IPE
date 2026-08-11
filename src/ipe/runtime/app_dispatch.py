@@ -10,7 +10,6 @@ import logging
 import time
 from typing import Any
 
-
 from ipe.config.spec import ActionSpec, ServiceSpec, TopicSpec
 from ipe.core.common import deep_merge as _deep_merge, project_top_level as _project
 from ipe.core.normalize import ct_to_epoch as _ct_to_epoch
@@ -18,6 +17,8 @@ from ipe.core.policy import Op
 from ipe.core.vocab import CLASS_OBSERVE_BULK, CLASS_TERMINAL
 from ipe.onem2m.notification import Notification
 from ipe.runtime.dispatcher import InboundEvent
+from ipe.runtime.lifecycle import IPEHealth, IPEPhase, IPEState
+from ipe.runtime.plan import PendingBindingPlan
 
 log = logging.getLogger(__name__)
 
@@ -126,7 +127,7 @@ class DispatchMixin:
             self.guard.trigger()
 
     def _dispatch_one(self, ev: InboundEvent, corr: str) -> None:
-        if ev.kind.startswith("_bind_"):
+        if ev.kind.startswith("_"):
             self._bind_dynamic(ev)
             return
         if not self.state.cas_dispatch(ev.robot_id, ev.interface, corr, time.time()):
@@ -150,6 +151,9 @@ class DispatchMixin:
 
     def _bind_dynamic(self, ev: InboundEvent) -> None:
         spec = getattr(ev, "spec", None)
+        if ev.kind == "_activate_plan" and isinstance(spec, PendingBindingPlan):
+            self._activate_plan(spec)
+            return
         if ev.kind == "_bind_service" and isinstance(spec, ServiceSpec):
             if self.adapter.bind_service(spec):
                 key = ("service", spec.robot_id, spec.interface)
@@ -174,6 +178,106 @@ class DispatchMixin:
                 self.specs_by_key[key] = spec
                 self._publish_contract_for(key, spec)
             self._publish_qos_state(only_key=(spec.robot_id, spec.interface))
+
+    def _activate_plan(self, pending: PendingBindingPlan) -> None:
+        """S10 make-before-break: bind additions, swap generation, remove old."""
+        current_generation = self.lifecycle.snapshot.generation
+        if (pending.base_generation is not None
+                and pending.base_generation != current_generation):
+            self.emit_event(
+                "provisioningStatus",
+                "warning",
+                {
+                    "event": "bindingPlanSuperseded",
+                    "baseGeneration": pending.base_generation,
+                    "activeGeneration": current_generation,
+                },
+            )
+            return
+        staged: list[tuple[tuple[str, str, str], Any]] = []
+        self.lifecycle.set(IPEState.RUNNING, IPEPhase.BINDING)
+        for key, spec in pending.additions:
+            if not self._bind_plan_spec(key, spec):
+                for staged_key, staged_spec in reversed(staged):
+                    self._unbind_plan_spec(staged_key, staged_spec)
+                self.lifecycle.set(
+                    IPEState.RUNNING, IPEPhase.IDLE, health=IPEHealth.DEGRADED,
+                    detail=f"binding rollback: {key}")
+                self.emit_event("provisioningStatus", "error",
+                                {"event": "bindingRollback", "binding": str(key)})
+                return
+            staged.append((key, spec))
+
+        # route/path/ResolvedConfig은 하나의 executor callback에서 세대 교체된다.
+        self.rc = pending.rc
+        self.provisioner.rc = pending.rc
+        self._absorb_provision(pending.provision)
+        for key, spec in pending.removals:
+            self._unbind_plan_spec(key, spec)
+            self._terminate_inflight(spec.robot_id, spec.interface)
+
+        self.lifecycle.set(IPEState.RUNNING, IPEPhase.IDLE,
+                           health=IPEHealth.HEALTHY, next_generation=True)
+        for key, spec in pending.additions:
+            runtime_kind = ("command" if key[0] == "topic"
+                            and spec.direction in ("command", "both") else key[0])
+            self._publish_contract_for((runtime_kind, spec.robot_id, spec.interface), spec)
+        self._publish_qos_state()
+        if pending.removals:
+            self._prov_jobs.put(("remove_interfaces", pending.removals))
+        self._prov_jobs.put(("catchup", "binding-generation"))
+        self.emit_event("provisioningStatus", "info",
+                        {"event": "bindingGenerationActivated",
+                         "generation": self.lifecycle.snapshot.generation,
+                         "added": len(pending.additions),
+                         "removed": len(pending.removals)})
+
+    def _bind_plan_spec(self, key: tuple[str, str, str], spec: Any) -> bool:
+        kind = key[0]
+        endpoint_key = (spec.robot_id, spec.interface)
+        if kind == "service":
+            if not self.adapter.bind_service(spec):
+                return False
+            self.specs_by_key[("service", *endpoint_key)] = spec
+            return True
+        if kind == "action":
+            if not self.adapter.bind_action(spec):
+                return False
+            self.specs_by_key[("action", *endpoint_key)] = spec
+            return True
+
+        bound_observe = False
+        if spec.direction in ("observe", "both"):
+            if not self.adapter.bind_observe(spec):
+                return False
+            bound_observe = True
+            self.specs_by_key[("observe", *endpoint_key)] = spec
+            self.pipeline.add_spec(spec)
+        if spec.direction in ("command", "both") and spec.access_enabled:
+            if not self.adapter.bind_command(spec):
+                if bound_observe:
+                    self.adapter.unbind_observe(endpoint_key)
+                    self.specs_by_key.pop(("observe", *endpoint_key), None)
+                    self.pipeline.remove_spec(*endpoint_key)
+                return False
+            self.specs_by_key[("command", *endpoint_key)] = spec
+        return True
+
+    def _unbind_plan_spec(self, key: tuple[str, str, str], spec: Any) -> None:
+        kind = key[0]
+        endpoint_key = (spec.robot_id, spec.interface)
+        if kind == "service":
+            self.adapter.unbind_service(endpoint_key)
+            self.specs_by_key.pop(("service", *endpoint_key), None)
+        elif kind == "action":
+            self.adapter.unbind_action(endpoint_key)
+            self.specs_by_key.pop(("action", *endpoint_key), None)
+        else:
+            self.adapter.unbind_observe(endpoint_key)
+            self.adapter.unbind_command(endpoint_key)
+            self.specs_by_key.pop(("observe", *endpoint_key), None)
+            self.specs_by_key.pop(("command", *endpoint_key), None)
+            self.pipeline.remove_spec(*endpoint_key)
 
     # --- command ------------------------------------------------------
 
@@ -574,4 +678,3 @@ class DispatchMixin:
                         {"event": "anomalyDetected", "interface": op.interface,
                          "robot": op.robot_id,
                          "anomaly": (op.content or {}).get("anomaly")})
-

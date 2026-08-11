@@ -44,6 +44,7 @@ def test_routes_remain_staged_until_provision_result_is_absorbed():
 
     assert "command/tb3/cmd_vel" in harness.routes
     assert harness.catchup.inputs == {"command/tb3/cmd_vel": "/T/ipe/cmd"}
+    assert harness.path_map == {("tb3", "/cmd_vel", "command"): "/T/ipe/cmd"}
 
 
 def test_initial_endpoint_failure_rolls_back_the_generation():

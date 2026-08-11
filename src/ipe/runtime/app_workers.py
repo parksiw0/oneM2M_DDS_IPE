@@ -15,6 +15,7 @@ from ipe.core.policy import Op
 from ipe.core.vocab import CLASS_TERMINAL
 from ipe.onem2m.client import OversizeError, TransportError, classify
 from ipe.runtime.dispatcher import InboundEvent
+from ipe.runtime.plan import PendingBindingPlan, append_spec, binding_map, set_spec
 
 log = logging.getLogger(__name__)
 
@@ -142,41 +143,96 @@ class WorkersMixin:
                     self.catchup.sweep(str(arg or "manual"))
                 elif job == "reconcile_discovery":
                     self._reconcile_discovery(arg)
+                elif job == "remove_interfaces":
+                    self._remove_interfaces(arg)
             except Exception:
                 log.exception("provisioning job %s failed", job)
 
+    @staticmethod
+    def _removal_path_count(key: tuple[str, str, str], spec: Any) -> int:
+        if key[0] != "topic":
+            return 1
+        return int(spec.direction in ("observe", "both")) + int(
+            spec.direction in ("command", "both")
+        )
+
+    def _remove_interfaces(self, items: list[tuple[Any, Any]]) -> None:
+        """CSE subtree 제거 실패를 다음 Graph 주기까지 보존한다."""
+        for key, spec in items:
+            try:
+                removed = self.provisioner.remove_interface(key[0], spec)
+            except Exception as e:
+                log.warning("resource removal deferred for %s: %s", key, e)
+                self._resource_removal_pending[key] = spec
+                continue
+            if len(removed) < WorkersMixin._removal_path_count(key, spec):
+                self._resource_removal_pending[key] = spec
+            else:
+                self._resource_removal_pending.pop(key, None)
+
     def _reconcile_discovery(self, snap: dict[str, Any]) -> None:
         from ipe.config.resolver import resolve
+        if self._resource_removal_pending:
+            self._remove_interfaces(list(self._resource_removal_pending.items()))
         try:
             new_rc = resolve(self.rc.raw, discovered=snap)
         except Exception as e:
             log.warning("discovery re-resolve failed: %s", e)
             return
+        self._defer_unloadable_types(new_rc)
         self._churn_track(snap)
 
-        def fresh_of(new_list, cur_list, type_attr):
-            known = {(x.robot_id, x.interface) for x in cur_list}
-            return [x for x in new_list
-                    if (x.robot_id, x.interface) not in known and getattr(x, type_attr)]
+        active = binding_map(self.rc)
+        desired = binding_map(new_rc)
+        grace = int(self.rc.discovery.get("vanish_grace_polls", 2) or 2)
+        removals: list[tuple[Any, Any]] = []
 
-        fresh_t = fresh_of(new_rc.topics, self.rc.topics, "msg_type")
-        fresh_s = fresh_of(new_rc.services, self.rc.services, "srv_type")
-        fresh_a = fresh_of(new_rc.actions, self.rc.actions, "action_type")
-        if not (fresh_t or fresh_s or fresh_a):
+        for key, spec in active.items():
+            if key in desired:
+                self._plan_misses.pop(key, None)
+                continue
+            misses = self._plan_misses.get(key, 0) + 1
+            self._plan_misses[key] = misses
+            if misses < grace:
+                append_spec(new_rc, key, spec)
+                desired[key] = spec
+            else:
+                removals.append((key, spec))
+
+        # 같은 이름의 type/direction 변동은 기존 endpoint를 유지한 채 defer한다.
+        # endpoint가 완전히 사라진 뒤 재등장하면 일반 remove/add 세대로 처리된다.
+        for key in active.keys() & desired.keys():
+            if active[key] != desired[key]:
+                log.warning("binding change deferred until endpoint rejoin: %s", key)
+                set_spec(new_rc, key, active[key])
+                desired[key] = active[key]
+
+        additions = [(key, spec) for key, spec in desired.items() if key not in active]
+        if not additions and not removals:
             return
-        self.rc.topics.extend(fresh_t)
-        self.rc.services.extend(fresh_s)
-        self.rc.actions.extend(fresh_a)
-        self._absorb_provision(self.provisioner.provision_all())
-        # 엔티티 생성은 executor 스레드에서만 해야 한다
-        for kind, items in (("_bind_topic", fresh_t), ("_bind_service", fresh_s),
-                            ("_bind_action", fresh_a)):
-            for x in items:
-                ev = InboundEvent(kind=kind, robot_id=x.robot_id,
-                                  interface=x.interface, correlation_id=None,
-                                  event_id=f"bind:{x.interface}", payload=None, ct=None)
-                ev.spec = x
-                self.inbound.put_control(ev)
+
+        previous = self.provisioner.rc
+        self.provisioner.rc = new_rc
+        try:
+            result = self.provisioner.provision_all()
+        finally:
+            self.provisioner.rc = previous
+        if not result.ok:
+            log.warning("staged discovery provisioning failed: %s", result.errors)
+            return
+
+        pending = PendingBindingPlan(
+            new_rc,
+            result,
+            additions,
+            removals,
+            base_generation=self.lifecycle.snapshot.generation,
+        )
+        ev = InboundEvent(kind="_activate_plan", robot_id="-", interface="-",
+                          correlation_id=None, event_id=f"plan:{time.time_ns()}",
+                          payload=None, ct=None, spec=pending)
+        if not self.inbound.put_control(ev):
+            log.error("control lane full: staged binding plan was not activated")
+            return
         if self.guard is not None:
             self.guard.trigger()
-

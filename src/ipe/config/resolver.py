@@ -13,7 +13,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from ipe.core.common import deep_merge as _deep_merge
 from ipe.config.identity import (
     apply_captures,
     interface_segments,
@@ -47,6 +46,7 @@ from ipe.config.spec import (
     SourceTsSpec,
     TopicSpec,
 )
+from ipe.core.common import deep_merge as _deep_merge
 
 log = logging.getLogger("ipe.config.resolver")
 

@@ -12,6 +12,7 @@ import queue
 import signal
 import threading
 import time
+from contextlib import suppress
 from typing import Any
 
 from ipe.config.resolver import resolve
@@ -24,8 +25,11 @@ from ipe.onem2m.catchup import CatchUpSweeper
 from ipe.onem2m.client import idify, make_onem2m_client
 from ipe.onem2m.notification_server import NotificationServer
 from ipe.onem2m.resource_ops import ResourceOps
-from ipe.runtime.dispatcher import Route, RouteTable
+from ipe.runtime.app_dispatch import DispatchMixin
+from ipe.runtime.app_ops import OpsMixin
+from ipe.runtime.app_workers import WorkersMixin
 from ipe.runtime.discovery import GraphNotReady, await_graph_convergence
+from ipe.runtime.dispatcher import Route, RouteTable
 from ipe.runtime.lifecycle import IPEHealth, IPEPhase, IPEState, Lifecycle
 from ipe.runtime.provisioning import Provisioner
 from ipe.runtime.queues import (
@@ -38,11 +42,6 @@ from ipe.runtime.state import StatePersistence
 log = logging.getLogger(__name__)
 
 GOAL_STATUS_TO_REASON = {4: "succeeded", 5: "canceled", 6: "aborted"}
-
-
-from ipe.runtime.app_dispatch import DispatchMixin
-from ipe.runtime.app_ops import OpsMixin
-from ipe.runtime.app_workers import WorkersMixin
 
 
 class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
@@ -104,6 +103,7 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
         self._inflight: dict[tuple[str, str], set[str]] = {}          # (robot,iface) -> corr들
         self._avail: dict[tuple[str, str, str], dict[str, Any]] = {}  # churn 상태기계(§4.6)
         self._plan_misses: dict[tuple[str, str, str], int] = {}
+        self._resource_removal_pending: dict[tuple[str, str, str], Any] = {}
         # qos FCNT 게시 상태 (QoS_FCNT_설계서 §4.5.2)
         self._qos_fcnt_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._qos_fcnt_last_pub: dict[tuple[str, str, str], float] = {}
@@ -301,26 +301,18 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
         if server is not None:
             server.stop()
         if self.adapter is not None:
-            try:
+            with suppress(Exception):
                 self.adapter.shutdown()
-            except Exception:
-                pass
         if self.executor is not None:
-            try:
+            with suppress(Exception):
                 self.executor.shutdown()
-            except Exception:
-                pass
         if self.node is not None:
-            try:
+            with suppress(Exception):
                 self.node.destroy_node()
-            except Exception:
-                pass
-        try:
+        with suppress(Exception):
             import rclpy
             if rclpy.ok():
                 rclpy.shutdown()
-        except Exception:
-            pass
         self._stop_clients()
         self.state.close()
         return code
@@ -342,12 +334,17 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
                 c.stop()
 
     def _absorb_provision(self, result: Any) -> None:
-        self.path_map.clear()
-        self.path_map.update(result.path_map)
-        self.status_paths.clear()
-        self.status_paths.update(result.status_paths)
-        for f in getattr(result, "qos_fcnt_failed", []):
-            self._qos_lbl_only.add((f["robot"], f["interface"], f["direction"]))
+        # 새 generation의 경로 사전을 먼저 완성한 뒤 참조를 교체한다. Pipeline도
+        # 같은 사전을 보게 해 clear/update 중간 상태가 노출되지 않게 한다.
+        self.path_map = dict(result.path_map)
+        pipeline = getattr(self, "pipeline", None)
+        if pipeline is not None:
+            pipeline.path_map = self.path_map
+        self.status_paths = dict(result.status_paths)
+        self._qos_lbl_only = {
+            (f["robot"], f["interface"], f["direction"])
+            for f in getattr(result, "qos_fcnt_failed", [])
+        }
         routes: dict[str, Route] = {}
         aliases: dict[str, str] = {}
         catchup_inputs: dict[str, str] = {}
@@ -403,18 +400,14 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
     def _graceful_shutdown(self) -> int:
         log.info("shutting down (§13.9)")
         self.server.stop()
-        try:
+        with suppress(Exception):
             self.adapter.publish_safety_stops()
-        except Exception:
-            pass
         now = time.time()
         for ev in self.inbound.get_batch(10_000):
             corr = ev.correlation_id or ev.event_id or ""
             if ev.kind == "cancel":
-                try:
+                with suppress(Exception):
                     self._dispatch_one(ev, corr)
-                except Exception:
-                    pass
             elif ev.kind.startswith("_"):
                 continue
             else:
@@ -430,10 +423,8 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
             if not any(t["state"] in in_flight_states
                        for t in self.state.active_transactions()):
                 break
-            try:
+            with suppress(Exception):
                 self.executor.spin_once(timeout_sec=0.2)
-            except Exception:
-                pass
         now = time.time()
         for t in self.state.active_transactions():
             if t["state"] in in_flight_states:
