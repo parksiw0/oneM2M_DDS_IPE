@@ -12,11 +12,13 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
+from ipe.config.identity import sanitize_segment
 from ipe.config.spec import ResolvedConfig
 
 log = logging.getLogger(__name__)
 
-ROOT_CNTS = ("ros2Data", "ros2Command", "services", "actions", "status", "config")
+IPE_ROOT_CNTS = ("robots", "status", "config")
+ROBOT_CNTS = ("ros2Data", "ros2Command", "services", "actions")
 STATUS_CNTS = ("topicHealth", "nodeStatus", "qosStatus", "commandStatus",
                "serviceStatus", "actionStatus", "provisioningStatus", "ipeHealth")
 CONFIG_CNTS = ("mappingPolicy", "transferPolicy", "qosMappingPolicy",
@@ -52,6 +54,13 @@ class Provisioner:
 
     def _ae_root(self) -> str:
         return f"/{self.rc.cse.cse_base}/{self.rc.cse.ae_name}"
+
+    def _robot_root(self, ae: str, robot_id: str) -> str:
+        robot = sanitize_segment(robot_id, self.rc.naming.get("sanitize", "_"))
+        return f"{ae}/robots/{robot}"
+
+    def _branch_root(self, ae: str, robot_id: str, branch: str) -> str:
+        return f"{self._robot_root(ae, robot_id)}/{branch}"
 
     def ensure_ae_identity(self) -> str:
         """AE를 등록(또는 재사용)하고 aei를 영속화한다. aei는 절대 추측하지 않는다."""
@@ -102,8 +111,13 @@ class Provisioner:
         rc = self.rc
         ae = self._ae_root()
         try:
-            for name in ROOT_CNTS:
+            for name in IPE_ROOT_CNTS:
                 self.ops.ensure_cnt(ae, name)
+            for robot_id in rc.robots:
+                robot_root = self.ops.ensure_cnt(f"{ae}/robots", sanitize_segment(
+                    robot_id, rc.naming.get("sanitize", "_")))
+                for name in ROBOT_CNTS:
+                    self.ops.ensure_cnt(robot_root, name)
             for name in STATUS_CNTS:
                 res.status_paths[name] = self.ops.ensure_cnt(f"{ae}/status", name)
             for name in CONFIG_CNTS:
@@ -148,7 +162,7 @@ class Provisioner:
         return self.ops.ensure_cnt(parent, segs[-1], mni=mni)
 
     def _provision_observe(self, res: ProvisionResult, ae: str, t: Any) -> None:
-        base = f"{ae}/ros2Data"
+        base = self._branch_root(ae, t.robot_id, "ros2Data")
         rep = t.representation
         if rep in ("latest",):
             if t.flexcontainer and self._try_fcnt_leaf(res, base, t):
@@ -239,24 +253,23 @@ class Provisioner:
                                 "sub_ri": sub.ri}
 
     def _provision_command(self, res: ProvisionResult, ae: str, t: Any) -> None:
-        parent = self._ensure_chain(f"{ae}/ros2Command", t.rel_path)
-        req = self.ops.ensure_cnt(parent, "publishRequest")
-        self.ops.ensure_cnt(parent, "publishStatus")
-        res.path_map[(t.robot_id, t.interface, "publishStatus")] = f"{parent}/publishStatus"
-        self._input_sub(res, req, "command", t.robot_id, t.interface, t.rel_path)
+        # 명령 CIN은 topic CNT에 직접 생성된다. SUB도 같은 CNT를 감시한다.
+        parent = self._ensure_chain(
+            self._branch_root(ae, t.robot_id, "ros2Command"), t.rel_path)
+        self._input_sub(res, parent, "command", t.robot_id, t.interface, t.rel_path)
         self._provision_qos_fcnt(res, parent, t, "command")
 
     def _provision_service(self, res: ProvisionResult, ae: str, s: Any) -> None:
-        parent = self._ensure_chain(f"{ae}/services", s.rel_path)
+        parent = self._ensure_chain(
+            self._branch_root(ae, s.robot_id, "services"), s.rel_path)
         req = self.ops.ensure_cnt(parent, "request")
         self.ops.ensure_cnt(parent, "response")
-        self.ops.ensure_cnt(parent, "invocationStatus")
         res.path_map[(s.robot_id, s.interface, "response")] = f"{parent}/response"
-        res.path_map[(s.robot_id, s.interface, "invocationStatus")] = f"{parent}/invocationStatus"
         self._input_sub(res, req, "service", s.robot_id, s.interface, s.rel_path)
 
     def _provision_action(self, res: ProvisionResult, ae: str, a: Any) -> None:
-        parent = self._ensure_chain(f"{ae}/actions", a.rel_path)
+        parent = self._ensure_chain(
+            self._branch_root(ae, a.robot_id, "actions"), a.rel_path)
         goal = self.ops.ensure_cnt(parent, "goal")
         self.ops.ensure_cnt(parent, "feedback")
         self.ops.ensure_cnt(parent, "result")

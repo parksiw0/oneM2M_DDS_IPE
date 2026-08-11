@@ -21,7 +21,6 @@ from ipe.config.identity import (
     pattern_specificity,
     resolve_robot,
     robot_ae,
-    robot_root,
     sanitize_segment,
     unresolved_captures,
 )
@@ -304,21 +303,14 @@ def _rel_path(
 ) -> tuple[str, str]:
     sanitize = naming.get("sanitize", "_")
     style = naming.get("path_style", "nested")
-    root = robot_root(robot)
     if merged.get("path"):
         templ = _substituted(merged["path"], captures, interface, "path")
         segs = [sanitize_segment(s, sanitize) for s in templ.strip("/").split("/") if s]
-        # {robot} 캡처도 robot 자신의 세그먼트도 없는 path에는 robot 루트를
-        # 앞에 붙인다 (멀티 robot 충돌 가드)
-        if root and "{robot}" not in merged["path"] and root not in segs:
-            segs = [root, *segs]
     else:
         alias = merged.get("alias") or merged.get("alias_template")
         if alias:
             alias = _substituted(alias, captures, interface, "alias")
         segs = interface_segments(robot, interface, style, sanitize, alias)
-        if root:
-            segs = [root, *segs]
     leaf = segs[-1] if segs else sanitize_segment(robot.id)
     return "/".join(segs), leaf
 
@@ -694,7 +686,10 @@ def _check_collisions(
             views: tuple[str, ...] = ("",)) -> None:
         ae = robot_ae(by_id[robot_id], shared_ae)
         for view in views:
-            key = f"{ae}/{branch}/{rel}{view}"
+            # 공유 AE에서도 robot CNT가 최상위 격리 경계다. rel_path에는 더 이상
+            # robot 세그먼트를 중복 저장하지 않는다.
+            robot = sanitize_segment(robot_id)
+            key = f"{ae}/robots/{robot}/{branch}/{rel}{view}"
             if key in seen:
                 raise ResolveError(
                     f"oneM2M path collision: '{key}' claimed by both "
