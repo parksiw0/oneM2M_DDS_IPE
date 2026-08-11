@@ -10,6 +10,8 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
+from ipe.config.identity import sanitize_segment
+
 
 def discovery_runtime_config(args: Any, env: Mapping[str, str] | None = None) -> dict[str, Any]:
     values = os.environ if env is None else env
@@ -21,6 +23,9 @@ def discovery_runtime_config(args: Any, env: Mapping[str, str] | None = None) ->
     endpoint = arg_or_env("cse_endpoint", "IPE_CSE_ENDPOINT", "http://127.0.0.1:3000")
     cse_base = arg_or_env("cse_base", "IPE_CSE_BASE", "TinyIoT")
     ae_name = arg_or_env("ae_name", "IPE_AE_NAME", "ros2-ipe")
+    # AE CREATE의 초기 Originator는 AE마다 고유해야 한다. CAdmin을 사용하면
+    # tinyIoT가 새 AE의 aei를 CAdmin으로 파생해 기존 관리 AE와 충돌한다.
+    origin = values.get("IPE_CSE_ORIGIN") or f"C{sanitize_segment(ae_name)}"
     robot_id = arg_or_env("robot_id", "IPE_ROBOT_ID", "robot")
     robot_namespace = arg_or_env("robot_namespace", "IPE_ROBOT_NAMESPACE", "")
     refresh_sec = float(arg_or_env("refresh_sec", "IPE_REFRESH_SEC", 5.0))
@@ -32,7 +37,7 @@ def discovery_runtime_config(args: Any, env: Mapping[str, str] | None = None) ->
             "endpoint": endpoint,
             "cse_base": cse_base,
             "ae_name": ae_name,
-            "origin": values.get("IPE_CSE_ORIGIN", "CAdmin"),
+            "origin": origin,
             "rvi": values.get("IPE_RVI", "3"),
         },
         "robots": [{"id": robot_id, "namespace": robot_namespace}],

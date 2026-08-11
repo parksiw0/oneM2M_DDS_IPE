@@ -42,3 +42,24 @@ def test_invalid_ros_peer_is_rejected():
 
     with pytest.raises(ConfigError, match="must be an IP address"):
         _configure_ros_environment(args, _resolved())
+
+
+def test_configless_origin_is_unique_per_ae():
+    args = SimpleNamespace(
+        cse_endpoint=None,
+        cse_base=None,
+        ae_name="warehouse-ipe",
+        instance_id=None,
+        robot_id=None,
+        robot_namespace=None,
+        refresh_sec=None,
+        domain_id=None,
+    )
+
+    generated = resolve(validate_config(discovery_runtime_config(args, {})))
+    overridden = resolve(validate_config(discovery_runtime_config(
+        args, {"IPE_CSE_ORIGIN": "CExplicitIPE"},
+    )))
+
+    assert generated.cse.origin == "Cwarehouse-ipe"
+    assert overridden.cse.origin == "CExplicitIPE"
