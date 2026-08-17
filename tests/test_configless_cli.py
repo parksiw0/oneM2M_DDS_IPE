@@ -27,14 +27,29 @@ def _resolved():
 
 def test_ros_peer_and_domain_are_applied_before_rclpy_init(monkeypatch):
     monkeypatch.delenv("ROS_DOMAIN_ID", raising=False)
+    monkeypatch.delenv("RMW_IMPLEMENTATION", raising=False)
     monkeypatch.delenv("CYCLONEDDS_URI", raising=False)
     args = SimpleNamespace(domain_id=30, ros_peer="192.168.219.106")
 
     _configure_ros_environment(args, _resolved())
 
     assert os.environ["ROS_DOMAIN_ID"] == "30"
+    assert os.environ["RMW_IMPLEMENTATION"] == "rmw_cyclonedds_cpp"
     uri = os.environ["CYCLONEDDS_URI"]
     assert '<Peer address="192.168.219.106"/>' in uri
+
+
+def test_ros_peer_warns_and_is_not_applied_to_non_cyclone_rmw(monkeypatch, caplog):
+    monkeypatch.setenv("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
+    monkeypatch.delenv("CYCLONEDDS_URI", raising=False)
+    args = SimpleNamespace(domain_id=30, ros_peer="192.168.219.105")
+
+    with caplog.at_level("WARNING"):
+        _configure_ros_environment(args, _resolved())
+
+    assert "CYCLONEDDS_URI" not in os.environ
+    assert "was not applied" in caplog.text
+    assert "rmw_fastrtps_cpp" in caplog.text
 
 
 def test_invalid_ros_peer_is_rejected():

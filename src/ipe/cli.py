@@ -12,6 +12,10 @@ from ipe.config.resolver import ResolveError, resolve
 from ipe.config.runtime_config import discovery_runtime_config
 from ipe.config.spec import QoSSpec, ResolvedConfig
 
+log = logging.getLogger(__name__)
+
+CYCLONE_RMW = "rmw_cyclonedds_cpp"
+
 
 def setup_logging(level: str) -> None:
     logging.basicConfig(
@@ -134,7 +138,13 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _configure_ros_environment(args: argparse.Namespace, rc: ResolvedConfig) -> None:
-    """rclpy.init() 전에 DDS Domain과 선택적 Cyclone DDS peer를 적용한다."""
+    """rclpy.init() 전에 DDS Domain과 선택적 Cyclone DDS peer를 적용한다.
+
+    ``--ros-peer``는 Cyclone DDS 설정이다. RMW가 아직 선택되지 않았다면
+    Cyclone을 선택하고, 사용자가 다른 RMW를 명시했다면 설정이 적용되지
+    않는다는 경고를 남긴다. 이렇게 해야 Fast DDS 실행에서 peer IP가 실제로
+    사용된 것처럼 보이는 조용한 오설정을 피할 수 있다.
+    """
     domain_id = args.domain_id
     if domain_id is None:
         domain_id = int(rc.discovery.get("domain_id", os.environ.get("ROS_DOMAIN_ID", 0)))
@@ -147,6 +157,18 @@ def _configure_ros_environment(args: argparse.Namespace, rc: ResolvedConfig) -> 
         ipaddress.ip_address(peer)
     except ValueError as e:
         raise ConfigError(f"--ros-peer must be an IP address: {peer!r}") from e
+
+    rmw = os.environ.get("RMW_IMPLEMENTATION", "").strip()
+    if not rmw:
+        rmw = CYCLONE_RMW
+        os.environ["RMW_IMPLEMENTATION"] = rmw
+    if rmw != CYCLONE_RMW:
+        log.warning(
+            "--ros-peer %s was not applied: RMW_IMPLEMENTATION=%s; "
+            "use %s or configure discovery for the selected RMW",
+            peer, rmw, CYCLONE_RMW,
+        )
+        return
     os.environ["CYCLONEDDS_URI"] = (
         "<CycloneDDS><Domain><Discovery><Peers>"
         f'<Peer address="{peer}"/>'
