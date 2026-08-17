@@ -38,6 +38,7 @@ from ipe.runtime.queues import (
     OutboundQueue,
 )
 from ipe.runtime.state import StatePersistence
+from ipe.runtime.type_support import type_support_requirement
 
 log = logging.getLogger(__name__)
 
@@ -104,6 +105,7 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
         self._avail: dict[tuple[str, str, str], dict[str, Any]] = {}  # churn 상태기계(§4.6)
         self._plan_misses: dict[tuple[str, str, str], int] = {}
         self._resource_removal_pending: dict[tuple[str, str, str], Any] = {}
+        self._deferred_type_support: dict[tuple[str, str, str], dict[str, Any]] = {}
         # qos FCNT 게시 상태 (QoS_FCNT_설계서 §4.5.2)
         self._qos_fcnt_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._qos_fcnt_last_pub: dict[tuple[str, str, str], float] = {}
@@ -204,6 +206,7 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
 
         # S8.5: endpoint가 모두 준비된 뒤 route와 binding generation을 활성화한다.
         self._absorb_provision(result)
+        self._publish_deferred_type_support_status()
         self.lifecycle.set(IPEState.PREPARED, IPEPhase.BINDING_READY)
 
         self.node.create_timer(1.0, self._tick_1s)
@@ -263,19 +266,43 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
 
     def _defer_unloadable_types(self, rc: ResolvedConfig) -> None:
         """로컬 type support가 없는 항목은 실패시키지 않고 다음 세대로 defer."""
-        groups = ((rc.topics, "msg_type", "msg"),
-                  (rc.services, "srv_type", "srv"),
-                  (rc.actions, "action_type", "action"))
-        for items, attr, kind in groups:
+        groups = ((rc.topics, "msg_type", "msg", "topic"),
+                  (rc.services, "srv_type", "srv", "service"),
+                  (rc.actions, "action_type", "action", "action"))
+        deferred: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for items, attr, type_kind, binding_kind in groups:
             kept = []
             for spec in items:
                 type_name = getattr(spec, attr)
-                if type_name and self.adapter.type_available(kind, type_name):
+                if type_name and self.adapter.type_available(type_kind, type_name):
                     kept.append(spec)
                 else:
-                    log.warning("binding deferred (type support unavailable): %s [%s]",
-                                spec.interface, type_name or "ambiguous")
+                    key = (binding_kind, spec.robot_id, spec.interface)
+                    requirement = type_support_requirement(
+                        binding_kind, spec.robot_id, spec.interface, type_name)
+                    deferred[key] = requirement
+                    log.warning(
+                        "binding deferred (ROS 2 Type Support unavailable): "
+                        "%s [%s] install=%s",
+                        spec.interface,
+                        type_name or "ambiguous",
+                        requirement.get("installPackage", "resolve interface type"),
+                    )
             items[:] = kept
+        self._deferred_type_support = deferred
+
+        # 초기 부팅에서는 status 경로가 아직 staged 상태다. 활성화 이후 호출되는
+        # refresh부터는 누락 요구사항을 provisioningStatus에도 남긴다.
+        if getattr(self, "status_paths", None):
+            self._publish_deferred_type_support_status()
+
+    def _publish_deferred_type_support_status(self) -> None:
+        for requirement in self._deferred_type_support.values():
+            self.emit_event(
+                "provisioningStatus",
+                "warning",
+                {"event": "typeSupportUnavailable", **requirement},
+            )
 
     def _init_ros(self) -> None:
         import rclpy

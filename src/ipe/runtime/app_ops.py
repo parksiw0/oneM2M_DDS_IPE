@@ -263,6 +263,12 @@ class OpsMixin:
             "budget_dropped": self._budget_dropped,
             "pending_confirm": dict(self._confirm_pending),
             "availability": {f"{k[1]}:{k[2]}": v["state"] for k, v in self._avail.items()},
+            "deferred_type_support": sorted(
+                getattr(self, "_deferred_type_support", {}).values(),
+                key=lambda item: (
+                    item["kind"], item["robot"], item["interface"]
+                ),
+            ),
             **self._transport_status(),
         }
 
@@ -311,4 +317,3 @@ class OpsMixin:
                 self.svc_tx.set_state(t["corr_id"], "failed", now)
                 self.emit_event("serviceStatus", "warning",
                                 {"event": "orphanedAtRestart", "requestId": t["corr_id"]})
-
