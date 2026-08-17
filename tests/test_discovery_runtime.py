@@ -84,6 +84,27 @@ def test_endpoint_namespace_creates_a_robot_boundary_without_yaml():
     assert rc.topics[0].rel_path == "scan"
 
 
+def test_bare_dds_placeholder_namespace_uses_fallback_robot():
+    raw = validate_config(
+        discovery_runtime_config(_args(robot_id="px4_sitl"), {})
+    )
+    snap = {
+        "topics": [("/fmu/out/vehicle_status", ["px4_msgs/msg/VehicleStatus"])],
+        "services": [], "actions": [],
+        "topic_directions": {"/fmu/out/vehicle_status": "observe"},
+        "owners": {
+            "topics": {
+                "/fmu/out/vehicle_status": ["_CREATED_BY_BARE_DDS_APP_"],
+            },
+        },
+    }
+
+    rc = resolve(raw, discovered=snap)
+
+    assert set(rc.robots) == {"px4_sitl"}
+    assert rc.topics[0].robot_id == "px4_sitl"
+
+
 @pytest.mark.parametrize(
     ("robot_id", "prefixed_interface", "expected_leaf"),
     [

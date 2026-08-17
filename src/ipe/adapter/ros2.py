@@ -198,8 +198,11 @@ class GenericROS2Adapter:
 
         def usable_namespace(value: Any) -> bool:
             namespace = str(value or "")
-            return bool(namespace and namespace != "/"
-                        and namespace != "_NODE_NAMESPACE_UNKNOWN_")
+            # ROS graph API의 정상 node namespace는 항상 절대 이름('/...')이다.
+            # Fast DDS가 bare DDS participant에 사용하는
+            # ``_CREATED_BY_BARE_DDS_APP_`` 같은 placeholder를 Robot 경계로
+            # 오인하지 않는다.
+            return bool(namespace.startswith("/") and namespace != "/")
 
         try:
             remote_nodes = [

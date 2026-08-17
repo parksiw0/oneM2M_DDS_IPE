@@ -130,3 +130,46 @@ def test_snapshot_recovers_unknown_endpoint_namespace_from_unambiguous_graph(mon
     assert snapshot["owners"]["topics"] == {
         "/warehouse_bot_7/camera/status": ["/warehouse_bot_7"],
     }
+
+
+def test_snapshot_ignores_bare_dds_placeholder_namespace(monkeypatch):
+    class BareDDSNode(_GraphNode):
+        def get_topic_names_and_types(self):
+            return [("/fmu/out/vehicle_status", ["px4_msgs/msg/VehicleStatus"])]
+
+        def get_publishers_info_by_topic(self, _name):
+            return [SimpleNamespace(
+                node_name="_CREATED_BY_BARE_DDS_APP_",
+                node_namespace="_CREATED_BY_BARE_DDS_APP_",
+            )]
+
+        def get_subscriptions_info_by_topic(self, _name):
+            return []
+
+        def get_service_names_and_types(self):
+            return []
+
+        def get_service_names_and_types_by_node(self, _node_name, _node_ns):
+            return []
+
+        def get_node_names_and_namespaces(self):
+            return [
+                (self.get_name(), self.get_namespace()),
+                ("_CREATED_BY_BARE_DDS_APP_", "_CREATED_BY_BARE_DDS_APP_"),
+            ]
+
+    monkeypatch.setattr(rclpy.action, "get_action_names_and_types", lambda _node: [])
+    monkeypatch.setattr(
+        rclpy.action,
+        "get_action_server_names_and_types_by_node",
+        lambda _node, _node_name, _node_ns: [],
+    )
+    adapter = GenericROS2Adapter(
+        BareDDSNode(), lambda _ir: None, lambda *_args: None,
+    )
+
+    snapshot = adapter.snapshot()
+
+    assert snapshot["owners"]["topics"] == {
+        "/fmu/out/vehicle_status": [],
+    }

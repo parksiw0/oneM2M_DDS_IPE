@@ -282,7 +282,8 @@ def _robot_for(
     # 설정 비의존 discovery에서는 원격 endpoint node namespace가 robot 경계다.
     # root namespace('/')는 robot 식별 정보를 주지 않으므로 catch-all robot을 쓴다.
     namespaces = sorted({x.rstrip("/") for x in (owner_namespaces or [])
-                         if x and x != "/"}, key=len, reverse=True)
+                         if x and x.startswith("/") and x != "/"},
+                        key=len, reverse=True)
     if len(namespaces) == 1:
         namespace = namespaces[0]
         for robot in robots:
