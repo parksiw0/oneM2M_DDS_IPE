@@ -68,6 +68,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ipe_options.add_argument("--cse-endpoint", help="oneM2M HTTP binding endpoint")
     ipe_options.add_argument("--cse-base", help="CSEBase resource name")
+    ipe_options.add_argument(
+        "--cse-timezone",
+        help="CSE timestamp timezone (IANA name such as Asia/Seoul, or local)",
+    )
     ipe_options.add_argument("--ae-name", help="IPE AE resource name")
     ipe_options.add_argument("--instance-id", help="IPE instance identifier")
     ipe_options.add_argument("--robot-id", help="Fallback Robot ID for a root namespace")
@@ -109,7 +113,7 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     if args.log_level:
         ipe_args.extend(["--log-level", args.log_level])
     for name in (
-        "cse_endpoint", "cse_base", "ae_name", "instance_id", "robot_id",
+        "cse_endpoint", "cse_base", "cse_timezone", "ae_name", "instance_id", "robot_id",
         "robot_namespace", "domain_id", "ros_peer", "refresh_sec",
     ):
         value = getattr(args, name)

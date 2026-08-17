@@ -296,9 +296,12 @@ class DispatchMixin:
             return
         payload = dict(ev.payload or {})
         payload.pop("commandId", None)
-        outcome = self.cmd_mgr.dispatch(spec, payload, _ct_to_epoch(ev.ct),
-                                        getattr(ev, "ingest_monotonic", None)
-                                        or time.monotonic())
+        outcome = self.cmd_mgr.dispatch(
+            spec,
+            payload,
+            _ct_to_epoch(ev.ct, cse_timezone=self.rc.cse.timezone),
+            getattr(ev, "ingest_monotonic", None) or time.monotonic(),
+        )
         status_path = self.path_map.get((ev.robot_id, ev.interface, "publishStatus"))
         if status_path:
             self._put_terminal(Op("create_cin", status_path,

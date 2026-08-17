@@ -22,6 +22,7 @@ def discovery_runtime_config(args: Any, env: Mapping[str, str] | None = None) ->
 
     endpoint = arg_or_env("cse_endpoint", "IPE_CSE_ENDPOINT", "http://127.0.0.1:3000")
     cse_base = arg_or_env("cse_base", "IPE_CSE_BASE", "TinyIoT")
+    cse_timezone = arg_or_env("cse_timezone", "IPE_CSE_TIMEZONE", "local")
     ae_name = arg_or_env("ae_name", "IPE_AE_NAME", "ros2-ipe")
     # AE CREATE의 초기 Originator는 AE마다 고유해야 한다. CAdmin을 사용하면
     # tinyIoT가 새 AE의 aei를 CAdmin으로 파생해 기존 관리 AE와 충돌한다.
@@ -36,6 +37,7 @@ def discovery_runtime_config(args: Any, env: Mapping[str, str] | None = None) ->
         "cse": {
             "endpoint": endpoint,
             "cse_base": cse_base,
+            "timezone": cse_timezone,
             "ae_name": ae_name,
             "origin": origin,
             "rvi": values.get("IPE_RVI", "3"),

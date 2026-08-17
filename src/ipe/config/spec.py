@@ -212,6 +212,7 @@ class CSESpec:
     endpoint: str                        # http 바인딩 베이스 URL (mqtt면 빈 문자열)
     cse_base: str                        # CSE 리소스 이름(CSE_BASE_NAME) — to 경로 루트
     ae_name: str
+    timezone: str = "local"             # ct 해석 기준: IANA timezone 또는 local
     protocol: str = "http"
     cse_id: str = ""                     # MQTT 토픽 receiver(CSE_BASE_RI) — mqtt 필수
     origin: str = "CAdmin"

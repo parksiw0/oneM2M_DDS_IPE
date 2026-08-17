@@ -15,6 +15,7 @@ def _resolved():
     args = SimpleNamespace(
         cse_endpoint=None,
         cse_base=None,
+        cse_timezone=None,
         ae_name=None,
         instance_id=None,
         robot_id=None,
@@ -63,6 +64,7 @@ def test_configless_origin_is_unique_per_ae():
     args = SimpleNamespace(
         cse_endpoint=None,
         cse_base=None,
+        cse_timezone=None,
         ae_name="warehouse-ipe",
         instance_id=None,
         robot_id=None,
@@ -78,3 +80,28 @@ def test_configless_origin_is_unique_per_ae():
 
     assert generated.cse.origin == "Cwarehouse-ipe"
     assert overridden.cse.origin == "CExplicitIPE"
+
+
+def test_configless_cse_timezone_uses_cli_then_environment():
+    args = SimpleNamespace(
+        cse_endpoint=None,
+        cse_base=None,
+        cse_timezone="Asia/Seoul",
+        ae_name=None,
+        instance_id=None,
+        robot_id=None,
+        robot_namespace=None,
+        refresh_sec=None,
+        domain_id=None,
+    )
+
+    cli = resolve(validate_config(discovery_runtime_config(
+        args, {"IPE_CSE_TIMEZONE": "UTC"},
+    )))
+    args.cse_timezone = None
+    env = resolve(validate_config(discovery_runtime_config(
+        args, {"IPE_CSE_TIMEZONE": "UTC"},
+    )))
+
+    assert cli.cse.timezone == "Asia/Seoul"
+    assert env.cse.timezone == "UTC"

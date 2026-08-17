@@ -439,10 +439,18 @@ def _mqtt_spec(cse_c: dict[str, Any]) -> MqttSpec:
 def resolve(config: dict[str, Any], discovered: Discovered | None = None) -> ResolvedConfig:
     cse_c = config["cse"]
     protocol = cse_c.get("protocol", "http")
+    cse_timezone = cse_c.get("timezone", "local")
+    if cse_timezone != "local":
+        try:
+            from zoneinfo import ZoneInfo
+            ZoneInfo(cse_timezone)
+        except (KeyError, ValueError) as e:
+            raise ResolveError(f"invalid cse.timezone: {cse_timezone!r}") from e
     cse = CSESpec(
         endpoint=cse_c.get("endpoint", ""),
         cse_base=cse_c["cse_base"],
         ae_name=cse_c["ae_name"],
+        timezone=cse_timezone,
         protocol=protocol,
         cse_id=cse_c.get("cse_id", ""),
         origin=cse_c.get("origin", "CAdmin"),

@@ -10,33 +10,45 @@ from __future__ import annotations
 import math
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from ipe.core.common import get_path, set_path as _set_path
 from ipe.ir import TopicIR
 
 
-def ct_to_epoch(ct: str | None, now: float | None = None) -> float | None:
+def ct_to_epoch(
+    ct: str | None,
+    now: float | None = None,
+    cse_timezone: str = "local",
+) -> float | None:
     """CSE ct("yyyymmddThhmmss[,SSS]") → epoch. 해석 불가면 None —
     명령 신선도 게이트는 None을 expired로 본다(fail-safe).
 
-    함정: oneM2M 표준 ts는 UTC지만 tinyIoT는 로컬타임으로 찍는다(실측 KST).
-    UTC로만 읽으면 age가 -9h가 되어 만료 검출이 무력화된다. UTC/로컬 두 해석 중
-    '현재에 가장 가까운 과거'를 채택해 양쪽 CSE에서 안전하게 동작시킨다."""
+    oneM2M 표준 UTC 해석과 지정된 CSE 시간대 해석을 후보로 삼고, 현재에
+    가장 가까운 과거를 채택한다. ``local``은 프로세스의 로컬 시간대를 뜻한다.
+    명시적 IANA 시간대를 사용하면 IPE와 CSE가 서로 다른 컨테이너 시간대여도
+    tinyIoT의 로컬 ``ct``를 안전하게 비교할 수 있다.
+    """
     if not ct:
         return None
     import time as _time
-    from datetime import datetime, timezone
     base, _, millis = ct.partition(",")
-    frac = int(millis) / 1000.0 if millis.isdigit() else 0.0
+    frac = float(f"0.{millis}") if millis.isdigit() else 0.0
     try:
         naive = datetime.strptime(base, "%Y%m%dT%H%M%S")
     except ValueError:
         return None
     utc = naive.replace(tzinfo=timezone.utc).timestamp() + frac
-    local = naive.timestamp() + frac          # 시스템 로컬 tz 해석
+    if cse_timezone == "local":
+        cse_local = naive.timestamp() + frac
+    else:
+        try:
+            cse_local = naive.replace(tzinfo=ZoneInfo(cse_timezone)).timestamp() + frac
+        except (KeyError, ValueError):
+            return None
     ref = _time.time() if now is None else now
     # 미래(±2s 허용 초과) 해석은 배제하고, 과거 해석 중 현재에 가까운 쪽
-    past = [e for e in (utc, local) if ref - e >= -2.0]
+    past = [e for e in {utc, cse_local} if ref - e >= -2.0]
     if not past:
         return None                           # 양쪽 다 미래 — 신선도 증명 불가
     return max(past)

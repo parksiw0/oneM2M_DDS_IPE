@@ -32,6 +32,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--cse-endpoint", help="oneM2M HTTP binding endpoint")
     p.add_argument("--cse-base", help="CSEBase resource name")
+    p.add_argument(
+        "--cse-timezone",
+        help="CSE timestamp timezone (IANA name such as Asia/Seoul, or local)",
+    )
     p.add_argument("--ae-name", help="IPE AE resource name")
     p.add_argument("--instance-id", help="IPE instance identifier")
     p.add_argument("--robot-id", help="Robot CNT name for an un-namespaced ROS graph")

@@ -200,6 +200,8 @@ CONFIG_SCHEMA: dict[str, Any] = {
             # endpoint는 http에서만 필수 — 교차검증은 loader._check_cse_protocol.
             "endpoint": {"type": "string", "required": False, "regex": r"^https?://.+"},
             "cse_base": {"type": "string", "required": True, "empty": False},
+            # oneM2M 표준 UTC 또는 tinyIoT가 사용하는 CSE 로컬 ct 해석 기준.
+            "timezone": {"type": "string", "empty": False, "default": "local"},
             "ae_name": {"type": "string", "required": True, "empty": False},
             "protocol": {"type": "string", "allowed": ["http", "mqtt"], "default": "http"},
             # MQTT 토픽 receiver 세그먼트(CSE-ID / CSE_BASE_RI). cse_base(CSE 리소스

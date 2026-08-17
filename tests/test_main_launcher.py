@@ -60,10 +60,13 @@ def test_help_lists_launcher_and_ipe_options():
 
 def test_registered_ipe_options_are_forwarded():
     _, ipe_args = launcher.parse_args(
-        ["turtlebot3", "--log-level", "DEBUG", "--explain", "--reset"]
+        ["turtlebot3", "--log-level", "DEBUG", "--cse-timezone", "Asia/Seoul",
+         "--explain", "--reset"]
     )
 
-    assert ipe_args == ["--log-level", "DEBUG", "--explain", "--reset"]
+    assert ipe_args == [
+        "--log-level", "DEBUG", "--cse-timezone", "Asia/Seoul", "--explain", "--reset",
+    ]
 
 
 def test_configless_discovery_options_do_not_become_a_profile_name():
