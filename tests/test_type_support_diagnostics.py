@@ -56,6 +56,7 @@ def test_unavailable_binding_is_deferred_and_exposed_as_status(monkeypatch):
         _publish_deferred_type_support_status = (
             IPEApp._publish_deferred_type_support_status
         )
+        _publish_type_support_transition = IPEApp._publish_type_support_transition
 
     harness = Harness()
     rc = SimpleNamespace(topics=[topic], services=[], actions=[])
@@ -74,3 +75,92 @@ def test_unavailable_binding_is_deferred_and_exposed_as_status(monkeypatch):
             {"event": "typeSupportUnavailable", **requirement},
         )
     ]
+
+
+def test_repeated_missing_type_support_warns_only_once(monkeypatch):
+    monkeypatch.setenv("ROS_DISTRO", "humble")
+    events = []
+    warnings = []
+    monkeypatch.setattr(
+        "ipe.runtime.app.log.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    class Harness:
+        adapter = SimpleNamespace(type_available=lambda *_args: False)
+        status_paths = {"provisioningStatus": "/status/provisioning"}
+        _deferred_type_support = {}
+
+        def emit_event(self, category, severity, payload):
+            events.append((category, severity, payload))
+
+        _publish_deferred_type_support_status = (
+            IPEApp._publish_deferred_type_support_status
+        )
+        _publish_type_support_transition = IPEApp._publish_type_support_transition
+
+    def config():
+        return SimpleNamespace(
+            topics=[SimpleNamespace(
+                robot_id="robot-a",
+                interface="/custom_data",
+                msg_type="custom_robot_msgs/msg/State",
+            )],
+            services=[],
+            actions=[],
+        )
+
+    harness = Harness()
+    IPEApp._defer_unloadable_types(harness, config())
+    IPEApp._defer_unloadable_types(harness, config())
+
+    assert len(warnings) == 1
+    assert len(events) == 1
+
+
+def test_available_type_support_emits_one_recovery_transition(monkeypatch):
+    monkeypatch.setenv("ROS_DISTRO", "humble")
+    available = False
+    events = []
+
+    class Adapter:
+        def type_available(self, *_args):
+            return available
+
+    class Harness:
+        adapter = Adapter()
+        status_paths = {"provisioningStatus": "/status/provisioning"}
+        _deferred_type_support = {}
+
+        def emit_event(self, category, severity, payload):
+            events.append((category, severity, payload))
+
+        _publish_deferred_type_support_status = (
+            IPEApp._publish_deferred_type_support_status
+        )
+        _publish_type_support_transition = IPEApp._publish_type_support_transition
+
+    def config():
+        return SimpleNamespace(
+            topics=[SimpleNamespace(
+                robot_id="robot-a",
+                interface="/custom_data",
+                msg_type="custom_robot_msgs/msg/State",
+            )],
+            services=[],
+            actions=[],
+        )
+
+    harness = Harness()
+    IPEApp._defer_unloadable_types(harness, config())
+    available = True
+    recovered = config()
+    IPEApp._defer_unloadable_types(harness, recovered)
+    IPEApp._defer_unloadable_types(harness, config())
+
+    assert len(recovered.topics) == 1
+    assert [event[2]["event"] for event in events] == [
+        "typeSupportUnavailable",
+        "typeSupportAvailable",
+    ]
+    assert harness._deferred_type_support == {}

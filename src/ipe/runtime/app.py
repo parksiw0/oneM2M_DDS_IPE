@@ -269,40 +269,88 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
         groups = ((rc.topics, "msg_type", "msg", "topic"),
                   (rc.services, "srv_type", "srv", "service"),
                   (rc.actions, "action_type", "action", "action"))
+        previous = getattr(self, "_deferred_type_support", {})
         deferred: dict[tuple[str, str, str], dict[str, Any]] = {}
+        available: set[tuple[str, str, str]] = set()
+        seen: set[tuple[str, str, str]] = set()
         for items, attr, type_kind, binding_kind in groups:
             kept = []
             for spec in items:
+                key = (binding_kind, spec.robot_id, spec.interface)
+                seen.add(key)
                 type_name = getattr(spec, attr)
                 if type_name and self.adapter.type_available(type_kind, type_name):
                     kept.append(spec)
+                    available.add(key)
                 else:
-                    key = (binding_kind, spec.robot_id, spec.interface)
                     requirement = type_support_requirement(
                         binding_kind, spec.robot_id, spec.interface, type_name)
                     deferred[key] = requirement
-                    log.warning(
-                        "binding deferred (ROS 2 Type Support unavailable): "
-                        "%s [%s] install=%s",
-                        spec.interface,
-                        type_name or "ambiguous",
-                        requirement.get("installPackage", "resolve interface type"),
-                    )
             items[:] = kept
+
+        newly_deferred = {
+            key for key, requirement in deferred.items()
+            if previous.get(key) != requirement
+        }
+        recovered = previous.keys() & available
+        disappeared = previous.keys() - deferred.keys() - available
+        for key in newly_deferred:
+            requirement = deferred[key]
+            log.warning(
+                "binding deferred (ROS 2 Type Support unavailable): "
+                "%s [%s] install=%s",
+                requirement["interface"],
+                requirement.get("rosType") or "ambiguous",
+                requirement.get("installPackage", "resolve interface type"),
+            )
+        for key in recovered:
+            requirement = previous[key]
+            log.info(
+                "binding resumed (ROS 2 Type Support available): %s [%s]",
+                requirement["interface"], requirement.get("rosType") or "resolved",
+            )
         self._deferred_type_support = deferred
 
         # 초기 부팅에서는 status 경로가 아직 staged 상태다. 활성화 이후 호출되는
-        # refresh부터는 누락 요구사항을 provisioningStatus에도 남긴다.
+        # refresh부터는 상태 전이가 있을 때만 provisioningStatus에 남긴다.
         if getattr(self, "status_paths", None):
-            self._publish_deferred_type_support_status()
+            self._publish_deferred_type_support_status(
+                [deferred[key] for key in newly_deferred]
+            )
+            for key in recovered:
+                self._publish_type_support_transition(
+                    "typeSupportAvailable", previous[key]
+                )
+            for key in disappeared:
+                if key not in seen:
+                    self._publish_type_support_transition(
+                        "typeSupportNoLongerRequired", previous[key]
+                    )
 
-    def _publish_deferred_type_support_status(self) -> None:
-        for requirement in self._deferred_type_support.values():
+    def _publish_deferred_type_support_status(
+        self,
+        requirements: Any = None,
+    ) -> None:
+        selected = (
+            self._deferred_type_support.values()
+            if requirements is None else requirements
+        )
+        for requirement in selected:
             self.emit_event(
                 "provisioningStatus",
                 "warning",
                 {"event": "typeSupportUnavailable", **requirement},
             )
+
+    def _publish_type_support_transition(
+        self,
+        event: str,
+        requirement: dict[str, Any],
+    ) -> None:
+        payload = {key: value for key, value in requirement.items() if key != "reason"}
+        self.emit_event(
+            "provisioningStatus", "info", {"event": event, **payload}
+        )
 
     def _init_ros(self) -> None:
         import rclpy
