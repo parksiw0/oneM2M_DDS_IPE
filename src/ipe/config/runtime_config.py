@@ -1,47 +1,97 @@
-"""설정 파일 없이 실행할 때 사용하는 범용 런타임 설정.
-
-ROS 2 인터페이스 목록은 의도적으로 포함하지 않는다. topic/service/action은
-DDS Domain 참여 뒤 얻은 ROS graph snapshot만으로 해석한다.
-"""
+"""Build runtime defaults for discovery-driven operation."""
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Mapping
 from typing import Any
 
 from ipe.config.identity import sanitize_segment
+from ipe.config.loader import ConfigError
+
+
+def _as_float(key: str, value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{key} must be a number, got {value!r}") from exc
+    if not math.isfinite(parsed):
+        raise ConfigError(f"{key} must be finite, got {value!r}")
+    return parsed
+
+
+def _as_int(key: str, value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{key} must be an integer, got {value!r}") from exc
 
 
 def discovery_runtime_config(args: Any, env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Return runtime settings without declaring any ROS interfaces.
+
+    The live graph supplies interfaces and QoS. Control interfaces stay disabled
+    unless the operator explicitly enables them.
+    """
     values = os.environ if env is None else env
 
     def arg_or_env(name: str, key: str, default: Any) -> Any:
         value = getattr(args, name, None)
         return value if value not in (None, "") else values.get(key, default)
 
-    endpoint = arg_or_env("cse_endpoint", "IPE_CSE_ENDPOINT", "http://127.0.0.1:3000")
+    def env_bool(key: str, default: bool = False) -> bool:
+        value = values.get(key)
+        if value is None:
+            return default
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    protocol = values.get("IPE_CSE_PROTOCOL", "http").strip().lower()
     cse_base = arg_or_env("cse_base", "IPE_CSE_BASE", "TinyIoT")
     cse_timezone = arg_or_env("cse_timezone", "IPE_CSE_TIMEZONE", "local")
     ae_name = arg_or_env("ae_name", "IPE_AE_NAME", "ros2-ipe")
-    # AE CREATE의 초기 Originator는 AE마다 고유해야 한다. CAdmin을 사용하면
-    # tinyIoT가 새 AE의 aei를 CAdmin으로 파생해 기존 관리 AE와 충돌한다.
     origin = values.get("IPE_CSE_ORIGIN") or f"C{sanitize_segment(ae_name)}"
     robot_id = arg_or_env("robot_id", "IPE_ROBOT_ID", "robot")
     robot_namespace = arg_or_env("robot_namespace", "IPE_ROBOT_NAMESPACE", "")
-    refresh_sec = float(arg_or_env("refresh_sec", "IPE_REFRESH_SEC", 5.0))
-    domain_id = int(arg_or_env("domain_id", "ROS_DOMAIN_ID", 0))
+    refresh_sec = _as_float(
+        "IPE_REFRESH_SEC", arg_or_env("refresh_sec", "IPE_REFRESH_SEC", 5.0)
+    )
+    domain_id = _as_int("ROS_DOMAIN_ID", arg_or_env("domain_id", "ROS_DOMAIN_ID", 0))
+    allow_control = bool(getattr(args, "allow_control", False)) or env_bool(
+        "IPE_ALLOW_CONTROL"
+    )
+
+    cse = {
+        "cse_base": cse_base,
+        "timezone": cse_timezone,
+        "ae_name": ae_name,
+        "origin": origin,
+        "rvi": values.get("IPE_RVI", "3"),
+        "protocol": protocol,
+    }
+    if protocol == "http":
+        cse["endpoint"] = arg_or_env(
+            "cse_endpoint", "IPE_CSE_ENDPOINT", "http://127.0.0.1:3000"
+        )
+    elif protocol == "mqtt":
+        cse["cse_id"] = values.get("IPE_CSE_ID", "")
+        cse["mqtt"] = {
+            "host": values.get("IPE_MQTT_HOST", "127.0.0.1"),
+            "port": _as_int("IPE_MQTT_PORT", values.get("IPE_MQTT_PORT", "1883")),
+            "client_id": values.get("IPE_MQTT_CLIENT_ID", str(ae_name)),
+            "qos": _as_int("IPE_MQTT_QOS", values.get("IPE_MQTT_QOS", "1")),
+            "username": values.get("IPE_MQTT_USERNAME"),
+            "password": values.get("IPE_MQTT_PASSWORD"),
+            "tls": env_bool("IPE_MQTT_TLS"),
+            "tls_ca": values.get("IPE_MQTT_TLS_CA"),
+            "tls_cert": values.get("IPE_MQTT_TLS_CERT"),
+            "tls_key": values.get("IPE_MQTT_TLS_KEY"),
+            "tls_insecure": env_bool("IPE_MQTT_TLS_INSECURE"),
+        }
 
     return {
         "ipe": {"instance_id": arg_or_env("instance_id", "IPE_INSTANCE_ID", "ros2-ipe")},
-        "cse": {
-            "endpoint": endpoint,
-            "cse_base": cse_base,
-            "timezone": cse_timezone,
-            "ae_name": ae_name,
-            "origin": origin,
-            "rvi": values.get("IPE_RVI", "3"),
-        },
+        "cse": cse,
         "robots": [{"id": robot_id, "namespace": robot_namespace}],
         "discovery": {
             "mode": "auto-expose",
@@ -49,12 +99,16 @@ def discovery_runtime_config(args: Any, env: Mapping[str, str] | None = None) ->
             "allow": ["/**"],
             "deny": [],
             "refresh_sec": refresh_sec,
-            "graph_settle_timeout_sec": float(values.get("IPE_GRAPH_TIMEOUT_SEC", "10")),
-            "graph_stable_polls": int(values.get("IPE_GRAPH_STABLE_POLLS", "2")),
-            "graph_poll_sec": float(values.get("IPE_GRAPH_POLL_SEC", "0.5")),
+            "graph_settle_timeout_sec": _as_float(
+                "IPE_GRAPH_TIMEOUT_SEC", values.get("IPE_GRAPH_TIMEOUT_SEC", "10")
+            ),
+            "graph_stable_polls": _as_int(
+                "IPE_GRAPH_STABLE_POLLS", values.get("IPE_GRAPH_STABLE_POLLS", "2")
+            ),
+            "graph_poll_sec": _as_float(
+                "IPE_GRAPH_POLL_SEC", values.get("IPE_GRAPH_POLL_SEC", "0.5")
+            ),
         },
-        # 인터페이스별 QoS 핀은 없다. 이 값은 endpoint 정보가 아직 없는 경우의
-        # fail-safe이며 실제 바인딩 때 offered/requested QoS와 reconcile된다.
         "qos_profiles": {
             "sensor_data": {
                 "reliability": "BEST_EFFORT",
@@ -65,11 +119,10 @@ def discovery_runtime_config(args: Any, env: Mapping[str, str] | None = None) ->
         },
         "defaults": {
             "topic_observe": {"representation": "latest"},
-            "service": {"access": {"enabled": True}},
-            "action": {"access": {"enabled": True}},
+            "topic_command": {"access": {"enabled": allow_control}},
+            "service": {"access": {"enabled": allow_control}},
+            "action": {"access": {"enabled": allow_control}},
         },
-        # interface마다 독립 subtree를 보장해 제거 reconcile이 인접 interface를
-        # 함께 지우지 않도록 한다(/foo와 /foo/bar prefix 충돌 방지).
         "naming": {"path_style": "flat", "sanitize": "_"},
         "bridge": {"topics": [], "services": [], "actions": []},
         "storage": {"state_db": values.get("IPE_STATE_DB", "ipe_state.db")},

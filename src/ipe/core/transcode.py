@@ -299,10 +299,13 @@ def _write_float(value: Any, typename: str, path: str) -> float:
 
 def _write_int(value: Any, typename: str, path: str, i64s: bool) -> int:
     if isinstance(value, bool):
-        raise TranscodeError(path, f"expected int, got bool")
+        raise TranscodeError(path, "expected int, got bool")
     if isinstance(value, str):
         if not (i64s and typename in _INT64_TYPENAMES):
-            raise TranscodeError(path, f"expected int, got str (int64_as_string only applies to int64/uint64)")
+            raise TranscodeError(
+                path,
+                "expected int, got str (int64_as_string only applies to int64/uint64)",
+            )
         try:
             v = int(value, 10)
         except ValueError as exc:

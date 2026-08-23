@@ -5,9 +5,8 @@ import ipaddress
 import logging
 import os
 import sys
-from pathlib import Path
 
-from ipe.config.loader import ConfigError, load_config, validate_config
+from ipe.config.loader import ConfigError, validate_config
 from ipe.config.resolver import ResolveError, resolve
 from ipe.config.runtime_config import discovery_runtime_config
 from ipe.config.spec import QoSSpec, ResolvedConfig
@@ -26,10 +25,6 @@ def setup_logging(level: str) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="ipe", description="Generic ROS2 <-> oneM2M IPE")
-    p.add_argument(
-        "--config", "-c", type=Path,
-        help="Optional deployment YAML. Without it, interfaces come from the ROS 2 graph.",
-    )
     p.add_argument("--cse-endpoint", help="oneM2M HTTP binding endpoint")
     p.add_argument("--cse-base", help="CSEBase resource name")
     p.add_argument(
@@ -43,9 +38,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--domain-id", type=int, help="ROS_DOMAIN_ID")
     p.add_argument("--ros-peer", help="Cyclone DDS unicast discovery peer IP")
     p.add_argument("--refresh-sec", type=float, help="ROS graph reconcile interval")
+    p.add_argument(
+        "--allow-control",
+        action="store_true",
+        help="Enable discovered command topics, services, and actions",
+    )
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     p.add_argument("--explain", action="store_true",
-                   help="Resolve config (no ROS2/CSE) and print the bridge plan per interface")
+                   help="Discover the live ROS graph and print the bridge plan")
     p.add_argument("--dry-run", action="store_true", help="Alias of --explain")
     p.add_argument("--discover", action="store_true", help="Print discovered ROS2 graph and exit")
     p.add_argument("--bootstrap-only", action="store_true", help="Create CSE resources and exit")
@@ -65,8 +65,11 @@ def _qos_str(q: QoSSpec) -> str:
 
 
 def explain(rc: ResolvedConfig, log: logging.Logger) -> None:
+    target = rc.cse.endpoint
+    if rc.cse.protocol == "mqtt" and rc.cse.mqtt is not None:
+        target = f"mqtt://{rc.cse.mqtt.host}:{rc.cse.mqtt.port}"
     log.info("=== Bridge plan: %s -> AE %s @ %s (RVI %s) ===",
-             rc.instance_id, rc.cse.ae_name, rc.cse.endpoint, rc.cse.rvi)
+             rc.instance_id, rc.cse.ae_name, target, rc.cse.rvi)
     log.info("robots: %s", ", ".join(f"{r.id}(ns='{r.namespace}')" for r in rc.robots.values()))
     log.info("discovery: mode=%s", rc.discovery.get("mode"))
 
@@ -103,14 +106,11 @@ def main(argv: list[str] | None = None) -> int:
     log = logging.getLogger("ipe")
 
     try:
-        config = (load_config(args.config) if args.config is not None
-                  else validate_config(discovery_runtime_config(args)))
+        config = validate_config(discovery_runtime_config(args))
     except ConfigError as e:
-        log.error("Configuration error: %s", e)
+        log.error("Runtime settings error: %s", e)
         return 1
 
-    # 설정 시점 해석: 명시적 이름은 지금, 패턴은 디스커버리 때 확장된다.
-    # ROS2 없이 --explain을 돌리기엔 이것으로 충분하다.
     try:
         rc = resolve(config, discovered=None)
     except ResolveError as e:
@@ -120,35 +120,23 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _configure_ros_environment(args, rc)
     except ConfigError as e:
-        log.error("Configuration error: %s", e)
+        log.error("Runtime settings error: %s", e)
         return 1
-    args.configless = args.config is None
-
     if args.explain or args.dry_run:
-        if args.configless:
-            return _discover(log, rc, explain_plan=True)
-        explain(rc, log)
-        return 0
+        return _discover(log, rc, explain_plan=True)
 
     if args.discover:
         return _discover(log, rc)
 
     if args.reset:
-        _reset_ae(rc, log)   # 삭제 후 정상 부트스트랩으로 계속
+        _reset_ae(rc, log)
 
-    # 런타임 import 실패는 조용한 no-op 대신 시끄럽게 실패시킨다.
     from ipe.runtime.app import run
     return run(rc, args)
 
 
 def _configure_ros_environment(args: argparse.Namespace, rc: ResolvedConfig) -> None:
-    """rclpy.init() 전에 DDS Domain과 선택적 Cyclone DDS peer를 적용한다.
-
-    ``--ros-peer``는 Cyclone DDS 설정이다. RMW가 아직 선택되지 않았다면
-    Cyclone을 선택하고, 사용자가 다른 RMW를 명시했다면 설정이 적용되지
-    않는다는 경고를 남긴다. 이렇게 해야 Fast DDS 실행에서 peer IP가 실제로
-    사용된 것처럼 보이는 조용한 오설정을 피할 수 있다.
-    """
+    """Apply the DDS domain and optional Cyclone peer before rclpy starts."""
     domain_id = args.domain_id
     if domain_id is None:
         domain_id = int(rc.discovery.get("domain_id", os.environ.get("ROS_DOMAIN_ID", 0)))
@@ -181,7 +169,7 @@ def _configure_ros_environment(args: argparse.Namespace, rc: ResolvedConfig) -> 
 
 
 def _discover(log: logging.Logger, rc: ResolvedConfig, *, explain_plan: bool = False) -> int:
-    """수렴한 graph 또는 graph에서 계산한 DesiredBindingPlan을 출력한다."""
+    """Wait for graph convergence and print the graph or its binding plan."""
     import rclpy
     from rclpy.node import Node
 
@@ -227,7 +215,7 @@ def _reset_ae(rc, log: logging.Logger) -> None:
     from ipe.onem2m.client import TransportError, make_onem2m_client
 
     client = make_onem2m_client(rc, rc.cse.origin)
-    client.start()   # MQTT는 브로커 연결 (HTTP는 no-op)
+    client.start()
     try:
         path = f"/{rc.cse.cse_base}/{rc.cse.ae_name}"
         r = client.delete(path)

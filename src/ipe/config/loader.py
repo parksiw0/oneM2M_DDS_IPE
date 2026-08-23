@@ -1,12 +1,4 @@
-"""v2 IPE 설정 로드 + 검증.
-
-`load_config`는 검증·케이스 정규화·env 치환이 끝난 설정 dict를 돌려준다.
-런타임 스펙 변환은 resolver 몫 — 로드 후 `resolve(config, discovered)`를 부른다.
-
-검증 파이프라인은 순서가 중요하다: env 치환(B2) →
-QoS enum 케이스 정규화 → Cerberus 구조 검증+기본값(B7) → 의미론적 교차
-검사(DESIGN §18.4) → 타입 로드 프로브(§3.2, rosidl import 가능할 때만).
-"""
+"""Validate and normalize settings generated for the discovery runtime."""
 
 from __future__ import annotations
 
@@ -15,10 +7,8 @@ import logging
 import os
 import re
 from collections.abc import Iterator, Mapping
-from pathlib import Path
 from typing import Any
 
-import yaml
 from cerberus import Validator
 
 from ipe.config.identity import compile_pattern
@@ -37,17 +27,6 @@ log = logging.getLogger("ipe.config.loader")
 
 class ConfigError(Exception):
     pass
-
-
-def load_config(path: str | Path, env: Mapping[str, str] | None = None) -> dict[str, Any]:
-    path = Path(path)
-    if not path.exists():
-        raise ConfigError(f"Config file not found: {path}")
-    with path.open("r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f)
-    if not isinstance(raw, dict):
-        raise ConfigError(f"Config root must be a mapping, got {type(raw).__name__}")
-    return validate_config(raw, env=env)
 
 
 def validate_config(raw: dict[str, Any], env: Mapping[str, str] | None = None) -> dict[str, Any]:

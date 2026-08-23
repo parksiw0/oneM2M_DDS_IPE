@@ -1,21 +1,49 @@
 #!/usr/bin/env python3
-"""IPE 종합 실행기.
-
-호스트에 ROS 2 Humble이 없어도 저장소의 Docker 이미지를 통해 IPE를 실행한다.
-공식 ROS 이미지의 entrypoint가 ROS 환경을 설정하므로 별도 shell/source가 필요 없다.
-"""
+"""Launch the discovery-driven IPE natively or in its ROS 2 Docker image."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-PROFILE_DIR = ROOT / "config" / "profiles"
 DEFAULT_IMAGE = "ipe:humble"
+IMAGE_SOURCE_LABEL = "ipe.dockerfile.sha256"
+PASSTHROUGH_ENV = (
+    "IPE_CSE_ENDPOINT",
+    "IPE_CSE_BASE",
+    "IPE_CSE_TIMEZONE",
+    "IPE_CSE_ORIGIN",
+    "IPE_CSE_PROTOCOL",
+    "IPE_CSE_ID",
+    "IPE_AE_NAME",
+    "IPE_INSTANCE_ID",
+    "IPE_ROBOT_ID",
+    "IPE_ROBOT_NAMESPACE",
+    "IPE_REFRESH_SEC",
+    "IPE_ALLOW_CONTROL",
+    "IPE_STATE_DB",
+    "IPE_RVI",
+    "IPE_GRAPH_TIMEOUT_SEC",
+    "IPE_GRAPH_STABLE_POLLS",
+    "IPE_GRAPH_POLL_SEC",
+    "IPE_ROS_PEER",
+    "IPE_MQTT_HOST",
+    "IPE_MQTT_PORT",
+    "IPE_MQTT_CLIENT_ID",
+    "IPE_MQTT_QOS",
+    "IPE_MQTT_USERNAME",
+    "IPE_MQTT_PASSWORD",
+    "IPE_MQTT_TLS",
+    "IPE_MQTT_TLS_CA",
+    "IPE_MQTT_TLS_CERT",
+    "IPE_MQTT_TLS_KEY",
+    "IPE_MQTT_TLS_INSECURE",
+)
 
 
 def host_timezone() -> str:
@@ -33,31 +61,19 @@ def host_timezone() -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the discovery-driven ROS2-oneM2M IPE",
-        epilog=(
-            "Examples: main.py --ros-peer 192.168.219.106 | "
-            "main.py turtlebot3.yaml | "
-            "main.py turtlebot3_report_motion | "
-            "main.py config/profiles/turtlebot3.yaml --explain"
-        ),
-    )
-    parser.add_argument(
-        "config",
-        nargs="?",
-        help=(
-            "optional legacy/profile YAML. When omitted, the live ROS 2 graph is authoritative"
-        ),
+        epilog="Examples: main.py | main.py --explain | main.py --ros-peer 192.168.219.106",
     )
 
     launcher_options = parser.add_argument_group("launcher options")
     launcher_options.add_argument(
+        "--docker",
+        action="store_true",
+        help="Run in the ROS 2 Humble Docker image",
+    )
+    launcher_options.add_argument(
         "--image",
         default=DEFAULT_IMAGE,
         help=f"Docker image name (default: {DEFAULT_IMAGE})",
-    )
-    launcher_options.add_argument(
-        "--native",
-        action="store_true",
-        help="Run in the current ROS environment instead of Docker",
     )
 
     ipe_options = parser.add_argument_group("IPE options")
@@ -79,6 +95,11 @@ def build_parser() -> argparse.ArgumentParser:
     ipe_options.add_argument("--domain-id", type=int, help="ROS_DOMAIN_ID")
     ipe_options.add_argument("--ros-peer", help="Cyclone DDS unicast discovery peer IP")
     ipe_options.add_argument("--refresh-sec", type=float, help="ROS Graph reconcile interval")
+    ipe_options.add_argument(
+        "--allow-control",
+        action="store_true",
+        help="Enable discovered command topics, services, and actions",
+    )
     ipe_options.add_argument(
         "--explain",
         action="store_true",
@@ -119,48 +140,17 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
         value = getattr(args, name)
         if value is not None:
             ipe_args.extend([f"--{name.replace('_', '-')}", str(value)])
-    for name in ("explain", "dry_run", "discover", "bootstrap_only", "reset"):
+    for name in (
+        "allow_control", "explain", "dry_run", "discover", "bootstrap_only", "reset",
+    ):
         if getattr(args, name):
             ipe_args.append(f"--{name.replace('_', '-')}")
     ipe_args.extend(passthrough)
     return args, ipe_args
 
 
-def available_profiles() -> list[str]:
-    """Return profile names accepted by the short launcher form."""
-    return sorted(
-        {
-            profile.stem
-            for pattern in ("*.yaml", "*.yml")
-            for profile in PROFILE_DIR.glob(pattern)
-            if profile.is_file()
-        }
-    )
-
-
-def resolve_config(value: str) -> tuple[Path, Path]:
-    candidate = Path(value)
-    if candidate.is_absolute():
-        config = candidate.resolve()
-    elif candidate.parent == Path("."):
-        filename = candidate.name
-        if candidate.suffix == "":
-            filename += ".yaml"
-        config = (PROFILE_DIR / filename).resolve()
-    else:
-        config = (ROOT / candidate).resolve()
-    try:
-        relative = config.relative_to(ROOT)
-    except ValueError as exc:
-        raise ValueError(f"config must be inside {ROOT}: {config}") from exc
-    if not config.is_file():
-        raise ValueError(f"config file does not exist: {config}")
-    return config, relative
-
-
 def docker_command(
     image: str,
-    relative_config: Path | None,
     ipe_args: list[str],
     *,
     tty: bool,
@@ -186,51 +176,63 @@ def docker_command(
             f"TZ={host_timezone()}",
             "-e",
             "PYTHONPATH=/ws/src",
-            image,
-            "python3",
-            "-m",
-            "ipe",
         ]
     )
-    if relative_config is not None:
-        command.extend(["--config", f"/ws/{relative_config.as_posix()}"])
+    for name in PASSTHROUGH_ENV:
+        if name in os.environ:
+            command.extend(["-e", name])
+    command.extend([image, "python3", "-m", "ipe"])
     command.extend(ipe_args)
     return command
 
 
 def ensure_image(image: str) -> None:
-    try:
-        inspected = subprocess.run(
-            ["docker", "image", "inspect", image],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
+    """Build the default image when missing or stale against its Dockerfile."""
+    dockerfile = ROOT / "Dockerfile"
+    source_digest = hashlib.sha256(dockerfile.read_bytes()).hexdigest()
+    inspect_command = ["docker", "image", "inspect"]
+    inspect_kwargs = {
+        "stderr": subprocess.DEVNULL,
+        "check": False,
+    }
+    if image == DEFAULT_IMAGE:
+        inspect_command.extend(
+            ["--format", f'{{{{ index .Config.Labels "{IMAGE_SOURCE_LABEL}" }}}}']
         )
+        inspect_kwargs.update({"stdout": subprocess.PIPE, "text": True})
+    else:
+        inspect_kwargs["stdout"] = subprocess.DEVNULL
+    inspect_command.append(image)
+
+    try:
+        inspected = subprocess.run(inspect_command, **inspect_kwargs)
     except FileNotFoundError as exc:
         raise RuntimeError("docker command was not found") from exc
-    if inspected.returncode == 0:
+    if inspected.returncode == 0 and (
+        image != DEFAULT_IMAGE or inspected.stdout.strip() == source_digest
+    ):
         return
     subprocess.run(
         [
             "docker",
             "build",
             "-f",
-            str(ROOT / "tools/humble.Dockerfile"),
+            str(dockerfile),
             "-t",
             image,
-            str(ROOT / "tools"),
+            "--label",
+            f"{IMAGE_SOURCE_LABEL}={source_digest}",
+            str(ROOT),
         ],
         check=True,
     )
 
 
-def native_command(config: Path | None, ipe_args: list[str]) -> tuple[list[str], dict[str, str]]:
+def native_command(ipe_args: list[str]) -> tuple[list[str], dict[str, str]]:
     env = os.environ.copy()
     src = str(ROOT / "src")
     env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     command = [sys.executable, "-m", "ipe"]
-    if config is not None:
-        command.extend(["--config", str(config)])
     command.extend(ipe_args)
     return command, env
 
@@ -238,28 +240,22 @@ def native_command(config: Path | None, ipe_args: list[str]) -> tuple[list[str],
 def main(argv: list[str] | None = None) -> int:
     args, ipe_args = parse_args(argv)
     try:
-        if args.config is None:
-            config, relative = None, None
-        else:
-            config, relative = resolve_config(args.config)
-        if args.native:
-            command, env = native_command(config, ipe_args)
-        else:
+        if args.docker:
             ensure_image(args.image)
             command = docker_command(
                 args.image,
-                relative,
                 ipe_args,
                 tty=sys.stdin.isatty() and sys.stdout.isatty(),
             )
             env = os.environ.copy()
+        else:
+            command, env = native_command(ipe_args)
     except (RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"main.py: {exc}", file=sys.stderr)
         return 2
 
-    mode = "native" if args.native else f"docker:{args.image}"
-    source = relative.as_posix() if relative is not None else "ROS 2 graph (no YAML)"
-    print(f"IPE source={source} runtime={mode}", flush=True)
+    mode = f"docker:{args.image}" if args.docker else "native"
+    print(f"IPE source=ROS 2 graph runtime={mode}", flush=True)
     os.execvpe(command[0], command, env)
     return 0
 

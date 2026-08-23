@@ -117,9 +117,11 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
     # ------------------------------------------------------------------
 
     def run(self) -> int:
+        """Start transport, discover the ROS graph, and run the bridge lifecycle."""
         rc = self.rc
+        target = self.poa if self.protocol == "mqtt" else rc.cse.endpoint
         log.info("IPE starting (%s): %s -> %s (AE %s)", self.protocol, rc.instance_id,
-                 rc.cse.endpoint or self.poa, rc.cse.ae_name)
+                 target, rc.cse.ae_name)
         self.lifecycle.set(IPEState.PREPARING, IPEPhase.VALIDATING_CONFIG)
 
         # S1: SUB 검증을 받을 listener와 oneM2M 전송만 준비한다. route는 비어 있다.

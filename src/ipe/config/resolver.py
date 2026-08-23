@@ -568,15 +568,7 @@ def _merged_for(
 
 
 def _iter_candidates(kind, rules, discovered, ctx: _Ctx, dblock, check=None):
-    """세 종류 resolver의 공통 전처리: 후보 수집 → 규칙 병합 → defaults
-    deep-merge(B3: 필드 단위 — defaults는 필드별로 진다) → robot/경로 해석.
-
-    (interface, types, merged, caps, src, robot, rel, leaf)를 낸다.
-    dblock은 dict 또는 (병합 전 규칙 필드) -> dict callable — 토픽은 direction에
-    따라 defaults 블록이 갈린다. check는 defaults 병합 직후·robot 해석 전에
-    실행하는 검사 훅 — 기존 오류 발생 순서 보존용(토픽 representation 검사는
-    robot 해석보다 먼저 걸려야 한다).
-    """
+    """Merge discovery candidates with defaults before resolving robot paths."""
     cand = _candidates(kind, rules, discovered, ctx.mode, ctx.allow, ctx.deny)
     for interface, types in cand.items():
         hit = _merged_for(interface, rules, ctx.mode)
@@ -600,12 +592,22 @@ def _iter_candidates(kind, rules, discovered, ctx: _Ctx, dblock, check=None):
 
 
 def _resolve_topics(rules, discovered, ctx: _Ctx) -> list[TopicSpec]:
+    """Resolve topic bindings, including both-direction control defaults."""
+
     def dblock(fields: dict[str, Any]) -> dict[str, Any]:
-        # direction은 defaults 블록에 못 들어가므로(schema._NOT_IN_DEFAULTS)
-        # 병합 전후가 같다 — 블록 선택은 병합 전 값으로 한다
-        return ctx.defaults.get(
-            "topic_command" if fields.get("direction", "observe") == "command"
-            else "topic_observe", {})
+        direction = fields.get("direction", "observe")
+        observe = ctx.defaults.get("topic_observe", {})
+        command = ctx.defaults.get("topic_command", {})
+        if direction == "command":
+            return command
+        if direction == "both":
+            command_controls = {
+                key: command[key]
+                for key in ("access", "command")
+                if key in command
+            }
+            return _deep_merge(observe, command_controls)
+        return observe
 
     def check(interface: str, merged: dict[str, Any]) -> None:
         rep = merged.get("representation", _DISCOVERY_REPRESENTATION)
@@ -621,21 +623,18 @@ def _resolve_topics(rules, discovered, ctx: _Ctx) -> list[TopicSpec]:
         direction = merged.get("direction", "observe")
         representation = merged.get("representation", _DISCOVERY_REPRESENTATION)
 
-        # fail-safe QoS(B9): observe는 sensor_data가 기본(설정 프로파일이 있으면
-        # 그것, 없으면 내장); command는 신뢰성 있는 베이스가 기본.
+        # Observable topics use a weak-compatible sensor baseline.
         if direction == "command":
             missing = QoSSpec()
         else:
             missing = ctx.profiles.get("sensor_data", _BUILTIN_SENSOR_DATA)
         qos = _resolve_qos(merged.get("qos"), ctx.profiles, missing)
 
-        if direction == "command":
-            # 병합 후 최종값으로 가드 재검사 (규칙 조합으로 새로 생길 수 있음);
-            # 술어는 rules.command_qos_violation(loader와 공유)
+        if direction in ("command", "both"):
             violation = command_qos_violation(qos.liveliness, qos.deadline_ms)
             if violation:
                 raise ResolveError(command_qos_resolve_message(violation, interface))
-        elif qos.lifespan_ms is not None:
+        if direction in ("observe", "both") and qos.lifespan_ms is not None:
             log.warning(
                 "observe topic '%s': lifespan_ms on a subscription expires samples by "
                 "SOURCE timestamp — clock-skewed robots may silently drop everything; "
@@ -644,14 +643,10 @@ def _resolve_topics(rules, discovered, ctx: _Ctx) -> list[TopicSpec]:
 
         stale = merged.get("stale_after_ms")
         if stale is None and direction in ("observe", "both"):
-            # 기본값: deadline이 있으면 그 2배, 없으면 5초
             stale = qos.deadline_ms * 2 if qos.deadline_ms else _DEFAULT_STALE_AFTER_MS
 
         mtype, source_rule = _type_and_source(merged, types, src)
         enabled, confirm = _access(merged, ctx.default_confirm)
-        if (src == "discovery-default" and direction in ("command", "both")
-                and "access" not in merged):
-            enabled = True
         out.append(TopicSpec(
             robot_id=robot.id,
             interface=interface,

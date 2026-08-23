@@ -52,3 +52,10 @@ logs/
 measurements/
 *.csv
 *.json.gz
+tests/
+tools/
+
+# Runtime state
+*.db
+*.db-shm
+*.db-wal

@@ -1,285 +1,150 @@
 # oneM2M-based Interworking Proxy Entity (IPE)
 
-A generic Interworking Proxy Entity (IPE) that bridges ROS2 robots to a oneM2M CSE (tinyIoT). It maps the topics, services, and actions a robot publishes onto oneM2M resources, and relays commands received over oneM2M back to the robot. Message types are not hardcoded — a single **yaml configuration** connects anything from a single robot to a multi-robot fleet.
+A generic Interworking Proxy Entity that discovers a live ROS 2 graph and bridges its topics, services, and actions to a oneM2M CSE such as tinyIoT. Interface names, types, directions, robot namespaces, and endpoint QoS come from DDS discovery; deployment profiles and YAML files are not used.
 
-- **Type-agnostic**: Converts arbitrary message types to canonical JSON via rosidl reflection. Not tied to any firmware.
-- **Declarative config**: yaml — not code — defines what maps to which oneM2M resource. A single pattern rule expands across N robots.
-- **Lossless & recoverable**: Every message ends in a oneM2M operation or a status event. State is recovered across restarts and CSE outages.
-
----
+- **Discovery-driven**: the running ROS 2 graph is the source of truth.
+- **Type-agnostic**: arbitrary ROS messages are converted to canonical JSON through rosidl reflection.
+- **Continuously reconciled**: interfaces are added and removed as the graph changes.
+- **Recoverable**: state and pending work survive process and CSE outages.
 
 ## Overview
 
-The IPE sits between the ROS2 graph and the oneM2M CSE, relaying messages in both directions.
-
-![IPE architecture](assets/architecture.svg)
-
-Each ROS2 interface maps to one of four subtrees under the oneM2M AE.
+The IPE maps discovered interfaces under one shared AE:
 
 | Subtree | Direction | Purpose |
 |---|---|---|
-| `ros2Data/<robot>/<iface>/` | ROS2 → oneM2M | Observed topic data |
-| `ros2Command/<robot>/<iface>/` | oneM2M → ROS2 | Command topics (a value an app writes to the CSE is published to the robot by the IPE) |
-| `services/<robot>/<iface>/` | Bidirectional | Service request/response |
-| `actions/<robot>/<iface>/` | Bidirectional | Action goal/feedback/result |
+| `robots/<robot>/ros2Data/<iface>/` | ROS 2 → oneM2M | Observed topic data |
+| `robots/<robot>/ros2Command/<iface>/` | oneM2M → ROS 2 | Command topics |
+| `robots/<robot>/services/<iface>/` | Bidirectional | Service request and response |
+| `robots/<robot>/actions/<iface>/` | Bidirectional | Action goal, feedback, and result |
 
-The default layout places a per-robot segment under a single shared AE (`<AE>/ros2Data/<robot_id>/...`). To give each robot its own AE, enable `ae_per_robot`.
+![IPE architecture](assets/architecture.svg)
 
----
+ROS infrastructure topics (`/rosout`, `/parameter_events`), parameter services, and hidden action internals are excluded automatically. Namespaced endpoint ownership creates robot boundaries. For a graph without robot namespaces, `--robot-id` supplies the fallback oneM2M robot name.
 
 ## Requirements
 
-- Python 3.10 or later, Linux
-- ROS2 — `rclpy` comes from a ROS2 distribution (e.g. Humble), not pip
+- Python 3.10 or later on Linux
+- A ROS 2 environment that provides `rclpy`
+- A running robot in the selected DDS domain
 - A running tinyIoT CSE
 
-The pip dependencies are just `pyyaml`, `requests`, and `cerberus`, installed automatically. `--explain`, which only validates the config, runs without ROS2; actual bridging and `--discover` require an active ROS2 environment.
-
----
+The base Python dependencies are `requests` and `cerberus`. Discovery, plan inspection, and normal execution all require an active ROS 2 graph.
 
 ## Installation
 
 ```bash
-source /opt/ros/humble/setup.bash   # provides rclpy
-pip install .                        # base
-pip install ".[notification]"        # with the notification listener (flask)
-pip install ".[mqtt]"                # with the MQTT transport (paho-mqtt)
+source /opt/ros/humble/setup.bash
+pip install .
 ```
 
-Installing registers the `ipe` console command.
-
-### Build from source
-
-IPE is a pure-Python package — "building" means producing a wheel/sdist.
+For MQTT transport:
 
 ```bash
-pip install build                   # build frontend (one-time)
-python -m build                     # writes dist/ipe-<ver>-py3-none-any.whl + .tar.gz
-pip install dist/ipe-*.whl          # install the built wheel
+pip install ".[mqtt]"
 ```
 
-For development, an editable install is usually enough (also available as `make install`):
-
-```bash
-pip install -e .                    # editable, base deps
-pip install -e ".[dev]"             # editable, with lint/test tooling
-```
-
----
+Installing the package registers the `ipe` command.
 
 ## Quick start
 
+Run directly in the current ROS environment:
+
 ```bash
-# 1. Inspect the ROS2 graph — list mappable topics/services/actions
-ipe --config config/profiles/px4.yaml --discover
-
-# 2. Validate the config — print the bridge plan only, no CSE/ROS2 needed
-export IPE_CSE_ORIGIN=Cipe
-ipe --config config/profiles/px4.yaml --explain
-
-# 3. Provision CSE resources (add --reset to recreate)
-ipe --config config/profiles/px4.yaml --bootstrap-only
-
-# 4. Run
-ipe --config config/profiles/px4.yaml
+ipe --discover
+ipe --explain
+ipe
 ```
 
-`--explain` checks that the config resolves as intended. It prints which oneM2M path and QoS each interface connects with.
+From the repository, `main.py` also runs in the current ROS environment:
 
----
-
-## Configuration — connecting a robot via yaml
-
-One file describes one deployment and can hold a single robot or many.
-
-```yaml
-cse: { endpoint: http://localhost:3000, cse_base: TinyIoT, ae_name: ros2-ipe, origin: "${IPE_CSE_ORIGIN}", rvi: "3" }
-robots: [ ... ]          # robot list
-discovery: { ... }       # interface discovery policy
-qos_profiles: { ... }    # named QoS presets (required, at least one)
-bridge:                  # interfaces to map
-  topics: [ ... ]
-  services: [ ... ]
-  actions: [ ... ]
+```bash
+python3 main.py --discover
+python3 main.py --explain
+python3 main.py
 ```
 
-### Transport: HTTP or MQTT
+Docker is optional. Use `--docker` only when the host does not provide ROS 2 Humble:
 
-The IPE talks to the CSE over **HTTP** (default) or **MQTT**, selected by `cse.protocol`. Provisioning, observe/command/service/action, catch-up, and recovery all behave identically on both.
-
-```yaml
-cse:
-  protocol: mqtt           # http (default) | mqtt
-  cse_base: TinyIoT        # CSE resource name (used in resource addresses)
-  cse_id: tinyiot          # CSE-ID = MQTT topic segment (tinyIoT CSE_BASE_RI); required for mqtt
-  ae_name: ros2-ipe
-  origin: "${IPE_CSE_ORIGIN}"
-  mqtt:
-    host: 127.0.0.1
-    port: 1883
-    username: test
-    password: mqtt
-    qos: 1                 # 0 | 1 | 2
-    # optional: tls + tls_ca/tls_cert/tls_key/tls_insecure, client_id, keepalive,
-    # clean_session, response_timeout_ms, connect_timeout_ms, max_payload, topic_prefix
+```bash
+python3 main.py --docker --discover
+python3 main.py --docker
 ```
 
-- **`cse_id` is required for MQTT** and is not the same as `cse_base`. It is the CSE-ID used as the MQTT topic receiver segment (tinyIoT's `CSE_BASE_RI`, e.g. `tinyiot`); `cse_base` is the CSE resource name used in addresses (e.g. `TinyIoT`). `endpoint` is only used for HTTP.
-- The IPE and the CSE both connect to an **MQTT broker** (e.g. Mosquitto) — not to each other. The tinyIoT CSE must be built with `ENABLE_MQTT` and pointed at the same broker. Install the transport with `pip install ".[mqtt]"`.
-- A single `protocol` governs **both** directions (requests and notifications); mixed HTTP/MQTT is not supported.
-- Under MQTT the AE's point-of-access is an `mqtt://` URI, so the HTTP `/healthz` and `/diag` endpoints are not served — connection state is reported in the `ipeHealth` heartbeat instead. `notification_server` applies to HTTP only.
+The root `Dockerfile` is built automatically only when `--docker` is selected.
 
-### Declaring robots
+## Dynamic discovery
 
-```yaml
-robots:
-  - { id: tb3, namespace: "" }       # single robot, no namespace
-  - { id: r1,  namespace: /robot1 }  # robot with a namespace
+Startup waits for a non-empty, stable graph before provisioning resources. The IPE then refreshes the graph periodically and reconciles interface additions, removals, type changes, ownership, and endpoint QoS.
+
+Topic direction is inferred from remote endpoints:
+
+- A remote publisher is an observed topic.
+- A remote subscription is a command topic.
+- Both endpoint kinds produce a bidirectional topic.
+
+Observed topics are bridged automatically. Discovered command topics, services, and actions are included in the binding plan but cannot execute control operations unless control is explicitly enabled:
+
+```bash
+ipe --allow-control
+python3 main.py --allow-control
 ```
 
-- `id` — the robot's root segment in the oneM2M path (`ros2Data/<id>/...`).
-- `namespace` — the prefix that determines which robot an interface belongs to.
+Only enable control for a trusted oneM2M deployment. The switch applies to every discovered control interface in the DDS domain.
 
-If you have a single robot and topic names carry no namespace, you can omit `robots` (a `default` robot is registered automatically).
+## Runtime settings
 
-### Selecting interfaces
+Deployment values are CLI options or environment variables rather than files:
 
-Each `bridge` entry targets an interface with either `name` (exact name) or `match` (pattern).
+| CLI option | Environment variable | Default |
+|---|---|---|
+| `--cse-endpoint` | `IPE_CSE_ENDPOINT` | `http://127.0.0.1:3000` |
+| `--cse-base` | `IPE_CSE_BASE` | `TinyIoT` |
+| `--cse-timezone` | `IPE_CSE_TIMEZONE` | `local` |
+| `--ae-name` | `IPE_AE_NAME` | `ros2-ipe` |
+| `--instance-id` | `IPE_INSTANCE_ID` | `ros2-ipe` |
+| `--robot-id` | `IPE_ROBOT_ID` | `robot` |
+| `--robot-namespace` | `IPE_ROBOT_NAMESPACE` | empty |
+| `--domain-id` | `ROS_DOMAIN_ID` | `0` (`main.py --docker`: `30`) |
+| `--ros-peer` | `IPE_ROS_PEER` | none |
+| `--refresh-sec` | `IPE_REFRESH_SEC` | `5` |
+| `--allow-control` | `IPE_ALLOW_CONTROL` | disabled |
 
-```yaml
-bridge:
-  topics:
-    - name: /tb3/scan          # a single topic
-    - match: "/{robot}/odom"   # pattern: applies to every robot's odom
+The AE origin defaults to a unique value derived from the AE name and can be overridden with `IPE_CSE_ORIGIN`. Runtime state is stored in `ipe_state.db` or the path specified by `IPE_STATE_DB`.
+
+For Cyclone DDS unicast discovery:
+
+```bash
+ipe --domain-id 30 --ros-peer 192.168.219.106
 ```
 
-A `{robot}` pattern auto-expands a single rule across the N robots found via discovery (`path: "{robot}/odom"` separates each robot's subtree). `discovery.mode` sets the discovery scope.
+`--ros-peer` selects Cyclone DDS when no RMW is selected. It is rejected for non-IP values and is not silently applied to another RMW implementation.
 
-| mode | Mapped targets |
-|---|---|
-| `config-only` | Only entries declared with `name` (each requires a `type` pin) |
-| `hybrid` (default) | Declared entries + discovered interfaces captured by a `match` pattern |
-| `auto-expose` | All discovered interfaces passing `allow`/`deny` |
+### MQTT CSE transport
 
-### Topic options
+Set the transport through environment variables and install the MQTT extra:
 
-```yaml
-- name: /tb3/battery_state
-  direction: observe          # observe(robot→CSE) | command(CSE→robot) | both
-  representation: latest       # latest | historical | both | sampled(downsample)
-  qos: sensor_data             # preset name or { profile: ..., depth: 1 }
-  sample: { min_interval_ms: 1000 }              # when representation: sampled
-  filter: { type: delta, fields: [voltage], min_change: 0.05 }   # optional
-  source_ts: { field: header.stamp, format: ros_time }           # extract source timestamp
+```bash
+export IPE_CSE_PROTOCOL=mqtt
+export IPE_CSE_ID=tinyiot
+export IPE_MQTT_HOST=127.0.0.1
+export IPE_MQTT_PORT=1883
+ipe
 ```
 
-### Command topics (safety)
-
-Commands are how an external application drives the robot, so they are disabled by default and must be explicitly enabled.
-
-```yaml
-- name: /tb3/cmd_vel
-  direction: command
-  qos: reliable
-  access: { enabled: true, confirm: required }   # enable + manual approval
-  command:
-    rate_limit_hz: 10            # publish rate cap
-    max_age_ms: 3000             # commands older than 3s expire
-    watchdog_ms: 500             # stop command if updates stall
-    clamp: { "linear.x": [-0.22, 0.22] }   # clamp field value range
-```
-
-### Services & actions
-
-```yaml
-services:
-  - { name: /tb3/reset, type: std_srvs/srv/Empty, timeout_ms: 5000 }
-actions:
-  - name: /tb3/navigate_to_pose
-    type: nav2_msgs/action/NavigateToPose
-    feedback: sampled            # log | latest | sampled | combined
-    goal_fields: [pose]
-    result_fields: [result]
-```
-
-### Example — single robot
-
-```yaml
-cse: { endpoint: http://localhost:3000, cse_base: TinyIoT, ae_name: ros2-ipe, origin: "${IPE_CSE_ORIGIN}", rvi: "3" }
-robots:
-  - { id: tb3, namespace: "" }
-discovery: { mode: config-only, deny: ["/rosout", "/tf", "/tf_static"], refresh_sec: 5 }
-qos_profiles:
-  sensor_data: { reliability: best_effort, depth: 5 }
-  reliable:    { reliability: reliable, depth: 10 }
-bridge:
-  topics:
-    - { name: /scan, type: sensor_msgs/msg/LaserScan, direction: observe, representation: latest, qos: sensor_data }
-    - name: /cmd_vel
-      type: geometry_msgs/msg/Twist
-      direction: command
-      qos: reliable
-      access: { enabled: true, confirm: required }
-      command: { rate_limit_hz: 10, max_age_ms: 3000, clamp: { "linear.x": [-0.22, 0.22] } }
-```
-
-### Example — multi-robot (fleet)
-
-```yaml
-cse: { endpoint: http://localhost:3000, cse_base: TinyIoT, ae_name: ros2-ipe, origin: "${IPE_CSE_ORIGIN}", rvi: "3" }
-robots:
-  - { id: r1, namespace: /robot1 }
-  - { id: r2, namespace: /robot2 }
-robots_strict: false           # dynamically register unknown robots too (true to reject)
-discovery: { mode: hybrid, allow: ["/robot*/**"], deny: ["/rosout", "/tf", "/tf_static"], refresh_sec: 5 }
-qos_profiles:
-  sensor_data: { reliability: best_effort, depth: 5 }
-  reliable:    { reliability: reliable, durability: transient_local, depth: 1 }
-bridge:
-  topics:
-    - { match: "/{robot}/odom", direction: observe, representation: sampled, sample: { min_interval_ms: 1000 }, path: "{robot}/odom", qos: reliable }
-    - { match: "/{robot}/scan", direction: observe, representation: latest, path: "{robot}/scan", qos: { profile: sensor_data, depth: 1 } }
-    - match: "/{robot}/cmd_vel"
-      direction: command
-      type: geometry_msgs/msg/Twist
-      path: "{robot}/cmd_vel"
-      access: { enabled: true, confirm: required }
-      command: { rate_limit_hz: 10, max_age_ms: 3000 }
-```
-
-To add a robot, append an entry to `robots` and make sure the `allow` glob covers its namespace. The topic rules need no change thanks to the `{robot}` capture.
-
-### Common errors
-
-| Symptom | Cause / fix |
-|---|---|
-| `must have exactly one of 'name' or 'match'` | A bridge entry must specify exactly one of `name`/`match` |
-| Missing type under config-only | `name` entries under `config-only` require a `type` pin |
-| Fails on unset env var | The value is exactly `${VAR}` but the variable isn't exported (partial interpolation unsupported) |
-| QoS preset undefined | `qos: name` is not in `qos_profiles` |
-| Path collision | Final oneM2M paths overlap — disambiguate with `path`/`alias`/`{robot}` |
-
-For the full set of config keys, allowed values, and defaults, see the schema in `src/ipe/config/schema.py`.
-
----
+Optional MQTT variables include `IPE_MQTT_CLIENT_ID`, `IPE_MQTT_QOS`, `IPE_MQTT_USERNAME`, `IPE_MQTT_PASSWORD`, `IPE_MQTT_TLS`, and the `IPE_MQTT_TLS_*` certificate settings. `main.py --docker` forwards these variables into its container.
 
 ## CLI
 
-```
-ipe --config <file> [options]
+```text
+ipe [options]
 ```
 
 | Flag | Action |
 |---|---|
-| `--config, -c` | Config file path (required) |
-| `--log-level` | `DEBUG`/`INFO`/`WARNING`/`ERROR` (default INFO) |
-| `--explain` (`--dry-run`) | Resolve the config and print the bridge plan only (no ROS2/CSE) |
-| `--discover` | Print a one-shot ROS2 graph snapshot |
-| `--bootstrap-only` | Provision CSE resources (AE/CNT/SUB) only |
-| `--reset` | Delete existing AEs before provisioning |
-
----
-
-## Example profiles
-
-The repository ships `config/profiles/px4.yaml` (a real-stack PX4 SITL + uXRCE-DDS example). For PX4, copy this file and just adjust the actual topic names you see from `ros2 topic list`. For a single robot or a fleet, copy the snippets above to get started.
+| `--discover` | Print one converged ROS 2 graph snapshot |
+| `--explain`, `--dry-run` | Discover the graph and print the resolved binding plan |
+| `--bootstrap-only` | Discover and provision CSE resources, then exit |
+| `--allow-control` | Enable discovered command topics, services, and actions |
+| `--reset` | Delete the existing AE before normal startup |
+| `--log-level` | Set `DEBUG`, `INFO`, `WARNING`, or `ERROR` logging |

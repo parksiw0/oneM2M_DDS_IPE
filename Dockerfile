@@ -1,6 +1,5 @@
-# PC(Ubuntu 24.04)에서 Humble IPE 실행용 — host 네트워크로 DDS/localhost 공유.
-# build:  docker build -f tools/humble.Dockerfile -t ipe:humble tools/
-# run:    python3 main.py config/profiles/turtlebot3.yaml [--explain|--discover|...]
+# ROS 2 Humble runtime for hosts that do not provide Humble packages.
+# Build with: docker build -t ipe:humble .
 FROM ros:humble-ros-base
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -13,6 +12,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install --no-cache-dir pyyaml requests cerberus
+RUN pip3 install --no-cache-dir requests cerberus "paho-mqtt>=2.1"
 
 ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
