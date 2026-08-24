@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_IMAGE = "ipe:humble"
@@ -25,7 +26,7 @@ PASSTHROUGH_ENV = (
     "IPE_ROBOT_ID",
     "IPE_ROBOT_NAMESPACE",
     "IPE_REFRESH_SEC",
-    "IPE_ALLOW_CONTROL",
+    "IPE_OBSERVE_ONLY",
     "IPE_STATE_DB",
     "IPE_RVI",
     "IPE_GRAPH_TIMEOUT_SEC",
@@ -96,9 +97,9 @@ def build_parser() -> argparse.ArgumentParser:
     ipe_options.add_argument("--ros-peer", help="Cyclone DDS unicast discovery peer IP")
     ipe_options.add_argument("--refresh-sec", type=float, help="ROS Graph reconcile interval")
     ipe_options.add_argument(
-        "--allow-control",
+        "--observe-only",
         action="store_true",
-        help="Enable discovered command topics, services, and actions",
+        help="Disable command topics, services, and actions",
     )
     ipe_options.add_argument(
         "--explain",
@@ -141,7 +142,7 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
         if value is not None:
             ipe_args.extend([f"--{name.replace('_', '-')}", str(value)])
     for name in (
-        "allow_control", "explain", "dry_run", "discover", "bootstrap_only", "reset",
+        "observe_only", "explain", "dry_run", "discover", "bootstrap_only", "reset",
     ):
         if getattr(args, name):
             ipe_args.append(f"--{name.replace('_', '-')}")
@@ -169,15 +170,31 @@ def docker_command(
             "-e",
             f"ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '30')}",
             "-e",
-            f"RMW_IMPLEMENTATION={os.environ.get('RMW_IMPLEMENTATION', 'rmw_cyclonedds_cpp')}",
-            "-e",
-            f"CYCLONEDDS_URI={os.environ.get('CYCLONEDDS_URI', '')}",
-            "-e",
             f"TZ={host_timezone()}",
             "-e",
             "PYTHONPATH=/ws/src",
         ]
     )
+    for name in ("RMW_IMPLEMENTATION", "CYCLONEDDS_URI"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            command.extend(["-e", f"{name}={value}"])
+    display = os.environ.get("DISPLAY", "").strip()
+    xauthority = os.environ.get("XAUTHORITY", "").strip()
+    if display:
+        command.extend([
+            "-e",
+            f"DISPLAY={display}",
+            "-v",
+            "/tmp/.X11-unix:/tmp/.X11-unix:rw",
+        ])
+        if xauthority and Path(xauthority).is_file():
+            command.extend([
+                "-e",
+                "XAUTHORITY=/tmp/.ipe.xauthority",
+                "-v",
+                f"{xauthority}:/tmp/.ipe.xauthority:ro",
+            ])
     for name in PASSTHROUGH_ENV:
         if name in os.environ:
             command.extend(["-e", name])
@@ -191,7 +208,7 @@ def ensure_image(image: str) -> None:
     dockerfile = ROOT / "Dockerfile"
     source_digest = hashlib.sha256(dockerfile.read_bytes()).hexdigest()
     inspect_command = ["docker", "image", "inspect"]
-    inspect_kwargs = {
+    inspect_kwargs: dict[str, Any] = {
         "stderr": subprocess.DEVNULL,
         "check": False,
     }

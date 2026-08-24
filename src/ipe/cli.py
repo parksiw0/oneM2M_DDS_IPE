@@ -10,10 +10,11 @@ from ipe.config.loader import ConfigError, validate_config
 from ipe.config.resolver import ResolveError, resolve
 from ipe.config.runtime_config import discovery_runtime_config
 from ipe.config.spec import QoSSpec, ResolvedConfig
+from ipe.rmw_selection import CYCLONE_DDS_RMW, RMWSelectionError, cyclone_peer_uri, select_rmw
 
 log = logging.getLogger(__name__)
 
-CYCLONE_RMW = "rmw_cyclonedds_cpp"
+CYCLONE_RMW = CYCLONE_DDS_RMW
 
 
 def setup_logging(level: str) -> None:
@@ -39,9 +40,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--ros-peer", help="Cyclone DDS unicast discovery peer IP")
     p.add_argument("--refresh-sec", type=float, help="ROS graph reconcile interval")
     p.add_argument(
-        "--allow-control",
+        "--observe-only",
         action="store_true",
-        help="Enable discovered command topics, services, and actions",
+        help="Disable command topics, services, and actions",
     )
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     p.add_argument("--explain", action="store_true",
@@ -76,10 +77,17 @@ def explain(rc: ResolvedConfig, log: logging.Logger) -> None:
     if rc.topics:
         log.info("--- topics (%d) ---", len(rc.topics))
     for t in sorted(rc.topics, key=lambda x: (x.robot_id, x.interface)):
-        branch = {"observe": "ros2Data", "command": "ros2Command", "both": "ros2Data+ros2Command"}[t.direction]
+        branch = {
+            "observe": "topics/observe",
+            "command": "topics/command",
+            "both": "topics/observe+topics/command",
+        }[t.direction]
+        qos_text = _qos_str(t.qos_for("observe" if t.direction != "command" else "command"))
+        if t.direction == "both":
+            qos_text = f"observe={qos_text}; command={_qos_str(t.qos_for('command'))}"
         log.info("  [%s] %-32s %-9s -> %s/%s | %s | rep=%s | qos:%s | rule:%s%s",
                  t.robot_id, t.interface, t.direction, branch, t.rel_path,
-                 t.msg_type or "(type@discovery)", t.representation, _qos_str(t.qos),
+                 t.msg_type or "(type@discovery)", t.representation, qos_text,
                  t.source_rule, "  ACCESS:ON" if t.access_enabled else "")
     if rc.services:
         log.info("--- services (%d) ---", len(rc.services))
@@ -108,19 +116,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = validate_config(discovery_runtime_config(args))
     except ConfigError as e:
-        log.error("Runtime settings error: %s", e)
+        print(f"Runtime settings error: {e}", file=sys.stderr)
         return 1
 
     try:
         rc = resolve(config, discovered=None)
     except ResolveError as e:
-        log.error("Resolution error: %s", e)
+        print(f"Resolution error: {e}", file=sys.stderr)
         return 1
 
     try:
+        _select_rmw_environment(args, rc)
         _configure_ros_environment(args, rc)
     except ConfigError as e:
-        log.error("Runtime settings error: %s", e)
+        print(f"Runtime settings error: {e}", file=sys.stderr)
         return 1
     if args.explain or args.dry_run:
         return _discover(log, rc, explain_plan=True)
@@ -162,9 +171,47 @@ def _configure_ros_environment(args: argparse.Namespace, rc: ResolvedConfig) -> 
         )
         return
     os.environ["CYCLONEDDS_URI"] = (
-        "<CycloneDDS><Domain><Discovery><Peers>"
-        f'<Peer address="{peer}"/>'
-        "</Peers></Discovery></Domain></CycloneDDS>"
+        cyclone_peer_uri(peer)
+    )
+
+
+def _select_rmw_environment(args: argparse.Namespace, rc: ResolvedConfig) -> None:
+    """Honor an explicit RMW or select one from target endpoint GIDs."""
+    domain_id = args.domain_id
+    if domain_id is None:
+        domain_id = int(rc.discovery.get("domain_id", os.environ.get("ROS_DOMAIN_ID", 0)))
+    os.environ["ROS_DOMAIN_ID"] = str(domain_id)
+
+    explicit = os.environ.get("RMW_IMPLEMENTATION", "").strip()
+    if explicit:
+        log.info("DDS RMW selected explicitly: %s", explicit)
+        return
+
+    peer = args.ros_peer or os.environ.get("IPE_ROS_PEER")
+    if peer:
+        try:
+            ipaddress.ip_address(peer)
+        except ValueError as exc:
+            raise ConfigError(f"--ros-peer must be an IP address: {peer!r}") from exc
+    robots = list(rc.robots.values())
+    robot_namespace = robots[0].namespace if len(robots) == 1 else ""
+    timeout_sec = float(rc.discovery.get("graph_settle_timeout_sec", 10))
+    try:
+        selected = select_rmw(
+            domain_id=domain_id,
+            robot_namespace=robot_namespace,
+            peer=peer,
+            timeout_sec=timeout_sec,
+        )
+    except RMWSelectionError as exc:
+        raise ConfigError(str(exc)) from exc
+    os.environ["RMW_IMPLEMENTATION"] = selected.implementation
+    log.info(
+        "DDS RMW auto-selected: %s (%s vendor=%s, target endpoints=%d)",
+        selected.implementation,
+        selected.vendor_name,
+        selected.vendor_id,
+        selected.endpoint_count,
     )
 
 

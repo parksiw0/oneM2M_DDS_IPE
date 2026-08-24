@@ -31,8 +31,8 @@ def _as_int(key: str, value: Any) -> int:
 def discovery_runtime_config(args: Any, env: Mapping[str, str] | None = None) -> dict[str, Any]:
     """Return runtime settings without declaring any ROS interfaces.
 
-    The live graph supplies interfaces and QoS. Control interfaces stay disabled
-    unless the operator explicitly enables them.
+    The live graph supplies interfaces and QoS. Control interfaces are enabled
+    unless the operator selects observe-only mode.
     """
     values = os.environ if env is None else env
 
@@ -57,8 +57,8 @@ def discovery_runtime_config(args: Any, env: Mapping[str, str] | None = None) ->
         "IPE_REFRESH_SEC", arg_or_env("refresh_sec", "IPE_REFRESH_SEC", 5.0)
     )
     domain_id = _as_int("ROS_DOMAIN_ID", arg_or_env("domain_id", "ROS_DOMAIN_ID", 0))
-    allow_control = bool(getattr(args, "allow_control", False)) or env_bool(
-        "IPE_ALLOW_CONTROL"
+    control_enabled = not (
+        bool(getattr(args, "observe_only", False)) or env_bool("IPE_OBSERVE_ONLY")
     )
 
     cse = {
@@ -119,9 +119,9 @@ def discovery_runtime_config(args: Any, env: Mapping[str, str] | None = None) ->
         },
         "defaults": {
             "topic_observe": {"representation": "latest"},
-            "topic_command": {"access": {"enabled": allow_control}},
-            "service": {"access": {"enabled": allow_control}},
-            "action": {"access": {"enabled": allow_control}},
+            "topic_command": {"access": {"enabled": control_enabled}},
+            "service": {"access": {"enabled": control_enabled}},
+            "action": {"access": {"enabled": control_enabled}},
         },
         "naming": {"path_style": "flat", "sanitize": "_"},
         "bridge": {"topics": [], "services": [], "actions": []},
