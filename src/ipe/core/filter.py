@@ -10,7 +10,7 @@ from ipe.core.common import get_path
 def _max_abs_delta(old: list[float], new: list[float]) -> float:
     if len(old) != len(new):
         return float("inf")
-    return max((abs(a - b) for a, b in zip(old, new)), default=0.0)
+    return max((abs(a - b) for a, b in zip(old, new, strict=False)), default=0.0)
 
 
 class DeltaFilter:
@@ -72,7 +72,7 @@ class DeltaFilter:
 
 
 def _agg_vectors(vectors: list[list[float]], fn: Any) -> Any:
-    cols = zip(*vectors)
+    cols = zip(*vectors, strict=False)
     res = [fn(list(c)) for c in cols]
     return res[0] if len(res) == 1 else res
 
@@ -120,10 +120,7 @@ class WindowAggregator:
                 st["vecs"].setdefault(name, []).append(nums)
         st["n"] += 1
 
-        if mode == "count":
-            closed = st["n"] >= size
-        else:
-            closed = (ts - st["start"]) >= size
+        closed = st["n"] >= size if mode == "count" else ts - st["start"] >= size
         if not closed:
             return None
 

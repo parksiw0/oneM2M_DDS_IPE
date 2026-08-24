@@ -137,7 +137,8 @@ class AnomalyGate:
                 self._disabled.add(key)
                 return False, 0.0
         try:
-            return det.score(vec)
+            anomalous, score = det.score(vec)
+            return bool(anomalous), float(score)
         except Exception:
             # 반복 실패는 메시지당 로그 폭주가 되므로 1회 보고 후 키 비활성
             log.exception("anomaly scoring failed for %s — disabling gate", key)

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=68,<80", "packaging>=24.2", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -54,6 +54,10 @@ disallow_untyped_defs = false
 
 [[tool.mypy.overrides]]
 module = "cerberus.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["rclpy.*", "rosidl_parser.*", "rosidl_runtime_py.*", "sklearn.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

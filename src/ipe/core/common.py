@@ -60,13 +60,13 @@ def as_numbers(v: Any) -> list[float] | None:
     """스칼라/수치 배열 → float 리스트. bool·비수치·NaN/Inf 포함이면 None(판정 불가)."""
     if isinstance(v, bool):
         return None
-    if isinstance(v, (int, float)):
+    if isinstance(v, int | float):
         f = float(v)
         return None if (math.isnan(f) or math.isinf(f)) else [f]
-    if isinstance(v, (list, tuple)):
+    if isinstance(v, list | tuple):
         out: list[float] = []
         for x in v:
-            if isinstance(x, bool) or not isinstance(x, (int, float)):
+            if isinstance(x, bool) or not isinstance(x, int | float):
                 return None
             f = float(x)
             if math.isnan(f) or math.isinf(f):

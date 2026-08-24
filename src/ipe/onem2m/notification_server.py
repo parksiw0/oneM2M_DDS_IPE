@@ -9,8 +9,8 @@
 from __future__ import annotations
 
 import json
-import threading
 import logging
+import threading
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -107,10 +107,7 @@ class NotificationServer:
                     self._respond(200, "2000")
                     return
                 path = self.path.split("?", 1)[0]
-                if path.startswith(prefix):
-                    path_key = path[len(prefix):]
-                else:
-                    path_key = path.lstrip("/")
+                path_key = path[len(prefix):] if path.startswith(prefix) else path.lstrip("/")
                 try:
                     # 직렬화는 앱의 admission 락이 담당한다(catch-up 경로 포함 단일 권위)
                     result = on_notify(path_key, notif)

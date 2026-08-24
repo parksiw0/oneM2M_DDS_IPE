@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from ipe.ir import TopicIR
 
@@ -62,7 +63,7 @@ def _as_float(value: Any) -> float | None:
 def _ros_time_dict(value: Any) -> float | None:
     """{sec, nanosec} dict → epoch 초. 그 외 형태는 None — 폴백은 호출자 몫."""
     if isinstance(value, dict) and "sec" in value:
-        return value.get("sec", 0) + value.get("nanosec", 0) / 1e9
+        return float(value.get("sec", 0) + value.get("nanosec", 0) / 1e9)
     return None
 
 
@@ -139,7 +140,7 @@ def _coerce_ros_time(value: Any) -> float | None:
     ts = _ros_time_dict(value)
     if ts is not None:
         return ts
-    if isinstance(value, (int, float)):
+    if isinstance(value, int | float):
         return float(value)
     return None
 

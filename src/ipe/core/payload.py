@@ -7,12 +7,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from ipe.core.normalize import epoch_to_onem2m_ts, get_path, sanitize_value
 
 
-def build_cin_content(normalized: dict[str, Any], ir: dict[str, Any]) -> dict[str, Any]:
+def build_cin_content(normalized: dict[str, Any], ir: Mapping[str, Any]) -> dict[str, Any]:
     """CIN con 본문 {seq, source_ts, ingest_ts, topic, robot, data} 생성."""
     source_ts = ir.get("source_ts")
     return {

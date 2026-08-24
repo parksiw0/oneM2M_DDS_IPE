@@ -84,12 +84,12 @@ def _require_rosidl() -> None:
         raise TranscodeError("", "rosidl_parser is required for transcoding (ROS environment not sourced)")
 
 
-def _iter_fields(msg_class: type) -> list[tuple[str, Any]]:
+def _iter_fields(msg_class: Any) -> list[tuple[str, Any]]:
     names = list(msg_class.get_fields_and_field_types().keys())
-    return list(zip(names, msg_class.SLOT_TYPES))
+    return list(zip(names, msg_class.SLOT_TYPES, strict=False))
 
 
-def _resolve_namespaced(nt: NamespacedType) -> type:
+def _resolve_namespaced(nt: NamespacedType) -> Any:
     module = importlib.import_module(".".join(nt.namespaces))
     return getattr(module, nt.name)
 
@@ -166,7 +166,7 @@ def _read_basic(value: Any, typename: str, path: str, i64s: bool) -> Any:
 
 
 def _octet_to_int(value: Any, path: str) -> int:
-    if isinstance(value, (bytes, bytearray)):
+    if isinstance(value, bytes | bytearray):
         if len(value) != 1:
             raise TranscodeError(path, f"scalar byte must be 1 byte, got {len(value)}")
         return value[0]
@@ -189,7 +189,7 @@ def _checked_ord(ch: str, path: str) -> int:
 def _read_sequence(value: Any, slot: AbstractNestedType, path: str, i64s: bool) -> Any:
     if _is_byte_sequence(slot):
         return base64.b64encode(_container_to_bytes(value, path)).decode("ascii")
-    if isinstance(value, (str, bytes, bytearray, Mapping)):
+    if isinstance(value, str | bytes | bytearray | Mapping):
         raise TranscodeError(path, f"expected sequence, got {type(value).__name__}")
     try:
         items = list(value)
@@ -200,17 +200,17 @@ def _read_sequence(value: Any, slot: AbstractNestedType, path: str, i64s: bool) 
 
 def _container_to_bytes(value: Any, path: str) -> bytes:
     """uint8[]/byte[] 컨테이너(bytes/str/array.array/numpy/list)를 bytes로 정규화."""
-    if isinstance(value, (bytes, bytearray, memoryview)):
+    if isinstance(value, bytes | bytearray | memoryview):
         return bytes(value)
     if isinstance(value, str):  # bytes 값을 rosidl이 chr() 연결로 렌더링한 형태
         return bytes(_checked_ord(c, f"{path}[{i}]") for i, c in enumerate(value))
     if hasattr(value, "tobytes"):  # array.array('B')와 numpy uint8 배열
         return bytes(value.tobytes())
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         out = bytearray()
         for i, item in enumerate(value):
             elem_path = f"{path}[{i}]"
-            if isinstance(item, (bytes, bytearray)):
+            if isinstance(item, bytes | bytearray):
                 if len(item) != 1:
                     raise TranscodeError(elem_path, f"byte element must be 1 byte, got {len(item)}")
                 out += item
@@ -287,7 +287,7 @@ def _write_basic(value: Any, typename: str, path: str, i64s: bool) -> Any:
 
 
 def _write_float(value: Any, typename: str, path: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, int | float):
         raise TranscodeError(path, f"expected number, got {type(value).__name__}")
     v = float(value)
     if v != v or v in (float("inf"), float("-inf")):
@@ -327,7 +327,7 @@ def _write_int(value: Any, typename: str, path: str, i64s: bool) -> int:
 def _write_string(value: Any, slot: AbstractGenericString, path: str) -> str:
     if not isinstance(value, str):
         raise TranscodeError(path, f"expected string, got {type(value).__name__}")
-    if isinstance(slot, (BoundedString, BoundedWString)) and len(value) > slot.maximum_size:
+    if isinstance(slot, BoundedString | BoundedWString) and len(value) > slot.maximum_size:
         raise TranscodeError(path, f"string length {len(value)} exceeds bound {slot.maximum_size}")
     return value
 
@@ -351,7 +351,8 @@ def _write_sequence(value: Any, slot: AbstractNestedType, path: str, i64s: bool)
         if slot.value_type.typename in _OCTET_TYPENAMES:
             return [bytes([b]) for b in raw]  # rclpy의 byte[]는 1바이트 bytes의 시퀀스
         return raw  # rclpy의 uint8[]은 bytes를 그대로 받음
-    if isinstance(value, (str, bytes, bytearray, Mapping)) or not isinstance(value, (list, tuple)):
+    if (isinstance(value, str | bytes | bytearray | Mapping)
+            or not isinstance(value, list | tuple)):
         raise TranscodeError(path, f"expected array, got {type(value).__name__}")
     _check_length(len(value), slot, path)
     return [_write_value(item, slot.value_type, f"{path}[{i}]", i64s) for i, item in enumerate(value)]

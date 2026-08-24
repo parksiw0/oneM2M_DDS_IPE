@@ -225,6 +225,9 @@ def make_onem2m_client(rc: ResolvedConfig, origin: str) -> OneM2MClient:
                 "(install the optional dependency: pip install \"ipe[mqtt]\" "
                 "or \"paho-mqtt>=2.1\")"
             ) from e
-        return OneM2MMQTTClient(rc.cse.mqtt, rc.cse.cse_id, rc.cse.cse_base,
+        mqtt = rc.cse.mqtt
+        if mqtt is None:
+            raise ValueError("cse.mqtt is required when cse.protocol is mqtt")
+        return OneM2MMQTTClient(mqtt, rc.cse.cse_id, rc.cse.cse_base,
                                 origin=origin, rvi=rc.cse.rvi)
     raise ValueError(f"unknown cse.protocol {proto!r} (expected 'http' or 'mqtt')")

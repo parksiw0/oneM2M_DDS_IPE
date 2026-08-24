@@ -106,7 +106,7 @@ def undefined_qos_ref(
         base = value.get("profile")
         present = (base is not None) if empty_base_violates else bool(base)
         if present and base not in names:
-            return "base", base
+            return "base", str(base)
     return None
 
 

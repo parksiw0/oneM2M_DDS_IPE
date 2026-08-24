@@ -7,7 +7,7 @@ import logging
 import os
 import re
 from collections.abc import Iterator, Mapping
-from typing import Any
+from typing import Any, cast
 
 from cerberus import Validator
 
@@ -42,7 +42,7 @@ def validate_config(raw: dict[str, Any], env: Mapping[str, str] | None = None) -
     _normalize_robot_namespaces(normalized)
     _check_semantics(normalized)
     _probe_type_pins(normalized)
-    return normalized
+    return cast(dict[str, Any], normalized)
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +121,7 @@ def _normalize_qos_case(cfg: dict[str, Any]) -> None:
     for prof in (cfg.get("qos_profiles") or {}).values():
         if isinstance(prof, dict):
             _upper_qos(prof)
-    for _label_, _ref, q in _iter_qos_values(cfg):
+    for _, _ref, q in _iter_qos_values(cfg):
         if isinstance(q, dict):
             _upper_qos(q)
 
@@ -206,7 +206,7 @@ def _label(item: dict[str, Any]) -> str:
 def _check_patterns(cfg: dict[str, Any]) -> None:
     """모든 패턴을 선행 컴파일 — 잘못된 캡처 이름이나 미종결 중괄호는
     런타임 re.error 크래시가 아니라 설정 오류여야 한다(B5)."""
-    for kind, where, _i, item in _bridge_items(cfg):
+    for _kind, where, _i, item in _bridge_items(cfg):
         has_name = "name" in item
         has_match = "match" in item
         if has_name == has_match:
@@ -249,7 +249,7 @@ def _check_mode_semantics(cfg: dict[str, Any]) -> None:
 
 def _check_qos_references(cfg: dict[str, Any]) -> None:
     qos_names = set((cfg.get("qos_profiles") or {}).keys())
-    for _label_, ref_label, q in _iter_qos_values(cfg):
+    for _, ref_label, q in _iter_qos_values(cfg):
         bad = undefined_qos_ref(q, qos_names, empty_base_violates=False)
         if bad:
             raise ConfigError(qos_ref_load_message(*bad, where=ref_label))
@@ -293,11 +293,11 @@ def _check_filters_and_sampling(cfg: dict[str, Any]) -> None:
 
     for i, item in enumerate(bridge.get("actions", []) or []):
         where = f"bridge.actions[{i}]"
-        if item.get("feedback") == "sampled" and "feedback_sample" not in item:
-            if "feedback_sample" not in (defaults.get("action") or {}):
-                raise ConfigError(
-                    f"{where} '{_label(item)}' feedback 'sampled' requires 'feedback_sample'."
-                )
+        if (item.get("feedback") == "sampled" and "feedback_sample" not in item
+                and "feedback_sample" not in (defaults.get("action") or {})):
+            raise ConfigError(
+                f"{where} '{_label(item)}' feedback 'sampled' requires 'feedback_sample'."
+            )
 
 
 def _check_qos_lease_and_history(cfg: dict[str, Any]) -> None:
@@ -341,7 +341,7 @@ def _check_command_qos(cfg: dict[str, Any]) -> None:
     전달 불가. 술어는 rules.command_qos_violation(resolver와 공유)."""
     profiles = cfg.get("qos_profiles") or {}
     default_cmd_qos = (cfg.get("defaults") or {}).get("topic_command", {}).get("qos")
-    for i, item in enumerate((cfg.get("bridge", {}).get("topics") or [])):
+    for i, item in enumerate(cfg.get("bridge", {}).get("topics") or []):
         if item.get("direction") != "command":
             continue
         eff = _effective_qos_dict(item.get("qos", default_cmd_qos), profiles)
@@ -411,7 +411,7 @@ def _fmt_errors(errors: Any, prefix: str = "") -> str:
                 walk(v, f"{path}.{k}" if path else str(k))
         elif isinstance(e, list):
             for item in e:
-                if isinstance(item, (dict, list)):
+                if isinstance(item, dict | list):
                     walk(item, path)
                 else:
                     lines.append(f"{path}: {item}")

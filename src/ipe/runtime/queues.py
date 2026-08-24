@@ -11,10 +11,11 @@ from __future__ import annotations
 import threading
 import time
 from collections import OrderedDict, deque
+from collections.abc import Hashable
 from queue import Empty
-from typing import Any, Hashable
+from typing import Any
 
-from ipe.core.vocab import (   # 정본은 vocab — 재export(기존 import 경로 호환)
+from ipe.core.vocab import (  # 정본은 vocab — 재export(기존 import 경로 호환)
     CLASS_OBSERVE_BULK,
     CLASS_OBSERVE_LATEST,
     CLASS_TERMINAL,

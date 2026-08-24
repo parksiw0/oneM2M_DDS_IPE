@@ -7,6 +7,7 @@ actionStatusEvent 페이로드로 되돌아갈 수 있게 한다. timeout_ms=0�
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import TYPE_CHECKING
 
 from ipe.core.vocab import (
@@ -25,7 +26,7 @@ class VocabularyError(ValueError):
     pass
 
 
-def _check(state: str, allowed: set[str], kind: str) -> None:
+def _check(state: str, allowed: Collection[str], kind: str) -> None:
     if state not in allowed:
         raise VocabularyError(f"invalid {kind} transaction state: {state!r}")
 
