@@ -59,11 +59,15 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
                                     control_maxsize=rec.get("control_lane_max", 64))
         self.outbound = OutboundQueue(maxsize=rec.get("outbound_max", 5000))
         self.routes = RouteTable()
+        self._routes_staging = threading.Event()
         self.protocol = rc.cse.protocol
         if self.protocol == "mqtt":
+            mqtt = rc.cse.mqtt
+            if mqtt is None:
+                raise ValueError("cse.mqtt is required when cse.protocol is mqtt")
             # tinyIoT는 POA URI 경로부를 NOTIFY 토픽으로 그대로 쓴다(aei 무관)
             self.poa_path = idify(rc.cse.ae_name)
-            self.poa = f"mqtt://{rc.cse.mqtt.host}:{rc.cse.mqtt.port}/{self.poa_path}"
+            self.poa = f"mqtt://{mqtt.host}:{mqtt.port}/{self.poa_path}"
         else:
             self.poa_path = ""
             self.poa = rc.cse.poa or f"http://127.0.0.1:{rc.notification_port}"
@@ -79,7 +83,10 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
 
         self.svc_tx = ServiceTransactionManager(self.state)
         self.act_tx = ActionTransactionManager(self.state)
-        self.cmd_mgr = CommandDispatchManager(self._publish_command)
+        self.cmd_mgr = CommandDispatchManager(
+            self._publish_command,
+            lambda spec, payload: self.adapter.validate_command(spec, payload),
+        )
 
         self.path_map: dict[tuple[str, str, str], str] = {}
         self.status_paths: dict[str, str] = {}
@@ -95,8 +102,14 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
         self._prov_jobs: queue.Queue = queue.Queue()
         self._shutdown = threading.Event()
         self._stop_worker = threading.Event()
+        self._spool_pending = threading.Event()
+        if self.state.spool_counts():
+            self._spool_pending.set()
+        self._cse_transport_down = False
         self._muted_pipeline: set[tuple[str, str]] = set()
         self._confirm_pending: dict[str, tuple[str, str, str]] = {}   # proposalId -> spec 키
+        self._approval_prompter: Any = None
+        self._approval_requests_emitted: set[str] = set()
         rate = float(rc.policy.get("max_total_write_hz", 0) or 0)
         # 0 = 무제한. BULK 전용(§9) — TERMINAL/LATEST 면제
         self._budget = TokenBucket(rate) if rate > 0 else None
@@ -109,6 +122,8 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
         # qos FCNT 게시 상태 (QoS_FCNT_설계서 §4.5.2)
         self._qos_fcnt_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._qos_fcnt_last_pub: dict[tuple[str, str, str], float] = {}
+        self._qos_fcnt_revision: dict[tuple[str, str, str], int] = {}
+        self._qos_resource_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._qos_lbl_only: set[tuple[str, str, str]] = set()   # FCNT 생성 실패 키
         self._qos_republish = threading.Event()   # CSE 재기동 → 전량 재게시
 
@@ -149,6 +164,8 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
 
             # S4: graph snapshot이 인터페이스 목록의 단일 권위다.
             resolved = resolve(rc.raw, discovered=discovered.snapshot)
+            self._apply_saved_control_approvals(resolved)
+            self._apply_saved_qos_overrides(resolved)
             self._defer_unloadable_types(resolved)
             self.rc = resolved
             self.provisioner.rc = resolved
@@ -166,8 +183,9 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
             self.prov_client.origin = self.aei
             self.provisioner.check_cse_identity()
             self.lifecycle.set(IPEState.PREPARING, IPEPhase.AE_REGISTERED)
-            result = self.provisioner.provision_all()
+            result = self._provision_staged()
             if not result.ok:
+                self._finish_route_staging()
                 raise RuntimeError(f"provisioning failed: {result.errors}")
             self.lifecycle.set(IPEState.PREPARING, IPEPhase.CSE_RESOURCES_PREPARED)
             for err in result.errors:
@@ -189,6 +207,7 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
             return self._abort_bootstrap()
 
         if getattr(self.args, "bootstrap_only", False):
+            self._finish_route_staging()
             log.info("bootstrap complete (--bootstrap-only)")
             self.lifecycle.set(IPEState.STOPPED, IPEPhase.IDLE)
             return self._abort_bootstrap(code=0)
@@ -196,7 +215,12 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
         # S8: staged CSE plan을 Pipeline에 주입한 뒤 ROS endpoint를 생성한다.
         self.path_map.update(result.path_map)
         large = rc.policy.get("suitability", {}).get("large_payload_bytes", 49152)
-        self.pipeline = Pipeline(rc.topics, self.path_map, large_payload_bytes=large)
+        self.pipeline = Pipeline(
+            rc.topics,
+            self.path_map,
+            large_payload_bytes=large,
+            cse_timezone=rc.cse.timezone,
+        )
         bufs = self.state.get_kv("anomaly_bufs")
         if bufs:
             self.pipeline.anomaly.restore(bufs)
@@ -261,16 +285,27 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
 
     def _binding_counts(self) -> dict[str, int]:
         return {
-            "topics": sum(1 for x in self.rc.topics if x.msg_type),
-            "services": sum(1 for x in self.rc.services if x.srv_type),
-            "actions": sum(1 for x in self.rc.actions if x.action_type),
+            "topics": sum(
+                1 for x in self.rc.topics
+                if x.msg_type and (
+                    x.direction in ("observe", "both") or x.access_enabled
+                )
+            ),
+            "services": sum(
+                1 for x in self.rc.services if x.srv_type and x.access_enabled
+            ),
+            "actions": sum(
+                1 for x in self.rc.actions if x.action_type and x.access_enabled
+            ),
         }
 
     def _defer_unloadable_types(self, rc: ResolvedConfig) -> None:
         """로컬 type support가 없는 항목은 실패시키지 않고 다음 세대로 defer."""
-        groups = ((rc.topics, "msg_type", "msg", "topic"),
-                  (rc.services, "srv_type", "srv", "service"),
-                  (rc.actions, "action_type", "action", "action"))
+        groups: tuple[tuple[Any, str, str, str], ...] = (
+            (rc.topics, "msg_type", "msg", "topic"),
+            (rc.services, "srv_type", "srv", "service"),
+            (rc.actions, "action_type", "action", "action"),
+        )
         previous = getattr(self, "_deferred_type_support", {})
         deferred: dict[tuple[str, str, str], dict[str, Any]] = {}
         available: set[tuple[str, str, str]] = set()
@@ -374,6 +409,8 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
         self.guard = self.node.create_guard_condition(self._drain_inbound)
 
     def _abort_bootstrap(self, code: int = 2) -> int:
+        self._finish_route_staging()
+        self._close_approval_prompt()
         server = getattr(self, "server", None)
         if server is not None:
             server.stop()
@@ -398,8 +435,11 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
         rc = self.rc
         if self.protocol == "mqtt":
             from ipe.onem2m.mqtt_listener import MQTTNotificationListener
+            mqtt = rc.cse.mqtt
+            if mqtt is None:
+                raise ValueError("cse.mqtt is required when cse.protocol is mqtt")
             return MQTTNotificationListener(
-                rc.cse.mqtt, rc.cse.cse_id, self.poa_path,
+                mqtt, rc.cse.cse_id, self.poa_path,
                 self._on_notify, self.routes.resolve_sur)
         return NotificationServer(rc.notification_host, rc.notification_port,
                                   on_notify=self._on_notify, diag_fn=self._diag)
@@ -437,6 +477,9 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
                     aliases[r["sub_ri"]] = path_key
         self.routes.replace(routes, aliases)
         self.catchup.replace(catchup_inputs)
+        finish_staging = getattr(self, "_finish_route_staging", None)
+        if finish_staging is not None:
+            finish_staging()
 
     def _bind_all(self) -> bool:
         ok = True
@@ -447,18 +490,18 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
                 else:
                     ok = False
             if t.direction in ("command", "both") and t.access_enabled and t.msg_type:
-                if self.adapter.bind_command(t):
+                if getattr(t, "confirm", "auto") == "on_first_use" or self.adapter.bind_command(t):
                     self.specs_by_key[("command", t.robot_id, t.interface)] = t
                 else:
                     ok = False
         for s in self.rc.services:
-            if s.srv_type:
+            if s.srv_type and s.access_enabled:
                 if self.adapter.bind_service(s):
                     self.specs_by_key[("service", s.robot_id, s.interface)] = s
                 else:
                     ok = False
         for a in self.rc.actions:
-            if a.action_type:
+            if a.action_type and a.access_enabled:
                 if self.adapter.bind_action(a):
                     self.specs_by_key[("action", a.robot_id, a.interface)] = a
                 else:
@@ -525,7 +568,8 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
                 self._spool_op(op)
         self._stop_worker.set()
         # 한 단계 실패가 나머지 정리를 막지 않게 단계별로 격리한다
-        for step in (lambda: self.state.set_kv("anomaly_bufs",
+        for step in (self._close_approval_prompt,
+                     lambda: self.state.set_kv("anomaly_bufs",
                                                self.pipeline.anomaly.snapshot()
                                                if self.pipeline else {}),
                      self.adapter.shutdown,
@@ -547,6 +591,11 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
         self.state.close()
         log.info("shutdown complete")
         return 0
+
+    def _close_approval_prompt(self) -> None:
+        if self._approval_prompter is not None:
+            self._approval_prompter.close()
+            self._approval_prompter = None
 
 
 

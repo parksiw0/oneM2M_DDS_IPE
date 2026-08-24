@@ -14,10 +14,7 @@ from typing import Any
 
 from ipe.onem2m.notification import Notification
 
-# kind -> CIN con 안의 상관 키. cancel은 goalId로 상관시키되 dedup은
-# (robot_id, goalId, event_id) 기준이다 — 그래서 모든 InboundEvent에
-# event_id가 실린다. qos_update는 CIN이 아니라 FCNT NOTIFY라 route()가
-# 특별 취급한다(멱등 키 = "sur:st=N", 설계서 §4.5.3).
+# A cancel targets goalId but uses the CIN event_id for admission deduplication.
 CORRELATION_FIELDS: dict[str, str] = {
     "command": "commandId",
     "service": "requestId",
@@ -25,6 +22,7 @@ CORRELATION_FIELDS: dict[str, str] = {
     "cancel": "goalId",
     "decision": "proposalId",
     "qos_update": "st",
+    "qos_policy": "requestId",
 }
 
 

@@ -11,25 +11,32 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from contextlib import contextmanager
-from typing import Any, Iterable, Iterator
-
-from ipe.runtime.queues import (
-    CLASS_OBSERVE_LATEST,
-    OUTBOUND_CLASSES,
-)
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager, suppress
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # 상태 어휘 (임의 문자열은 거부)
 # ---------------------------------------------------------------------------
-
 from ipe.core.vocab import (
     ACTION_STATES as ACTION_TX_STATES,
+)
+from ipe.core.vocab import (
     ACTION_TERMINAL as ACTION_TX_TERMINAL,
+)
+from ipe.core.vocab import (
     PROCESSED_ACTIVE_STATES,
     PROCESSED_TERMINAL_STATES,
+)
+from ipe.core.vocab import (
     SERVICE_STATES as SERVICE_TX_STATES,
+)
+from ipe.core.vocab import (
     SERVICE_TERMINAL as SERVICE_TX_TERMINAL,
+)
+from ipe.runtime.queues import (
+    CLASS_OBSERVE_LATEST,
+    OUTBOUND_CLASSES,
 )
 
 TRANSACTION_KINDS: dict[str, frozenset[str]] = {
@@ -90,6 +97,7 @@ class StatePersistence:
         self._local = threading.local()
         self._all_conns: list[sqlite3.Connection] = []
         self._conns_lock = threading.Lock()
+        self._shared: sqlite3.Connection | None
         if self._memory:
             self._shared = self._new_conn()
         else:
@@ -117,8 +125,11 @@ class StatePersistence:
         if self._closed:
             raise sqlite3.ProgrammingError("StatePersistence is closed")
         if self._memory:
+            shared = self._shared
+            if shared is None:
+                raise sqlite3.ProgrammingError("Shared in-memory connection is unavailable")
             with self._mem_lock:
-                yield self._shared  # type: ignore[misc]
+                yield shared
         else:
             conn = getattr(self._local, "conn", None)
             if conn is None:
@@ -500,12 +511,8 @@ class StatePersistence:
         with self._conns_lock:
             conns, self._all_conns = self._all_conns, []
         for conn in conns:
-            try:
+            with suppress(sqlite3.Error):
                 if not self._memory:
                     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except sqlite3.Error:
-                pass
-            try:
+            with suppress(sqlite3.Error):
                 conn.close()
-            except sqlite3.Error:
-                pass

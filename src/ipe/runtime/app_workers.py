@@ -14,6 +14,7 @@ from typing import Any
 from ipe.core.policy import Op
 from ipe.core.vocab import CLASS_TERMINAL
 from ipe.onem2m.client import OversizeError, TransportError, classify
+from ipe.runtime.context import RuntimeContext
 from ipe.runtime.dispatcher import InboundEvent
 from ipe.runtime.plan import PendingBindingPlan, append_spec, binding_map, set_spec
 
@@ -21,25 +22,60 @@ log = logging.getLogger(__name__)
 
 GOAL_STATUS_TO_REASON = {4: "succeeded", 5: "canceled", 6: "aborted"}
 
-class WorkersMixin:
+class WorkersMixin(RuntimeContext):
+    def _provision_staged(self) -> Any:
+        """Provision CSE routes while deferring notifications until activation."""
+        staging = getattr(self, "_routes_staging", None)
+        if staging is None:
+            return self.provisioner.provision_all()
+        staging.set()
+        try:
+            return self.provisioner.provision_all()
+        except Exception:
+            staging.clear()
+            raise
+
+    def _finish_route_staging(self) -> None:
+        staging = getattr(self, "_routes_staging", None)
+        if staging is not None:
+            staging.clear()
+
     def _spool_op(self, op: Op) -> None:
         import json as _json
         self.state.spool_put(op.queue_class, f"{op.robot_id}:{op.interface}:{op.view}",
                              _json.dumps({"kind": op.kind, "path": op.path,
-                                          "content": op.content, "rn": op.rn}),
+                                          "content": op.content, "rn": op.rn,
+                                          "et": op.et,
+                                          "expires_at": op.expires_at}),
                              time.time())
+        self._spool_pending.set()
+
+    def _mark_cse_unavailable(self) -> None:
+        self._cse_transport_down = True
+
+    def _mark_cse_available(self) -> bool:
+        if not self._cse_transport_down:
+            return False
+        self._cse_transport_down = False
+        self._prov_jobs.put(("recover", None))
+        return True
 
     def _outbound_worker(self) -> None:
         rec = self.rc.recovery
         retries = int(rec.get("retry_count", 3))
         base_ms = int(rec.get("retry_delay_ms", 500))
+        next_spool_attempt = 0.0
         while not self._stop_worker.is_set():
             # 유일한 CSE 쓰기 스레드 — 어떤 예외에도 죽지 않는다
             try:
+                now = time.monotonic()
+                if self._spool_pending.is_set() and now >= next_spool_attempt:
+                    self._spool_pending.clear()
+                    self._drain_spool()
+                    next_spool_attempt = time.monotonic() + max(0.5, base_ms / 1000.0)
                 try:
                     op = self.outbound.get(timeout=0.5)
                 except queue.Empty:
-                    self._drain_spool()
                     continue
                 self._send_with_retry(op, retries, base_ms)
             except Exception:
@@ -50,28 +86,42 @@ class WorkersMixin:
         delays = iter(backoff_delays(retries, base_ms))
         attempt = 0
         while True:
+            if op.expires_at is not None and time.time() >= op.expires_at:
+                return
             failure: Any = None
             try:
                 if op.kind == "update_fcnt":
                     fr = self.worker_ops.update_fcnt(op.path, op.content)
                     if fr.ok:
+                        self._mark_cse_available()
                         return
                     failure = fr
+                elif op.kind == "update_cnt":
+                    cr = self.worker_ops.update_cnt(op.path, op.content)
+                    if cr.ok:
+                        self._mark_cse_available()
+                        return
+                    failure = cr
                 elif op.kind == "update_lbl":
                     lr = self.worker_ops.update_lbl(op.path, op.content["labels"])
                     if lr.ok:
+                        self._mark_cse_available()
                         return
                     failure = lr
                 else:
                     r = self.worker_ops.create_cin(op.path, op.content,
-                                                   rn=getattr(op, "rn", None))
+                                                   rn=getattr(op, "rn", None),
+                                                   et=getattr(op, "et", None))
                     if r.created or r.duplicate:
+                        self._mark_cse_available()
                         return
                     failure = r.response
             except (TransportError, OversizeError) as e:
                 failure = e
             cls = classify(failure)
             if cls == "non_recoverable":
+                if not isinstance(failure, BaseException):
+                    self._mark_cse_available()
                 log.error("non-recoverable op dropped: %s (%s)", op.path, failure)
                 # §15.5: 무음 금지 — 4xx는 CSE 생존 상태이므로 이벤트 송신 가능
                 self.emit_event("ipeHealth", "error",
@@ -80,15 +130,16 @@ class WorkersMixin:
                                  "kind": op.kind})
                 return
             if cls == "policy_dependent":
-                self._prov_jobs.put(("reconcile", None))
+                if not self._mark_cse_available():
+                    self._prov_jobs.put(("reconcile", None))
                 if op.queue_class == CLASS_TERMINAL:
                     self._spool_op(op)
                 return
             attempt += 1
             if attempt > retries:
+                self._mark_cse_unavailable()
                 if op.queue_class == CLASS_TERMINAL:
                     self._spool_op(op)
-                self._prov_jobs.put(("catchup", "cse-recovered"))
                 return
             self._stop_worker.wait(next(delays) / 1000.0)
 
@@ -97,27 +148,50 @@ class WorkersMixin:
         for row in self.state.spool_list(limit=20):
             data = _json.loads(row["payload"])
             kind = data.get("kind", "create_cin")
+            if data.get("expires_at") is not None \
+                    and time.time() >= float(data["expires_at"]):
+                self.state.spool_delete([row["id"]])
+                continue
             try:
                 if kind == "update_fcnt":
                     r_ok = self.worker_ops.update_fcnt(data["path"], data["content"]).ok
+                elif kind == "update_cnt":
+                    r_ok = self.worker_ops.update_cnt(data["path"], data["content"]).ok
                 elif kind == "update_lbl":
                     r_ok = self.worker_ops.update_lbl(
                         data["path"], data["content"]["labels"]).ok
                 else:
                     r = self.worker_ops.create_cin(data["path"], data["content"],
-                                                   rn=data.get("rn"))
-                    if not (r.created or r.duplicate) and classify(r.response) == "non_recoverable":
-                        # poison row — 영구 실패 op가 드레인을 막으면 안 된다
-                        log.error("poison spool row %s dropped: %s", row["id"], data["path"])
-                        self.state.spool_delete([row["id"]])
-                        continue
+                                                   rn=data.get("rn"), et=data.get("et"))
+                    if not (r.created or r.duplicate):
+                        cls = classify(r.response)
+                        if cls == "non_recoverable":
+                            self._mark_cse_available()
+                            log.error("poison spool row %s dropped: %s", row["id"], data["path"])
+                            self.state.spool_delete([row["id"]])
+                            continue
+                        if cls == "policy_dependent":
+                            if not self._mark_cse_available():
+                                self._prov_jobs.put(("reconcile", None))
+                        else:
+                            self._mark_cse_unavailable()
                     r_ok = r.created or r.duplicate
-            except (TransportError, OversizeError):
-                return   # CSE 불가 — 다음 유휴 사이클에 재시도
+            except TransportError:
+                self._mark_cse_unavailable()
+                self._spool_pending.set()
+                return
+            except OversizeError:
+                log.error("poison spool row %s dropped: %s", row["id"], data["path"])
+                self.state.spool_delete([row["id"]])
+                continue
             if r_ok:
+                self._mark_cse_available()
                 self.state.spool_delete([row["id"]])
             else:
+                self._spool_pending.set()
                 return
+        if self.state.spool_list(limit=1):
+            self._spool_pending.set()
 
     # ------------------------------------------------------------------
     # 프로비저닝 워커
@@ -132,7 +206,7 @@ class WorkersMixin:
             try:
                 if job == "reconcile":
                     restarted = self.provisioner.check_cse_identity()
-                    self._absorb_provision(self.provisioner.provision_all())
+                    self._absorb_provision(self._provision_staged())
                     # 재프로비저닝 후 캐시 1회 무효화(§4.8.4) — 재생성된 qos
                     # FCNT가 CREATE 초기 속성만 든 채 캐시에 가려지는 것을 막는다.
                     # 게시는 executor 틱이 수행한다(스레드 소유권).
@@ -141,11 +215,17 @@ class WorkersMixin:
                         self.catchup.sweep("cse-restart")
                 elif job == "catchup":
                     self.catchup.sweep(str(arg or "manual"))
+                elif job == "recover":
+                    restarted = self.provisioner.check_cse_identity()
+                    self._absorb_provision(self._provision_staged())
+                    self._qos_republish.set()
+                    self.catchup.sweep("cse-restart" if restarted else "cse-recovered")
                 elif job == "reconcile_discovery":
                     self._reconcile_discovery(arg)
                 elif job == "remove_interfaces":
                     self._remove_interfaces(arg)
             except Exception:
+                self._finish_route_staging()
                 log.exception("provisioning job %s failed", job)
 
     @staticmethod
@@ -179,6 +259,12 @@ class WorkersMixin:
         except Exception as e:
             log.warning("discovery re-resolve failed: %s", e)
             return
+        apply_approvals = getattr(self, "_apply_saved_control_approvals", None)
+        if apply_approvals is not None:
+            apply_approvals(new_rc)
+        apply_qos = getattr(self, "_apply_saved_qos_overrides", None)
+        if apply_qos is not None:
+            apply_qos(new_rc)
         self._defer_unloadable_types(new_rc)
         self._churn_track(snap)
 
@@ -214,10 +300,11 @@ class WorkersMixin:
         previous = self.provisioner.rc
         self.provisioner.rc = new_rc
         try:
-            result = self.provisioner.provision_all()
+            result = self._provision_staged()
         finally:
             self.provisioner.rc = previous
         if not result.ok:
+            self._finish_route_staging()
             log.warning("staged discovery provisioning failed: %s", result.errors)
             return
 
@@ -232,6 +319,7 @@ class WorkersMixin:
                           correlation_id=None, event_id=f"plan:{time.time_ns()}",
                           payload=None, ct=None, spec=pending)
         if not self.inbound.put_control(ev):
+            self._finish_route_staging()
             log.error("control lane full: staged binding plan was not activated")
             return
         if self.guard is not None:

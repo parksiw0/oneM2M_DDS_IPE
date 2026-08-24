@@ -11,11 +11,13 @@ import time
 from typing import Any
 
 from ipe.config.spec import ActionSpec, ServiceSpec, TopicSpec
-from ipe.core.common import deep_merge as _deep_merge, project_top_level as _project
+from ipe.core.common import deep_merge as _deep_merge
+from ipe.core.common import project_top_level as _project
 from ipe.core.normalize import ct_to_epoch as _ct_to_epoch
 from ipe.core.policy import Op
 from ipe.core.vocab import CLASS_OBSERVE_BULK, CLASS_TERMINAL
 from ipe.onem2m.notification import Notification
+from ipe.runtime.context import RuntimeContext
 from ipe.runtime.dispatcher import InboundEvent
 from ipe.runtime.lifecycle import IPEHealth, IPEPhase, IPEState
 from ipe.runtime.plan import PendingBindingPlan
@@ -24,7 +26,9 @@ log = logging.getLogger(__name__)
 
 GOAL_STATUS_TO_REASON = {4: "succeeded", 5: "canceled", 6: "aborted"}
 
-class DispatchMixin:
+class DispatchMixin(RuntimeContext):
+    _approval_prompter: Any
+
     def _on_topic_ir(self, ir: Any) -> None:
         try:
             ops = self.pipeline.process(ir)
@@ -69,15 +73,20 @@ class DispatchMixin:
     def _admit(self, path_key: str, notif: Notification) -> str:
         ev = self.routes.route(path_key, notif)
         if ev is None:
+            staging = getattr(self, "_routes_staging", None)
+            if staging is not None and staging.is_set():
+                return "denied"
             self.emit_event("ipeHealth", "warning",
                             {"event": "unknownRoute", "path_key": path_key})
             return "invalid"
         if notif.cr is not None and notif.cr == self.aei:
             return "denied"   # 알림 루프 방지 불변식 (cr == 자기 aei)
-        # 결정(decision)은 같은 proposalId로 여러 번 온다(approve→revoke→…) —
-        # 멱등 키는 CIN ri, proposalId는 페이로드다
-        corr = (ev.event_id if ev.kind == "decision"
-                else ev.correlation_id or ev.event_id) or ""
+        if ev.kind == "decision":
+            corr = ev.event_id or ev.correlation_id or ""
+        elif ev.kind == "cancel":
+            corr = f"cancel:{ev.event_id or ev.correlation_id or ''}"
+        else:
+            corr = ev.correlation_id or ev.event_id or ""
         ev.dedup_corr = corr   # 드레인의 CAS가 반드시 같은 키를 봐야 한다
         now = time.time()
         verdict = self.state.admit(ev.robot_id, ev.interface, corr,
@@ -104,7 +113,8 @@ class DispatchMixin:
         return {"command": "commandStatus", "service": "serviceStatus",
                 "action_goal": "actionStatus", "cancel": "actionStatus",
                 "decision": "provisioningStatus",
-                "qos_update": "qosStatus"}.get(kind, "ipeHealth")
+                "qos_update": "qosStatus", "qos_policy": "qosStatus"}.get(
+                    kind, "ipeHealth")
 
     # ------------------------------------------------------------------
     # guard 드레인 (executor 스레드, 예산 제한)
@@ -144,6 +154,8 @@ class DispatchMixin:
             self._dispatch_decision(ev, corr)
         elif ev.kind == "qos_update":
             self._dispatch_qos_update(ev, corr)
+        elif ev.kind == "qos_policy":
+            self._dispatch_qos_policy(ev, corr)
         else:
             self.emit_event("ipeHealth", "warning",
                             {"event": "unhandledKind", "kind": ev.kind})
@@ -152,16 +164,23 @@ class DispatchMixin:
     def _bind_dynamic(self, ev: InboundEvent) -> None:
         spec = getattr(ev, "spec", None)
         if ev.kind == "_activate_plan" and isinstance(spec, PendingBindingPlan):
-            self._activate_plan(spec)
+            try:
+                self._activate_plan(spec)
+            except Exception:
+                self._end_route_staging()
+                raise
+            return
+        if ev.kind == "_control_approval":
+            self._apply_popup_control_decision(ev)
             return
         if ev.kind == "_bind_service" and isinstance(spec, ServiceSpec):
-            if self.adapter.bind_service(spec):
+            if spec.access_enabled and self.adapter.bind_service(spec):
                 key = ("service", spec.robot_id, spec.interface)
                 self.specs_by_key[key] = spec
                 self._publish_contract_for(key, spec)
             return
         if ev.kind == "_bind_action" and isinstance(spec, ActionSpec):
-            if self.adapter.bind_action(spec):
+            if spec.access_enabled and self.adapter.bind_action(spec):
                 key = ("action", spec.robot_id, spec.interface)
                 self.specs_by_key[key] = spec
                 self._publish_contract_for(key, spec)
@@ -173,11 +192,17 @@ class DispatchMixin:
                 # 등록하지 않으면 관측 IR이 조용히 버려진다
                 self.pipeline.add_spec(spec)
             if (spec.direction in ("command", "both") and spec.access_enabled
-                    and self.adapter.bind_command(spec)):
+                    and spec.confirm == "on_first_use") or (spec.direction in ("command", "both") and spec.access_enabled
+                  and self.adapter.bind_command(spec)):
                 key = ("command", spec.robot_id, spec.interface)
                 self.specs_by_key[key] = spec
                 self._publish_contract_for(key, spec)
             self._publish_qos_state(only_key=(spec.robot_id, spec.interface))
+
+    def _end_route_staging(self) -> None:
+        finish = getattr(self, "_finish_route_staging", None)
+        if finish is not None:
+            finish()
 
     def _activate_plan(self, pending: PendingBindingPlan) -> None:
         """S10 make-before-break: bind additions, swap generation, remove old."""
@@ -193,6 +218,7 @@ class DispatchMixin:
                     "activeGeneration": current_generation,
                 },
             )
+            self._end_route_staging()
             return
         staged: list[tuple[tuple[str, str, str], Any]] = []
         self.lifecycle.set(IPEState.RUNNING, IPEPhase.BINDING)
@@ -205,6 +231,7 @@ class DispatchMixin:
                     detail=f"binding rollback: {key}")
                 self.emit_event("provisioningStatus", "error",
                                 {"event": "bindingRollback", "binding": str(key)})
+                self._end_route_staging()
                 return
             staged.append((key, spec))
 
@@ -236,11 +263,15 @@ class DispatchMixin:
         kind = key[0]
         endpoint_key = (spec.robot_id, spec.interface)
         if kind == "service":
+            if not spec.access_enabled:
+                return True
             if not self.adapter.bind_service(spec):
                 return False
             self.specs_by_key[("service", *endpoint_key)] = spec
             return True
         if kind == "action":
+            if not spec.access_enabled:
+                return True
             if not self.adapter.bind_action(spec):
                 return False
             self.specs_by_key[("action", *endpoint_key)] = spec
@@ -254,13 +285,16 @@ class DispatchMixin:
             self.specs_by_key[("observe", *endpoint_key)] = spec
             self.pipeline.add_spec(spec)
         if spec.direction in ("command", "both") and spec.access_enabled:
-            if not self.adapter.bind_command(spec):
+            if spec.confirm == "on_first_use":
+                self.specs_by_key[("command", *endpoint_key)] = spec
+            elif not self.adapter.bind_command(spec):
                 if bound_observe:
                     self.adapter.unbind_observe(endpoint_key)
                     self.specs_by_key.pop(("observe", *endpoint_key), None)
                     self.pipeline.remove_spec(*endpoint_key)
                 return False
-            self.specs_by_key[("command", *endpoint_key)] = spec
+            else:
+                self.specs_by_key[("command", *endpoint_key)] = spec
         return True
 
     def _unbind_plan_spec(self, key: tuple[str, str, str], spec: Any) -> None:
@@ -282,7 +316,7 @@ class DispatchMixin:
     # --- command ------------------------------------------------------
 
     def _publish_command(self, spec: TopicSpec, payload: dict[str, Any]) -> bool:
-        return self.adapter.publish_command(spec, payload)
+        return bool(self.adapter.publish_command(spec, payload))
 
     def _dispatch_command(self, ev: InboundEvent, corr: str) -> None:
         spec = self.specs_by_key.get(("command", ev.robot_id, ev.interface))
@@ -302,21 +336,199 @@ class DispatchMixin:
             _ct_to_epoch(ev.ct, cse_timezone=self.rc.cse.timezone),
             getattr(ev, "ingest_monotonic", None) or time.monotonic(),
         )
-        status_path = self.path_map.get((ev.robot_id, ev.interface, "publishStatus"))
-        if status_path:
-            self._put_terminal(Op("create_cin", status_path,
-                                  {"commandId": corr, "status": outcome.status,
-                                   "detail": outcome.detail, "clamped": outcome.clamped},
-                                  ev.robot_id, ev.interface, "publishStatus",
-                                  CLASS_TERMINAL))
-        if not outcome.published:
-            self.emit_event("commandStatus", "warning",
-                            {"event": outcome.status, "interface": ev.interface,
-                             "robot": ev.robot_id, "commandId": corr,
-                             "detail": outcome.detail})
+        if outcome.status == "approvalRequired":
+            self._request_control_approval(spec, payload)
+        self.emit_event(
+            "commandStatus",
+            "info" if outcome.published else "warning",
+            {"event": outcome.status, "interface": ev.interface,
+             "robot": ev.robot_id, "commandId": corr,
+             "detail": outcome.detail, "clamped": outcome.clamped},
+        )
         terminal = {"published": "succeeded", "expired": "expired",
                     "accessDenied": "accessDenied"}.get(outcome.status, "rejected")
         self._finish(ev.robot_id, ev.interface, corr, terminal, time.time())
+
+    def _request_control_approval(
+        self,
+        spec: TopicSpec,
+        payload: dict[str, Any],
+    ) -> None:
+        from ipe.runtime.approval import (
+            ApprovalRequest,
+            DesktopApprovalPrompt,
+            command_preview,
+            control_approval_id,
+        )
+
+        if not spec.msg_type:
+            return
+        proposal_id = control_approval_id(
+            spec.robot_id,
+            spec.interface,
+            spec.msg_type,
+        )
+        key = ("command", spec.robot_id, spec.interface)
+        self._confirm_pending[proposal_id] = key
+        preview = command_preview(payload)
+        if proposal_id not in self._approval_requests_emitted:
+            self._approval_requests_emitted.add(proposal_id)
+            ae = f"/{self.rc.cse.cse_base}/{self.rc.cse.ae_name}"
+            self._put_terminal(Op(
+                "create_cin",
+                f"{ae}/config/pendingMappingProposal",
+                {
+                    "proposalId": proposal_id,
+                    "kind": "command",
+                    "robot": spec.robot_id,
+                    "interface": spec.interface,
+                    "type": spec.msg_type,
+                    "reason": "firstUseOfAmbiguousTopic",
+                    "commandPreview": preview,
+                },
+                spec.robot_id,
+                spec.interface,
+                "proposal",
+                CLASS_TERMINAL,
+                rn=f"pmp_{proposal_id}"[:60],
+            ))
+        if self._approval_prompter is None:
+            self._approval_prompter = DesktopApprovalPrompt(
+                self._enqueue_popup_control_decision
+            )
+        self._approval_prompter.request(ApprovalRequest(
+            proposal_id=proposal_id,
+            robot_id=spec.robot_id,
+            interface=spec.interface,
+            msg_type=spec.msg_type,
+            preview=preview,
+        ))
+
+    def _enqueue_popup_control_decision(self, request: Any, decision: str) -> None:
+        ev = InboundEvent(
+            kind="_control_approval",
+            robot_id=request.robot_id,
+            interface=request.interface,
+            correlation_id=request.proposal_id,
+            event_id=f"popup:{time.time_ns()}",
+            payload={"proposalId": request.proposal_id, "decision": decision},
+            ct=None,
+        )
+        if not self.inbound.put_control(ev):
+            log.error("control lane full: popup decision was not applied")
+            return
+        if self.guard is not None:
+            self.guard.trigger()
+
+    def _apply_popup_control_decision(self, ev: InboundEvent) -> None:
+        payload = ev.payload or {}
+        self._apply_control_decision(
+            str(payload.get("proposalId", "")),
+            str(payload.get("decision", "")),
+            source="popup",
+        )
+
+    @staticmethod
+    def _control_approval_record(spec: TopicSpec) -> dict[str, str]:
+        return {
+            "robot": spec.robot_id,
+            "interface": spec.interface,
+            "type": spec.msg_type or "",
+        }
+
+    def _apply_saved_control_approvals(self, rc: Any) -> None:
+        from ipe.runtime.approval import control_approval_id
+
+        saved = self.state.get_kv("control_approvals", {})
+        for spec in rc.topics:
+            if spec.direction != "both" or spec.confirm != "on_first_use" or not spec.msg_type:
+                continue
+            proposal_id = control_approval_id(
+                spec.robot_id,
+                spec.interface,
+                spec.msg_type,
+            )
+            if saved.get(proposal_id) == self._control_approval_record(spec):
+                spec.confirm = "auto"
+
+    def _persist_control_approval(self, proposal_id: str, spec: TopicSpec) -> None:
+        saved = self.state.get_kv("control_approvals", {})
+        saved[proposal_id] = self._control_approval_record(spec)
+        self.state.set_kv("control_approvals", saved)
+
+    def _remove_control_approval(self, proposal_id: str) -> None:
+        saved = self.state.get_kv("control_approvals", {})
+        if proposal_id in saved:
+            saved.pop(proposal_id)
+            self.state.set_kv("control_approvals", saved)
+
+    def _apply_control_decision(
+        self,
+        proposal_id: str,
+        decision: str,
+        *,
+        source: str,
+    ) -> bool:
+        key = self._confirm_pending.get(proposal_id)
+        if key is None:
+            self.emit_event(
+                "provisioningStatus",
+                "warning",
+                {"event": "unknownProposal", "proposalId": proposal_id},
+            )
+            return False
+        spec = self.specs_by_key.get(key)
+        if spec is None:
+            self.emit_event(
+                "provisioningStatus",
+                "warning",
+                {"event": "proposalNotBound", "proposalId": proposal_id},
+            )
+            return False
+        normalized = decision.lower()
+        if normalized == "approve":
+            if isinstance(spec, TopicSpec) and not self.adapter.bind_command(spec):
+                self.emit_event(
+                    "provisioningStatus",
+                    "error",
+                    {"event": "approvalBindFailed", "proposalId": proposal_id},
+                )
+                return False
+            spec.confirm = "auto"
+            if isinstance(spec, TopicSpec) and spec.direction == "both":
+                self._persist_control_approval(proposal_id, spec)
+            event = "approved"
+            severity = "info"
+        elif normalized == "revoke":
+            if isinstance(spec, TopicSpec) and spec.direction == "both":
+                self.adapter.unbind_command((spec.robot_id, spec.interface))
+                spec.confirm = "on_first_use"
+                self._remove_control_approval(proposal_id)
+            else:
+                spec.confirm = "required"
+            event = "revoked"
+            severity = "warning"
+        elif normalized in ("reject", "defer"):
+            event = "rejected" if normalized == "reject" else "deferred"
+            severity = "warning"
+        elif normalized == "unavailable":
+            event = "approvalPopupUnavailable"
+            severity = "warning"
+        else:
+            event = "invalidDecision"
+            severity = "warning"
+        self.emit_event(
+            "provisioningStatus",
+            severity,
+            {
+                "event": event,
+                "proposalId": proposal_id,
+                "interface": key[2],
+                "robot": key[1],
+                "source": source,
+            },
+        )
+        return normalized == "approve"
 
     # --- service ------------------------------------------------------
 
@@ -327,6 +539,10 @@ class DispatchMixin:
         if spec is None:
             self._service_event(ev, corr, "rejected", "notBound")
             self._finish(ev.robot_id, ev.interface, corr, "rejected", now)
+            return
+        if not spec.access_enabled:
+            self._service_event(ev, corr, "rejected", "accessDenied")
+            self._finish(ev.robot_id, ev.interface, corr, "accessDenied", now)
             return
         if spec.confirm == "required":
             self._service_event(ev, corr, "rejected", "pendingConfirmation")
@@ -381,16 +597,12 @@ class DispatchMixin:
         self.svc_tx.set_state(corr, "invoked", time.time())
 
     def _service_event(self, ev: InboundEvent, corr: str, status: str, detail: str) -> None:
-        path = self.path_map.get((ev.robot_id, ev.interface, "invocationStatus"))
-        if path:
-            self._put_terminal(Op("create_cin", path,
-                                  {"requestId": corr, "status": status, "detail": detail},
-                                  ev.robot_id, ev.interface, "invocationStatus",
-                                  CLASS_TERMINAL))
-        if status in ("timeout", "rejected", "failed"):
-            self.emit_event("serviceStatus", "warning",
-                            {"event": status, "interface": ev.interface,
-                             "robot": ev.robot_id, "requestId": corr, "detail": detail})
+        self.emit_event(
+            "serviceStatus",
+            "warning" if status in ("timeout", "rejected", "failed") else "info",
+            {"event": status, "interface": ev.interface,
+             "robot": ev.robot_id, "requestId": corr, "detail": detail},
+        )
 
     # --- action -------------------------------------------------------
 
@@ -401,6 +613,10 @@ class DispatchMixin:
         if spec is None:
             self._action_event(ev, corr, 0, "goalRejected", "notBound")
             self._finish(ev.robot_id, ev.interface, corr, "rejected", now)
+            return
+        if not spec.access_enabled:
+            self._action_event(ev, corr, 0, "goalRejected", "accessDenied")
+            self._finish(ev.robot_id, ev.interface, corr, "accessDenied", now)
             return
         if spec.confirm == "required":
             self._action_event(ev, corr, 0, "goalRejected", "pendingConfirmation")
@@ -495,6 +711,10 @@ class DispatchMixin:
         if spec is None:
             self._finish(ev.robot_id, ev.interface, corr, "rejected", now)
             return
+        if not spec.access_enabled:
+            self._action_event(ev, goal_id, 0, "cancelRejected", "accessDenied")
+            self._finish(ev.robot_id, ev.interface, corr, "accessDenied", now)
+            return
         verdict = self.adapter.cancel_goal(spec, goal_id)
         if verdict == "unknown":
             self._action_event(ev, goal_id, 0, "cancelRejected", "unknownGoal")
@@ -558,8 +778,120 @@ class DispatchMixin:
             return None, "liveliness MANUAL_BY_TOPIC requires cfLse (B8)"
         return cand, ""
 
-    def _dispatch_qos_update(self, ev: InboundEvent, corr: str) -> None:
+    def _apply_qos_candidate(
+        self,
+        spec: Any,
+        key: tuple[str, str],
+        direction: str,
+        candidate: Any,
+    ) -> tuple[bool, str, list[str]]:
+        """Validate, rebind, persist, and publish one topic-direction QoS change."""
         from ipe.config.rules import command_qos_violation
+
+        if direction == "command":
+            violation = command_qos_violation(
+                candidate.liveliness,
+                candidate.deadline_ms,
+            )
+            if violation:
+                return False, f"command qos violation: {violation} (§8.5)", []
+        ok, reasons = self.adapter.check_candidate(key, candidate, direction)
+        if not ok:
+            return False, f"predicted incompatible: {'; '.join(reasons)}", reasons
+        rebind = getattr(self.adapter, "rebind_direction", None)
+        rebound = (rebind(key, candidate, direction) if rebind is not None
+                   else self.adapter.rebind_interface(key, candidate))
+        if not rebound:
+            return False, "rebind failed and the previous endpoint was restored", reasons
+        self._persist_qos_override(key[0], key[1], direction, candidate)
+        cache_key = (key[0], key[1], direction)
+        self._qos_fcnt_cache.pop(cache_key, None)
+        self._qos_fcnt_last_pub.pop(cache_key, None)
+        self._qos_resource_cache.pop((key[0], key[1], "history"), None)
+        self._publish_qos_state(only_key=key)
+        return True, "", reasons
+
+    def _persist_qos_override(
+        self,
+        robot: str,
+        interface: str,
+        direction: str,
+        qos: Any,
+    ) -> None:
+        saved = self.state.get_kv("qos_overrides", {})
+        saved[f"{robot}|{direction}|{interface}"] = dict(qos.__dict__)
+        self.state.set_kv("qos_overrides", saved)
+
+    def _apply_saved_qos_overrides(self, rc: Any) -> None:
+        """Restore accepted topic QoS requests before DDS endpoints are created."""
+        from ipe.config.spec import QoSSpec
+
+        saved = self.state.get_kv("qos_overrides", {})
+        for spec in rc.topics:
+            for direction in ("observe", "command"):
+                if direction == "observe" and spec.direction not in ("observe", "both"):
+                    continue
+                if direction == "command" and spec.direction not in ("command", "both"):
+                    continue
+                value = saved.get(f"{spec.robot_id}|{direction}|{spec.interface}")
+                if not isinstance(value, dict):
+                    continue
+                try:
+                    spec.set_qos_for(direction, QoSSpec(**value))
+                except (TypeError, ValueError) as exc:
+                    log.warning("ignored invalid saved QoS override for %s: %s",
+                                spec.interface, exc)
+
+    @staticmethod
+    def _policy_changes_to_cf(changes: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+        from ipe.core.dds_qos import DDS_QOS_POLICY_NAMES
+
+        aliases = {
+            "RELIABILITY": "cfRlb",
+            "DURABILITY": "cfDrb",
+            "DEADLINE": "cfDdl",
+            "LIFESPAN": "cfLsp",
+        }
+        translated: dict[str, Any] = {}
+        for raw_name, value in changes.items():
+            name = str(raw_name).upper()
+            if name not in DDS_QOS_POLICY_NAMES:
+                return None, f"unknown DDS QoS policy: {raw_name}"
+            if name in aliases:
+                if isinstance(value, dict):
+                    value = value.get("durationMs", value.get("value"))
+                translated[aliases[name]] = value
+                continue
+            if name == "HISTORY":
+                if isinstance(value, str):
+                    translated["cfHst"] = value
+                elif isinstance(value, dict):
+                    translated["cfHst"] = value.get("kind")
+                    if "depth" in value:
+                        translated["cfDpt"] = value["depth"]
+                else:
+                    return None, "HISTORY must be a kind or an object"
+                continue
+            if name == "LIVELINESS":
+                if isinstance(value, str):
+                    translated["cfLiv"] = value
+                elif isinstance(value, dict):
+                    translated["cfLiv"] = value.get("kind")
+                    if "leaseDurationMs" in value:
+                        translated["cfLse"] = value["leaseDurationMs"]
+                else:
+                    return None, "LIVELINESS must be a kind or an object"
+                continue
+            return None, f"{name} is not changeable through the active ROS 2 RMW adapter"
+        if not translated:
+            return None, "changes must contain at least one supported policy"
+        if "cfHst" in translated and translated["cfHst"] is None:
+            return None, "HISTORY.kind is required"
+        if "cfLiv" in translated and translated["cfLiv"] is None:
+            return None, "LIVELINESS.kind is required"
+        return translated, ""
+
+    def _dispatch_qos_update(self, ev: InboundEvent, corr: str) -> None:
         now = time.time()
         direction = (ev.meta or {}).get("direction", "observe")
         key = (ev.robot_id, ev.interface)
@@ -582,37 +914,113 @@ class DispatchMixin:
         if not self.rc.qos_fcnt.allow_update or spec is None:
             _reject("qos update not allowed" if spec is not None else "notBound")
             return
-        candidate, why = self._parse_cf_update(payload, spec.qos)
+        base = spec.qos_for(direction)
+        candidate, why = self._parse_cf_update(payload, base)
         if candidate is None:
             _reject(why)
             return
-        if candidate == spec.qos:
+        if candidate == base:
             # 에코 가드: 자기 총함수 게시(또는 무변경 UPDATE)의 NOTIFY
             self._finish(ev.robot_id, ev.interface, corr, "succeeded", now)
             return
-        if direction == "command":
-            violation = command_qos_violation(candidate.liveliness,
-                                              candidate.deadline_ms)
-            if violation:
-                _reject(f"command qos violation: {violation} (§8.5)")
-                return
-        ok, reasons = self.adapter.check_candidate(key, candidate, direction)
+        ok, why, reasons = self._apply_qos_candidate(spec, key, direction, candidate)
         if not ok:
-            _reject(f"predicted incompatible: {'; '.join(reasons)}")
+            _reject(why)
             return
         if reasons:
             self.emit_event("qosStatus", "warning",
                             {"event": "predictedIncompatible", "interface": ev.interface,
                              "robot": ev.robot_id, "reasons": reasons})
-        if not self.adapter.rebind_interface(key, candidate):
-            _reject("rebind failed")
-            return
-        self._qos_fcnt_cache.pop((ev.robot_id, ev.interface, direction), None)
-        self._qos_fcnt_last_pub.pop((ev.robot_id, ev.interface, direction), None)
-        self._publish_qos_state(only_key=key)   # 새 cf*+ap* 총함수 게시 = CSE 수렴
         self.emit_event("qosStatus", "info",
                         {"event": "qosConfigUpdated", "interface": ev.interface,
                          "robot": ev.robot_id, "direction": direction})
+        self._finish(ev.robot_id, ev.interface, corr, "succeeded", now)
+
+    def _dispatch_qos_policy(self, ev: InboundEvent, corr: str) -> None:
+        now = time.time()
+        payload = ev.payload or {}
+        request_id = str(payload.get("requestId") or corr)
+        target = payload.get("target")
+
+        def reject(reason: str, *, robot: str = "-", interface: str = "") -> None:
+            self.emit_event("qosStatus", "warning", {
+                "event": "qosPolicyRejected",
+                "requestId": request_id,
+                "robot": robot,
+                "interface": interface,
+                "reason": reason,
+            })
+            self._finish(ev.robot_id, ev.interface, corr, "rejected", now)
+
+        if not isinstance(target, dict):
+            reject("target must be an object")
+            return
+        robot = str(target.get("robot", ""))
+        interface = str(target.get("interface", ""))
+        direction = str(target.get("direction", "observe")).lower()
+        interface_kind = str(target.get("kind", "topic")).lower()
+        if interface_kind != "topic":
+            reject("dynamic QoS updates are currently supported only for topic interfaces",
+                   robot=robot, interface=interface)
+            return
+        if direction not in ("observe", "command"):
+            reject("direction must be observe or command", robot=robot,
+                   interface=interface)
+            return
+        spec = self.specs_by_key.get((direction, robot, interface))
+        if spec is None:
+            reject("target topic direction is not bound", robot=robot, interface=interface)
+            return
+        changes = payload.get("changes")
+        if not isinstance(changes, dict):
+            reject("changes must be an object", robot=robot, interface=interface)
+            return
+        cache_key = (robot, interface, direction)
+        base_revision = payload.get("baseRevision")
+        if base_revision is not None:
+            if not isinstance(base_revision, int) or isinstance(base_revision, bool):
+                reject("baseRevision must be an integer", robot=robot, interface=interface)
+                return
+            current_revision = self._qos_fcnt_revision.get(cache_key, 0)
+            if base_revision != current_revision:
+                reject(f"stale baseRevision {base_revision}; current is {current_revision}",
+                       robot=robot, interface=interface)
+                return
+        translated, why = self._policy_changes_to_cf(changes)
+        if translated is None:
+            reject(why, robot=robot, interface=interface)
+            return
+        candidate, why = self._parse_cf_update(translated, spec.qos_for(direction))
+        if candidate is None:
+            reject(why, robot=robot, interface=interface)
+            return
+        if candidate == spec.qos_for(direction):
+            self.emit_event("qosStatus", "info", {
+                "event": "qosPolicyUnchanged",
+                "requestId": request_id,
+                "robot": robot,
+                "interface": interface,
+                "direction": direction,
+            })
+            self._finish(ev.robot_id, ev.interface, corr, "succeeded", now)
+            return
+        ok, why, warnings = self._apply_qos_candidate(
+            spec,
+            (robot, interface),
+            direction,
+            candidate,
+        )
+        if not ok:
+            reject(why, robot=robot, interface=interface)
+            return
+        self.emit_event("qosStatus", "info", {
+            "event": "qosPolicyApplied",
+            "requestId": request_id,
+            "robot": robot,
+            "interface": interface,
+            "direction": direction,
+            "warnings": warnings,
+        })
         self._finish(ev.robot_id, ev.interface, corr, "succeeded", now)
 
     # ------------------------------------------------------------------
@@ -625,39 +1033,16 @@ class DispatchMixin:
         payload = ev.payload or {}
         decision = str(payload.get("decision", "")).lower()
         pid = ev.correlation_id or payload.get("proposalId") or ""
-        key = self._confirm_pending.get(pid)
         now = time.time()
-        if key is None:
-            self.emit_event("provisioningStatus", "warning",
-                            {"event": "unknownProposal", "proposalId": pid})
-            self._finish(ev.robot_id, ev.interface, corr, "rejected", now)
-            return
-        if decision == "approve":
-            spec = self.specs_by_key.get(key)
-            if spec is not None:
-                spec.confirm = "auto"
-            # 제안 매핑은 유지한다 — 이후 revoke가 같은 proposalId로 철회할 수 있어야 함
-            self.emit_event("provisioningStatus", "info",
-                            {"event": "approved", "proposalId": pid,
-                             "interface": key[2], "robot": key[1]})
-        elif decision == "revoke":
-            # 승인 철회 — 게이트를 required 보류로 되돌리고 제안을 재등록(§5.4)
-            spec = self.specs_by_key.get(key)
-            if spec is not None:
-                spec.confirm = "required"
-            self._confirm_pending[pid] = key
-            self.emit_event("provisioningStatus", "warning",
-                            {"event": "revoked", "proposalId": pid,
-                             "interface": key[2], "robot": key[1]})
-        elif decision in ("reject", "defer"):
-            self.emit_event("provisioningStatus", "warning",
-                            {"event": decision + "ed", "proposalId": pid,
-                             "interface": key[2], "robot": key[1]})
-        else:
-            self.emit_event("provisioningStatus", "warning",
-                            {"event": "invalidDecision", "proposalId": corr,
-                             "decision": decision})
-        self._finish(ev.robot_id, ev.interface, corr, "succeeded", now)
+        applied = self._apply_control_decision(pid, decision, source="cse")
+        accepted = applied or decision in ("reject", "defer", "revoke")
+        self._finish(
+            ev.robot_id,
+            ev.interface,
+            corr,
+            "succeeded" if accepted else "rejected",
+            now,
+        )
 
     # ------------------------------------------------------------------
     # 계약 게시 (input_example, QoS 메타, 확인 제안)
@@ -665,7 +1050,7 @@ class DispatchMixin:
 
     def _finish(self, robot: str, iface: str, corr: str, terminal: str, ts: float) -> bool:
         self._inflight.get((robot, iface), set()).discard(corr)
-        return self.state.finish(robot, iface, corr, terminal, ts)
+        return bool(self.state.finish(robot, iface, corr, terminal, ts))
 
     def _anomaly_event(self, op: Any) -> None:
         # CIN 자체는 매번 가고(fast-path), 알림 이벤트만 인터페이스당 5s coalesce

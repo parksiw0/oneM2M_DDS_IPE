@@ -12,14 +12,14 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from ipe.core.common import TokenBucket, get_path, set_path
 from ipe.config.spec import TopicSpec
+from ipe.core.common import TokenBucket, get_path, set_path
 
 
 @dataclass
 class CommandOutcome:
     published: bool
-    status: str           # published | rejected | expired | rateLimited | accessDenied | error
+    status: str
     detail: str = ""
     clamped: dict[str, Any] = field(default_factory=dict)
 
@@ -33,8 +33,13 @@ class CommandOutcome:
 class CommandDispatchManager:
     """publish_fn(spec, payload) -> bool — 어댑터가 executor 스레드에서 소유하는 publish."""
 
-    def __init__(self, publish_fn: Callable[[TopicSpec, dict[str, Any]], bool]) -> None:
+    def __init__(
+        self,
+        publish_fn: Callable[[TopicSpec, dict[str, Any]], bool],
+        validate_fn: Callable[[TopicSpec, dict[str, Any]], None] | None = None,
+    ) -> None:
         self.publish_fn = publish_fn
+        self.validate_fn = validate_fn
         self._buckets: dict[tuple[str, str], TokenBucket] = {}
 
     def dispatch(
@@ -46,8 +51,6 @@ class CommandDispatchManager:
     ) -> CommandOutcome:
         if not spec.access_enabled:
             return CommandOutcome(False, "accessDenied", "access.enabled is false")
-        if spec.confirm == "required":
-            return CommandOutcome(False, "rejected", "pending confirmation (confirm: required)")
 
         safety = spec.command
         max_age_ms = safety.max_age_ms if safety else 5000
@@ -66,6 +69,20 @@ class CommandDispatchManager:
             if queued_ms > max_age_ms:
                 return CommandOutcome(False, "expired", f"queued {queued_ms:.0f}ms > {max_age_ms}ms")
 
+        if spec.confirm in ("required", "on_first_use"):
+            try:
+                if self.validate_fn is not None:
+                    self.validate_fn(spec, payload)
+            except Exception as e:
+                return CommandOutcome(False, "rejected", f"invalid command: {e}")
+            if spec.confirm == "on_first_use":
+                return CommandOutcome(
+                    False,
+                    "approvalRequired",
+                    "first use of an ambiguous topic requires approval",
+                )
+            return CommandOutcome(False, "rejected", "pending confirmation")
+
         if safety and safety.rate_limit_hz:
             key = (spec.robot_id, spec.interface)
             bucket = self._buckets.get(key)
@@ -79,7 +96,7 @@ class CommandDispatchManager:
         if safety and safety.clamp:
             for path, (lo, hi) in safety.clamp.items():
                 found, v = get_path(payload, path)
-                if found and isinstance(v, (int, float)) and not isinstance(v, bool):
+                if found and isinstance(v, int | float) and not isinstance(v, bool):
                     cv = min(max(float(v), lo), hi)
                     if cv != v:
                         set_path(payload, path, cv)

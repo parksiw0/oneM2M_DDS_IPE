@@ -10,15 +10,15 @@ import logging
 import time
 from typing import Any
 
-
 from ipe.core.policy import Op
 from ipe.core.vocab import CLASS_OBSERVE_BULK, CLASS_TERMINAL
+from ipe.runtime.context import RuntimeContext
 
 log = logging.getLogger(__name__)
 
 SEVERITY_ORDER = {"info": 0, "warning": 1, "error": 2}
 
-class OpsMixin:
+class OpsMixin(RuntimeContext):
     def _tick_1s(self) -> None:
         self.adapter.tick()
         # matched 콜백(Iron+)의 재조정 트리거 + CSE 재기동 후 전량 재게시
@@ -29,6 +29,7 @@ class OpsMixin:
             self._qos_republish.clear()
             self._qos_fcnt_cache.clear()
             self._qos_fcnt_last_pub.clear()
+            self._qos_resource_cache.clear()
             self._publish_qos_state()
         now = time.time()
         for corr in self.svc_tx.sweep_timeouts(now):
@@ -85,6 +86,11 @@ class OpsMixin:
     def _publish_contract_for(self, key: tuple[str, str, str], spec: Any) -> None:
         kind, robot, iface = key
         ae = f"/{self.rc.cse.cse_base}/{self.rc.cse.ae_name}"
+        if kind == "command" and spec.direction == "both" and spec.msg_type:
+            from ipe.runtime.approval import control_approval_id
+
+            proposal_id = control_approval_id(robot, iface, spec.msg_type)
+            self._confirm_pending[proposal_id] = key
         # 입력 계약 예시 — 외부 앱이 호출 형식을 참조한다(§3.3)
         if kind in ("command", "service", "action"):
             try:
@@ -124,6 +130,115 @@ class OpsMixin:
             return make_input_example(get_action(spec.action_type).Goal)
         return None
 
+    def _qos_mapping_targets(
+        self,
+        robot: str,
+        iface: str,
+        direction: str,
+        applied: Any,
+    ) -> dict[str, dict[str, Any]]:
+        """Resolve policy records to the actual oneM2M resource or IPE handler."""
+        targets: dict[str, dict[str, Any]] = {
+            "RELIABILITY": {
+                "handler": "ros2EndpointAndOneM2MRetry",
+                "result": "APPROXIMATED",
+            },
+            "DEADLINE": {
+                "handler": "ros2EndpointEvent",
+                "result": "APPLIED_AT_ROS2_ENDPOINT",
+            },
+            "LIVELINESS": {
+                "handler": "ros2EndpointEvent",
+                "result": "APPLIED_AT_ROS2_ENDPOINT",
+            },
+            "DURABILITY": {
+                "handler": "ros2EndpointAndCseRetention",
+                "result": "APPROXIMATED",
+            },
+        }
+        if direction != "observe":
+            targets["HISTORY"] = {
+                "result": "PRESERVED",
+                "reason": "DDS writer cache depth does not control command retention",
+            }
+            targets["LIFESPAN"] = {
+                "result": "PRESERVED",
+                "reason": "command freshness is enforced by the command safety gate",
+            }
+            return targets
+        history_path = self.path_map.get((robot, iface, "history"))
+        latest_path = self.path_map.get((robot, iface, "latest"))
+        state_path = self.path_map.get((robot, iface, "fcnt"))
+        if history_path and applied.history == "KEEP_LAST":
+            targets["HISTORY"] = {
+                "resource": history_path,
+                "attribute": "mni",
+                "value": applied.depth,
+                "result": "APPROXIMATED",
+            }
+        elif history_path:
+            targets["HISTORY"] = {
+                "resource": history_path,
+                "result": "APPROXIMATED",
+                "reason": "KEEP_ALL remains bounded by the CSE retention limit",
+            }
+        else:
+            targets["HISTORY"] = {
+                "resource": latest_path or state_path,
+                "result": "CONSTRAINED_BY_REPRESENTATION",
+                "reason": "the interface exposes only the latest value",
+            }
+        if applied.lifespan_ms is None:
+            targets["LIFESPAN"] = {"result": "NOT_CONFIGURED"}
+        elif history_path or latest_path:
+            targets["LIFESPAN"] = {
+                "resources": [path for path in (history_path, latest_path) if path],
+                "attribute": "contentInstance.et",
+                "result": "APPROXIMATED",
+            }
+        else:
+            targets["LIFESPAN"] = {
+                "resource": state_path,
+                "result": "UNSUPPORTED",
+                "reason": "a mutable data flexContainer has no per-sample expirationTime",
+            }
+        return targets
+
+    def _topic_data_refs(
+        self, robot: str, iface: str, direction: str
+    ) -> list[dict[str, str]]:
+        """Return the concrete oneM2M data resources managed by a topic QoS FCNT."""
+        views = (("latest", "history", "fcnt")
+                 if direction == "observe" else ("command",))
+        return [
+            {"role": view, "path": self.path_map[(robot, iface, view)]}
+            for view in views
+            if (robot, iface, view) in self.path_map
+        ]
+
+    def _apply_qos_resource_mapping(
+        self,
+        robot: str,
+        iface: str,
+        direction: str,
+        applied: Any,
+    ) -> None:
+        """Apply Category A attributes without treating the management FCNT as enforcement."""
+        if direction != "observe" or applied.history != "KEEP_LAST":
+            return
+        path = self.path_map.get((robot, iface, "history"))
+        if path is None:
+            return
+        attrs = {"mni": applied.depth}
+        key = (robot, iface, "history")
+        if self._qos_resource_cache.get(key) == attrs:
+            return
+        self._qos_resource_cache[key] = attrs
+        self.outbound.put(
+            Op("update_cnt", path, attrs, robot, iface, "historyQos", CLASS_TERMINAL),
+            CLASS_TERMINAL,
+        )
+
     def _publish_qos_state(self, only_key: tuple[str, str] | None = None) -> None:
         """qos FCNT 총함수 게시 (QoS_FCNT_설계서 §4.5.2).
 
@@ -142,6 +257,8 @@ class OpsMixin:
             view = "qosObserve" if direction == "observe" else "qosCommand"
             fcnt_path = self.path_map.get((robot, iface, view))
             applied = stt["applied"]
+            if applied is not None:
+                self._apply_qos_resource_mapping(robot, iface, direction, applied)
 
             # lbl 병행(Phase 1) — 기존 스킴 유지: observe 실효값 + qosResource 포인터
             if qf.lbl_compat and direction == "observe" and applied is not None:
@@ -167,18 +284,31 @@ class OpsMixin:
                 msg_type=getattr(spec, "msg_type", None),
                 smode=smode if direction == "observe" else None,
                 events=stt["events"], peers=stt["peers"][:qf.peers_max],
-                peer_count=len(stt["peers"]))
+                peer_count=len(stt["peers"]),
+                mapping_targets=self._qos_mapping_targets(
+                    robot, iface, direction, applied),
+                data_resource_refs=self._topic_data_refs(robot, iface, direction),
+                policy_source=("DEFAULT" if any(
+                    event in {"noPublisherFallback", "noSubscriberFallback"}
+                    for event in stt["events"]
+                ) else "ROS2_RMW"))
             ckey = (robot, iface, direction)
-            if self._qos_fcnt_cache.get(ckey) == rec:
+            previous = self._qos_fcnt_cache.get(ckey)
+            previous_body = ({key: value for key, value in previous.items() if key != "rev"}
+                             if previous else None)
+            if previous_body == rec:
                 continue
             last = self._qos_fcnt_last_pub.get(ckey)
             if last is not None and now - last < qf.publish_min_interval_ms / 1000.0:
                 continue   # 캐시 미갱신 — 다음 트리거가 재시도한다
+            revision = self._qos_fcnt_revision.get(ckey, 0) + 1
+            self._qos_fcnt_revision[ckey] = revision
+            rec["rev"] = revision
             self._qos_fcnt_cache[ckey] = rec
             self._qos_fcnt_last_pub[ckey] = now
             self.outbound.put(Op("update_fcnt", fcnt_path, {qf.type: rec},
-                                 robot, iface, view, CLASS_OBSERVE_BULK),
-                              CLASS_OBSERVE_BULK)
+                                 robot, iface, view, CLASS_TERMINAL),
+                              CLASS_TERMINAL)
 
     # ------------------------------------------------------------------
     # churn 상태기계 (§4.6) — 프로비저닝 워커 스레드에서 실행
@@ -216,7 +346,7 @@ class OpsMixin:
 
     def _mark_avail(self, robot: str, iface: str, available: bool) -> None:
         path = None
-        for view in ("history", "latest", "fcnt", "publishStatus", "response", "result"):
+        for view in ("history", "latest", "fcnt", "command", "request", "response", "result"):
             path = self.path_map.get((robot, iface, view))
             if path:
                 break
@@ -249,6 +379,7 @@ class OpsMixin:
             self._finish(robot, iface, corr, "failed", now)
 
     def _diag(self) -> dict[str, Any]:
+        anomaly = getattr(self.pipeline, "anomaly", None) if self.pipeline else None
         return {
             "aei": self.aei,
             "bound": {f"{k[0]}:{k[1]}:{k[2]}": True for k in self.specs_by_key},
@@ -258,8 +389,7 @@ class OpsMixin:
             "dropped": self.outbound.dropped_counters(),
             "spool": self.state.spool_counts(),
             "muted": [f"{r}:{i}" for r, i in self._muted_pipeline],
-            "anomaly_suppressed": dict(getattr(self.pipeline, "anomaly", None).suppressed
-                                       if self.pipeline else {}),
+            "anomaly_suppressed": dict(anomaly.suppressed if anomaly is not None else {}),
             "budget_dropped": self._budget_dropped,
             "pending_confirm": dict(self._confirm_pending),
             "availability": {f"{k[1]}:{k[2]}": v["state"] for k, v in self._avail.items()},
