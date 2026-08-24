@@ -119,32 +119,21 @@ def build_qos_profile(spec: QoSSpec):
 # ---------------------------------------------------------------------------
 
 def reconcile_observe(
-    offered: list[Any], configured: QoSSpec, has_explicit: bool
+    offered: list[Any], configured: QoSSpec, has_explicit: bool,
+    explicit_fields: frozenset[str] | set[str] | None = None,
 ) -> tuple[QoSSpec, list[str]]:
-    """제공된 발행자 QoS에 대해 축별 최약-호환 요청을 만든다.
-
-    - reliability/durability/liveliness: 제공값 중 최소 강도. ``has_explicit``이면
-      설정값도 풀에 합류해 명시적으로 더 약한 사용자 선택이 존중된다(명시적으로
-      더 강한 값은 이길 수 없다 — 매칭이 0이 된다).
-    - deadline/lease: max(제공값); 하나라도 Infinite/미설정이면 None. 설정된
-      duration은 여기서 보지 않는다 — 명시적인 더 엄격한 오버라이드는
-      strictness_guard 소관.
-    - history/depth(그리고 조정 표에 없는 lifespan): 항상 설정값 — 그래프
-      인트로스펙션은 history=UNKNOWN, depth=0을 보고한다(재구성이지 사본이 아님).
-    - 제공이 비면(로봇 미기동): 설정값 그대로 + 'noPublisherFallback';
-      호출자가 디스커버리 갱신 때 재평가한다.
-    """
+    """Derive a weak-compatible request while preserving explicit duration fields."""
     if not offered:
         return configured, ["noPublisherFallback"]
 
     events: list[str] = []
 
-    def weakest(axis: str, attr: str, configured_value: str) -> str:
+    def weakest(axis: str, attr: str, fallback: str) -> str:
         pool = _strengths(axis, [_policy_name(getattr(p, attr)) for p in offered])
         if has_explicit:
-            pool += _strengths(axis, [configured_value])
+            pool += _strengths(axis, [fallback])
         if not pool:
-            return configured_value
+            return fallback
         return min(pool)[1]
 
     reliability = weakest("reliability", "reliability", configured.reliability)
@@ -156,9 +145,16 @@ def reconcile_observe(
         # 이 이벤트가 유일한 가시성이다.
         events.append("latchedDowngraded")
 
-    deadline_ms = _max_or_none([duration_ms(p.deadline) for p in offered])
-    lease_ms = _max_or_none(
-        [duration_ms(p.liveliness_lease_duration) for p in offered]
+    fields = explicit_fields or frozenset()
+    deadline_ms = (
+        configured.deadline_ms
+        if "deadline_ms" in fields
+        else _max_or_none([duration_ms(p.deadline) for p in offered])
+    )
+    lease_ms = (
+        configured.liveliness_lease_duration_ms
+        if "liveliness_lease_duration_ms" in fields
+        else _max_or_none([duration_ms(p.liveliness_lease_duration) for p in offered])
     )
 
     spec = replace(
@@ -176,7 +172,18 @@ def _max_or_none(values: list[int | None]) -> int | None:
     """제공 duration들의 max; 미설정/무한(None)이 하나라도 있으면 None이 지배."""
     if any(v is None for v in values):
         return None
-    return max(values) if values else None
+    finite = [v for v in values if v is not None]
+    return max(finite) if finite else None
+
+
+def _replace_policy_name(spec: QoSSpec, field: str, value: str) -> QoSSpec:
+    if field == "reliability":
+        return replace(spec, reliability=value)
+    if field == "durability":
+        return replace(spec, durability=value)
+    if field == "liveliness":
+        return replace(spec, liveliness=value)
+    raise ValueError(f"unknown QoS policy field: {field}")
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +226,7 @@ def reconcile_command(
         have = getattr(spec, field)
         if have in STRENGTH[axis] and STRENGTH[axis][have] >= STRENGTH[axis][need]:
             continue
-        spec = replace(spec, **{field: need})
+        spec = _replace_policy_name(spec, field, need)
         events.append("qosUpgraded")
 
     if spec.durability == "TRANSIENT_LOCAL" and spec.lifespan_ms is None:
@@ -276,20 +283,7 @@ def check_compatible(pub_profile: Any, sub_profile: Any) -> tuple[bool, list[str
 def strictness_guard(
     spec: QoSSpec, offered: list[Any], mode: str
 ) -> tuple[QoSSpec, list[str]]:
-    """제공값보다 엄격한 observe 오버라이드(매칭 0의 원인)를 탐지한다.
-
-    구독 요청이 제공보다 엄격한 경우:
-    - deadline: spec은 유한한데 어떤 발행자가 Infinite를 제공하거나, 어떤
-      발행자의 제공 deadline보다 짧을 때(매칭된 발행자마다
-      req.period >= offered.period가 성립해야 함);
-    - lease: liveliness_lease_duration에 같은 규칙;
-    - liveliness: spec의 kind가 제공된 가장 약한 kind보다 강할 때.
-
-    ``mode='reject'``: spec을 그대로 반환; 이벤트가 비어 있지 않으면 호출자가
-    설정을 거부해야 한다. ``mode='demote'``: 위반 축을 제공값 중 최약-호환으로
-    강등해 반환하고, 같은 이벤트를 qosStatus 보고용으로 돌려준다. *offered*가
-    비면 비교 대상이 없으므로 (spec, []).
-    """
+    """Reject or demote observe requests that are stricter than any publisher offer."""
     if mode not in ("reject", "demote"):
         raise ValueError(f"strictness mode must be 'reject' or 'demote', got {mode!r}")
     if not offered:
@@ -297,6 +291,25 @@ def strictness_guard(
 
     events: list[str] = []
     demoted = spec
+
+    strict_events = {
+        "reliability": "strictReliability",
+        "durability": "strictDurability",
+        "liveliness": "strictLiveliness",
+    }
+    for axis, attr in (
+        ("reliability", "reliability"),
+        ("durability", "durability"),
+        ("liveliness", "liveliness"),
+    ):
+        pool = _strengths(axis, [_policy_name(getattr(p, attr)) for p in offered])
+        requested = getattr(spec, attr)
+        if not pool or requested not in STRENGTH[axis]:
+            continue
+        weakest = min(pool)[1]
+        if STRENGTH[axis][requested] > STRENGTH[axis][weakest]:
+            events.append(strict_events[axis])
+            demoted = _replace_policy_name(demoted, attr, weakest)
 
     offered_deadlines = [duration_ms(p.deadline) for p in offered]
     if spec.deadline_ms is not None and any(
@@ -313,15 +326,6 @@ def strictness_guard(
         demoted = replace(
             demoted, liveliness_lease_duration_ms=_max_or_none(offered_leases)
         )
-
-    pool = _strengths(
-        "liveliness", [_policy_name(p.liveliness) for p in offered]
-    )
-    if pool and spec.liveliness in STRENGTH["liveliness"]:
-        floor = min(pool)[1]
-        if STRENGTH["liveliness"][spec.liveliness] > STRENGTH["liveliness"][floor]:
-            events.append("strictLiveliness")
-            demoted = replace(demoted, liveliness=floor)
 
     return (demoted if mode == "demote" else spec), events
 
@@ -397,6 +401,11 @@ def spec_to_fcnt_attrs(
     events: list[str] | None = None,
     peers: list[dict[str, Any]] | None = None,
     peer_count: int | None = None,
+    interface_kind: str = "topic",
+    mapping_targets: dict[str, dict[str, Any]] | None = None,
+    native_policies: dict[str, Any] | None = None,
+    policy_source: str = "ROS2_RMW",
+    data_resource_refs: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """총함수 FCNT 레코드 합성 — 부분 레코드를 만들 수 없는 유일한 API.
 
@@ -405,9 +414,12 @@ def spec_to_fcnt_attrs(
     있으면(=바인딩 후 게시) ap*·evts·peers·pcnt·dvAxs를 빈 값이라도 실어
     한번 쓴 속성이 생략으로 유실되는 일이 없게 한다.
     """
+    from ipe.core.dds_qos import compact_policy_groups
+
     rec: dict[str, Any] = {
         "dir": direction, "iface": interface, "robot": robot_id,
-        "sver": QOS_FCNT_SVER,
+        "sver": QOS_FCNT_SVER, "mver": "2", "ikind": interface_kind,
+        "drefs": list(data_resource_refs or []),
     }
     if msg_type:
         rec["rtype"] = msg_type
@@ -423,6 +435,67 @@ def spec_to_fcnt_attrs(
         rec["peers"] = ps
         rec["pcnt"] = peer_count if peer_count is not None else len(ps)
         rec["dvAxs"] = divergent_axes(ps)
+    groups = compact_policy_groups(
+        configured,
+        applied,
+        source=policy_source,
+        native_policies=native_policies,
+        mapping_overrides=mapping_targets,
+    )
+    rec.update(groups)
+    return rec
+
+
+def interface_qos_fcnt_attrs(
+    *,
+    interface_kind: str,
+    interface: str,
+    robot_id: str,
+    channels: dict[str, QoSSpec | None],
+    msg_type: str | None = None,
+    data_resource_refs: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Build one management snapshot for a logical service or action interface."""
+    from ipe.core.dds_qos import DDS_QOS_POLICY_NAMES, rmw_policy_values
+
+    records: dict[str, Any] = {}
+    for channel, profile in channels.items():
+        records[channel] = {
+            "configured": rmw_policy_values(profile) if profile is not None else None,
+            "source": "CONFIGURED" if profile is not None else "ROS2_DEFAULT",
+        }
+    rec: dict[str, Any] = {
+        "sver": QOS_FCNT_SVER,
+        "mver": "2",
+        "ikind": interface_kind,
+        "iface": interface,
+        "robot": robot_id,
+        "channels": records,
+        "drefs": list(data_resource_refs or []),
+        "resourceMappings": {
+            "LIFESPAN": {"target": "drefs", "result": "NOT_APPLIED_TO_ONEM2M"},
+            "HISTORY": {"target": "drefs", "result": "NOT_APPLIED_TO_ONEM2M"},
+            "RESOURCE_LIMITS": {
+                "target": "drefs",
+                "result": "DDS_VALUE_UNAVAILABLE",
+            },
+        },
+        "behaviorStatus": {
+            name: {
+                "source": "channels",
+                "result": "APPLIED_AT_ROS2_ENDPOINT",
+            }
+            for name in ("RELIABILITY", "DEADLINE", "LIVELINESS", "DURABILITY")
+        },
+        "ddsQoSProperties": {},
+        "unavailablePolicies": [
+            name for name in DDS_QOS_POLICY_NAMES
+            if name not in {"RELIABILITY", "DURABILITY", "HISTORY", "DEADLINE",
+                            "LIFESPAN", "LIVELINESS"}
+        ],
+    }
+    if msg_type:
+        rec["rtype"] = msg_type
     return rec
 
 

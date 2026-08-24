@@ -78,7 +78,10 @@ COMMAND_SAFETY_SCHEMA: dict[str, Any] = {
 # cerberus default 금지(모듈 docstring 참고) — 기본값은 resolver가 적용
 ACCESS_SCHEMA: dict[str, Any] = {
     "enabled": {"type": "boolean"},
-    "confirm": {"type": "string", "allowed": ["auto", "required"]},
+    "confirm": {
+        "type": "string",
+        "allowed": ["auto", "required", "on_first_use"],
+    },
 }
 
 SOURCE_TS_SCHEMA: dict[str, Any] = {
@@ -417,6 +420,12 @@ CONFIG_SCHEMA: dict[str, Any] = {
             "type": {"type": "string", "empty": False, "default": "ros:tqos"},
             "cnd": {"type": "string", "empty": False,
                     "default": "kr.ac.sejong.seslab.ros2.moduleclass.topicQos"},
+            "service_type": {"type": "string", "empty": False, "default": "ros:sqos"},
+            "service_cnd": {"type": "string", "empty": False,
+                            "default": "kr.ac.sejong.seslab.ros2.moduleclass.serviceQos"},
+            "action_type": {"type": "string", "empty": False, "default": "ros:aqos"},
+            "action_cnd": {"type": "string", "empty": False,
+                           "default": "kr.ac.sejong.seslab.ros2.moduleclass.actionQos"},
             "lbl_compat": {"type": "boolean", "default": True},
             "allow_update": {"type": "boolean", "default": False},
             "publish_min_interval_ms": {"type": "integer", "min": 0, "default": 5000},

@@ -66,6 +66,7 @@ _BUILTIN_SENSOR_DATA = QoSSpec(
 _DISCOVERY_REPRESENTATION = "latest"
 _BUILTIN_FEEDBACK_SAMPLE_MS = 500
 _DEFAULT_STALE_AFTER_MS = 5000
+_STATIC_LATCHED_TOPICS = frozenset({"robot_description", "tf_static"})
 
 # 내장 deny: 숨김 인터페이스('_'로 시작하는 세그먼트 — */_action/* 내부 포함)와
 # 노드별 파라미터 서비스 6종. 모드와 무관하게 주입되며 명시적 `name` 항목은
@@ -113,6 +114,19 @@ def _resolve_qos(value: Any, profiles: dict[str, QoSSpec], missing: QoSSpec) -> 
         base = profiles[base_name] if base_name else QoSSpec()
         return base.merged(value)
     raise ResolveError(f"qos must be a profile name or a map, got {type(value).__name__}")
+
+
+def _explicit_qos_fields(value: Any) -> frozenset[str]:
+    """Return QoS fields explicitly supplied by a topic rule or profile reference."""
+    if isinstance(value, str):
+        return frozenset(QoSSpec.__dataclass_fields__) - {"profile"}
+    if isinstance(value, dict):
+        fields = {key for key in value if key in QoSSpec.__dataclass_fields__}
+        if value.get("profile"):
+            fields.update(QoSSpec.__dataclass_fields__)
+        fields.discard("profile")
+        return frozenset(fields)
+    return frozenset()
 
 
 def _action_qos(value: Any, profiles: dict[str, QoSSpec], interface: str) -> dict[str, QoSSpec]:
@@ -503,6 +517,14 @@ def resolve(config: dict[str, Any], discovered: Discovered | None = None) -> Res
         enabled=bool(qf.get("enabled", True)),
         type=qf.get("type", "ros:tqos"),
         cnd=qf.get("cnd", "kr.ac.sejong.seslab.ros2.moduleclass.topicQos"),
+        service_type=qf.get("service_type", "ros:sqos"),
+        service_cnd=qf.get(
+            "service_cnd", "kr.ac.sejong.seslab.ros2.moduleclass.serviceQos"
+        ),
+        action_type=qf.get("action_type", "ros:aqos"),
+        action_cnd=qf.get(
+            "action_cnd", "kr.ac.sejong.seslab.ros2.moduleclass.actionQos"
+        ),
         lbl_compat=bool(qf.get("lbl_compat", True)),
         allow_update=bool(qf.get("allow_update", False)),
         publish_min_interval_ms=int(qf.get("publish_min_interval_ms", 5000)),
@@ -596,8 +618,8 @@ def _resolve_topics(rules, discovered, ctx: _Ctx) -> list[TopicSpec]:
 
     def dblock(fields: dict[str, Any]) -> dict[str, Any]:
         direction = fields.get("direction", "observe")
-        observe = ctx.defaults.get("topic_observe", {})
-        command = ctx.defaults.get("topic_command", {})
+        observe = dict(ctx.defaults.get("topic_observe", {}))
+        command = dict(ctx.defaults.get("topic_command", {}))
         if direction == "command":
             return command
         if direction == "both":
@@ -623,15 +645,25 @@ def _resolve_topics(rules, discovered, ctx: _Ctx) -> list[TopicSpec]:
         direction = merged.get("direction", "observe")
         representation = merged.get("representation", _DISCOVERY_REPRESENTATION)
 
-        # Observable topics use a weak-compatible sensor baseline.
+        raw_qos = merged.get("qos")
+        observe_base = ctx.profiles.get("sensor_data", _BUILTIN_SENSOR_DATA)
+        command_base = QoSSpec()
         if direction == "command":
-            missing = QoSSpec()
+            qos = _resolve_qos(raw_qos, ctx.profiles, command_base)
+            command_qos = None
         else:
-            missing = ctx.profiles.get("sensor_data", _BUILTIN_SENSOR_DATA)
-        qos = _resolve_qos(merged.get("qos"), ctx.profiles, missing)
+            qos = _resolve_qos(raw_qos, ctx.profiles, observe_base)
+            command_qos = (
+                _resolve_qos(raw_qos, ctx.profiles, command_base)
+                if direction == "both" and raw_qos is not None
+                else command_base if direction == "both" else None
+            )
 
         if direction in ("command", "both"):
-            violation = command_qos_violation(qos.liveliness, qos.deadline_ms)
+            command_effective = command_qos or qos
+            violation = command_qos_violation(
+                command_effective.liveliness, command_effective.deadline_ms
+            )
             if violation:
                 raise ResolveError(command_qos_resolve_message(violation, interface))
         if direction in ("observe", "both") and qos.lifespan_ms is not None:
@@ -642,11 +674,15 @@ def _resolve_topics(rules, discovered, ctx: _Ctx) -> list[TopicSpec]:
             )
 
         stale = merged.get("stale_after_ms")
-        if stale is None and direction in ("observe", "both"):
+        topic_leaf = interface.rsplit("/", 1)[-1]
+        if (stale is None and direction in ("observe", "both")
+                and topic_leaf not in _STATIC_LATCHED_TOPICS):
             stale = qos.deadline_ms * 2 if qos.deadline_ms else _DEFAULT_STALE_AFTER_MS
 
         mtype, source_rule = _type_and_source(merged, types, src)
         enabled, confirm = _access(merged, ctx.default_confirm)
+        if src == "discovery-default" and direction == "both" and confirm == "auto":
+            confirm = "on_first_use"
         out.append(TopicSpec(
             robot_id=robot.id,
             interface=interface,
@@ -654,6 +690,9 @@ def _resolve_topics(rules, discovered, ctx: _Ctx) -> list[TopicSpec]:
             direction=direction,
             representation=representation,
             qos=qos,
+            qos_explicit="qos" in merged,
+            qos_explicit_fields=_explicit_qos_fields(raw_qos),
+            command_qos=command_qos,
             sample=_sample(merged.get("sample")),
             filter=merged.get("filter"),
             selected_fields=merged.get("selected_fields"),
@@ -765,13 +804,15 @@ def _check_collisions(
     for t in topics:
         who = f"{t.interface} (robot={t.robot_id})"
         # "/qos" 뷰는 qos FCNT 자리(QoS_FCNT_설계서 §4.4) — 사용자 경로의 선점을 조기 검출
-        views = (("", "/latest", "/history", "/qos")
+        views = (("", "/last", "/hist", "/state", "/qos")
                  if t.representation == "both" else ("", "/qos"))
         if t.direction in ("observe", "both"):
-            chk(t.robot_id, "ros2Data", t.rel_path, who, views)
+            chk(t.robot_id, "topics/observe", t.rel_path, who, views)
         if t.direction in ("command", "both"):
-            chk(t.robot_id, "ros2Command", t.rel_path, who, ("", "/qos"))
+            chk(t.robot_id, "topics/command", t.rel_path, who, ("", "/qos"))
     for s in services:
-        chk(s.robot_id, "services", s.rel_path, f"{s.interface} (robot={s.robot_id})")
+        chk(s.robot_id, "services", s.rel_path, f"{s.interface} (robot={s.robot_id})",
+            ("", "/qos"))
     for a in actions:
-        chk(a.robot_id, "actions", a.rel_path, f"{a.interface} (robot={a.robot_id})")
+        chk(a.robot_id, "actions", a.rel_path, f"{a.interface} (robot={a.robot_id})",
+            ("", "/qos"))

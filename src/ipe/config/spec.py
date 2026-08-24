@@ -109,6 +109,9 @@ class TopicSpec:
     direction: Direction
     representation: Representation
     qos: QoSSpec
+    qos_explicit: bool = False
+    qos_explicit_fields: frozenset[str] = field(default_factory=frozenset)
+    command_qos: QoSSpec | None = None
     sample: SampleSpec | None = None
     filter: dict[str, Any] | None = None
     selected_fields: list[str] | None = None
@@ -123,6 +126,19 @@ class TopicSpec:
     access_enabled: bool = False
     confirm: str = "auto"
     source_rule: str = ""                # --explain용 (어느 규칙이 이겼는지)
+
+    def qos_for(self, direction: str) -> QoSSpec:
+        """Return the configured QoS baseline for one topic direction."""
+        if direction == "command" and self.command_qos is not None:
+            return self.command_qos
+        return self.qos
+
+    def set_qos_for(self, direction: str, qos: QoSSpec) -> None:
+        """Replace one direction's configured QoS baseline."""
+        if direction == "command" and self.direction == "both":
+            self.command_qos = qos
+        else:
+            self.qos = qos
 
 
 @dataclass
@@ -178,10 +194,22 @@ class QosFcntSpec:
     enabled: bool = True
     type: str = "ros:tqos"
     cnd: str = "kr.ac.sejong.seslab.ros2.moduleclass.topicQos"
+    service_type: str = "ros:sqos"
+    service_cnd: str = "kr.ac.sejong.seslab.ros2.moduleclass.serviceQos"
+    action_type: str = "ros:aqos"
+    action_cnd: str = "kr.ac.sejong.seslab.ros2.moduleclass.actionQos"
     lbl_compat: bool = True
     allow_update: bool = False
     publish_min_interval_ms: int = 5000
     peers_max: int = 8
+
+    def specialization(self, interface_kind: str) -> tuple[str, str]:
+        """Return the FCNT specialization for one ROS interface kind."""
+        if interface_kind == "service":
+            return self.service_type, self.service_cnd
+        if interface_kind == "action":
+            return self.action_type, self.action_cnd
+        return self.type, self.cnd
 
 
 @dataclass(frozen=True)

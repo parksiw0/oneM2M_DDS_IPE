@@ -12,7 +12,8 @@ from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from ipe.core.common import get_path, set_path as _set_path
+from ipe.core.common import get_path
+from ipe.core.common import set_path as _set_path
 from ipe.ir import TopicIR
 
 
@@ -54,9 +55,14 @@ def ct_to_epoch(
     return max(past)
 
 
-def epoch_to_onem2m_ts(epoch: float) -> str:
-    """epoch 초 -> oneM2M 타임스탬프(UTC, ms 정밀도)."""
-    dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+def epoch_to_onem2m_ts(epoch: float, timestamp_timezone: str = "UTC") -> str:
+    """Format an epoch as a millisecond oneM2M timestamp in the selected timezone."""
+    if timestamp_timezone == "local":
+        dt = datetime.fromtimestamp(epoch).astimezone()
+    elif timestamp_timezone == "UTC":
+        dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    else:
+        dt = datetime.fromtimestamp(epoch, tz=ZoneInfo(timestamp_timezone))
     millis = dt.microsecond // 1000
     return f"{dt.strftime('%Y%m%dT%H%M%S')},{millis:03d}"
 
@@ -69,7 +75,7 @@ def sanitize_value(v: Any) -> Any:
     """
     if isinstance(v, float) and not math.isfinite(v):
         return None
-    if isinstance(v, (list, tuple)):
+    if isinstance(v, list | tuple):
         return [sanitize_value(x) for x in v]
     if isinstance(v, dict):
         return {k: sanitize_value(val) for k, val in v.items()}

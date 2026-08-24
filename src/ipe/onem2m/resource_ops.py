@@ -123,6 +123,8 @@ class ResourceOps:
         parent: str,
         name: str,
         mni: int | None = None,
+        mbs: int | None = None,
+        mia: int | None = None,
         lbl: list[str] | None = None,
     ) -> str:
         """컨테이너 생성 또는 스킵. mni는 주어질 때만 본문에 넣는다
@@ -130,6 +132,10 @@ class ResourceOps:
         attrs: dict[str, Any] = {"rn": name}
         if mni is not None:
             attrs["mni"] = mni
+        if mbs is not None:
+            attrs["mbs"] = mbs
+        if mia is not None:
+            attrs["mia"] = mia
         if lbl is not None:
             attrs["lbl"] = lbl
         r = self.client.create(parent, TY_CNT, {"m2m:cnt": attrs})
@@ -156,6 +162,12 @@ class ResourceOps:
     def update_fcnt(self, path: str, content: dict[str, Any]) -> OneM2MResponse:
         return self.client.update(path, content)
 
+    def update_cnt(self, path: str, attrs: dict[str, Any]) -> OneM2MResponse:
+        allowed = {key: attrs[key] for key in ("mni", "mbs", "mia") if key in attrs}
+        if not allowed:
+            raise ValueError("CNT update requires at least one of mni, mbs, or mia")
+        return self.client.update(path, {"m2m:cnt": allowed})
+
     # -- CIN -----------------------------------------------------------------
 
     def create_cin(
@@ -164,6 +176,7 @@ class ResourceOps:
         con: dict[str, Any],
         rn: str | None = None,
         lbl: list[str] | None = None,
+        et: str | None = None,
     ) -> CinResult:
         """contentInstance CREATE. con은 JSON 문자열로 직렬화한다
         (tinyIoT는 문자열 con에만 cs를 계산).
@@ -177,6 +190,8 @@ class ResourceOps:
             attrs["rn"] = rn
         if lbl is not None:
             attrs["lbl"] = lbl
+        if et is not None:
+            attrs["et"] = et
         r = self.client.create(parent, TY_CIN, {"m2m:cin": attrs})
         if r.status == 201:
             return CinResult(created=True, duplicate=False, response=r)

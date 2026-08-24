@@ -17,11 +17,13 @@ import json
 import logging
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
 
 from ipe.adapter.transform import extract_source_ts, parse_message
-from ipe.config.spec import ACTION_QOS_CHANNELS, ActionSpec, ServiceSpec, TopicSpec
+from ipe.config.rules import command_qos_violation
+from ipe.config.spec import ACTION_QOS_CHANNELS, ActionSpec, QoSSpec, ServiceSpec, TopicSpec
 from ipe.core import qos as qosmod
 from ipe.core.transcode import TranscodeError, from_canonical
 from ipe.ir import TopicIR
@@ -139,6 +141,16 @@ class GenericROS2Adapter:
         self._qos_dirty_last: dict[tuple[str, str], float] = {}
         self._unsupported_event_axes_reported: set[tuple[str, str]] = set()
 
+    def _remote_endpoint_infos(self, infos: list[Any]) -> list[Any]:
+        """Exclude this IPE node's endpoints from peer QoS reconciliation."""
+        try:
+            own = (self.node.get_name(), self.node.get_namespace())
+        except Exception:
+            return list(infos)
+        return [info for info in infos if (
+            getattr(info, "node_name", None), getattr(info, "node_namespace", None)
+        ) != own]
+
     @staticmethod
     def type_available(kind: str, type_str: str | None) -> bool:
         if not type_str:
@@ -214,7 +226,12 @@ class GenericROS2Adapter:
             remote_nodes = []
         graph_namespaces = sorted({node_ns for _node_name, node_ns in remote_nodes
                                    if usable_namespace(node_ns)})
-        graph_namespace = graph_namespaces[0] if len(graph_namespaces) == 1 else None
+        has_root_nodes = any(node_ns == "/" for _node_name, node_ns in remote_nodes)
+        graph_namespace = (
+            graph_namespaces[0]
+            if len(graph_namespaces) == 1 and not has_root_nodes
+            else None
+        )
 
         topics: list[tuple[str, list[str]]] = []
         topic_directions: dict[str, str] = {}
@@ -238,9 +255,7 @@ class GenericROS2Adapter:
             namespaces = {getattr(x, "node_namespace", "")
                           for x in (*publishers, *subscriptions)}
             owners = sorted(x for x in namespaces if usable_namespace(x))
-            # 일부 RMW는 endpoint info의 node namespace를 UNKNOWN으로 주지만
-            # node graph에는 올바른 namespace를 제공한다. 전체 원격 graph에서
-            # 하나의 namespace만 명확할 때에만 안전하게 보완한다.
+            # Use a graph-wide fallback only when every remote node is namespaced.
             if not owners and graph_namespace:
                 owners = [graph_namespace]
             topic_owners[name] = owners
@@ -314,14 +329,19 @@ class GenericROS2Adapter:
         key = (spec.robot_id, spec.interface)
         if key in self.observes:
             return True
+        if not spec.msg_type:
+            return False
         msg_class = self._load_or_report("msg", spec.msg_type, spec)
         if msg_class is None:
             return False
 
-        infos = self.node.get_publishers_info_by_topic(spec.interface)
+        infos = self._remote_endpoint_infos(
+            self.node.get_publishers_info_by_topic(spec.interface)
+        )
         offered = [i.qos_profile for i in infos]
-        resolved, events = qosmod.reconcile_observe(offered, spec.qos,
-                                                    has_explicit=True)
+        resolved, events = qosmod.reconcile_observe(offered, spec.qos_for("observe"),
+                                                    has_explicit=spec.qos_explicit,
+                                                    explicit_fields=spec.qos_explicit_fields)
         # observe에서 offered보다 엄격한 deadline/lease/liveliness는 매칭을 0으로 만든다
         guarded, strict_events = qosmod.strictness_guard(resolved, offered,
                                                          self.qos_strictness)
@@ -374,15 +394,18 @@ class GenericROS2Adapter:
 
     def _refresh_observe(self, key: tuple[str, str]) -> bool:
         st = self.observes[key]
-        infos = self.node.get_publishers_info_by_topic(st.spec.interface)
+        infos = self._remote_endpoint_infos(
+            self.node.get_publishers_info_by_topic(st.spec.interface)
+        )
         peers = [qosmod.endpoint_to_peer(i, "pub") for i in infos]
         changed = peers != st.offered_peers
         st.offered_peers = peers
         if not infos:
             return changed   # publisher 부재는 변화가 아니다 — fallback 유지
         offered = [i.qos_profile for i in infos]
-        new_spec, events = qosmod.reconcile_observe(offered, st.spec.qos,
-                                                    has_explicit=True)
+        new_spec, events = qosmod.reconcile_observe(offered, st.spec.qos_for("observe"),
+                                                    has_explicit=st.spec.qos_explicit,
+                                                    explicit_fields=st.spec.qos_explicit_fields)
         # applied_qos는 가드 적용 후 값 — 같은 기준으로 비교해야 demote 강등
         # 토픽이 offered 불변인데도 폴마다 rebind를 반복하지 않는다
         guarded_new, strict_events = qosmod.strictness_guard(new_spec, offered,
@@ -404,14 +427,29 @@ class GenericROS2Adapter:
 
     def _refresh_command(self, key: tuple[str, str]) -> bool:
         st = self.commands[key]
-        infos = self.node.get_subscriptions_info_by_topic(st.spec.interface)
+        infos = self._remote_endpoint_infos(
+            self.node.get_subscriptions_info_by_topic(st.spec.interface)
+        )
         peers = [qosmod.endpoint_to_peer(i, "sub") for i in infos]
         changed = peers != st.requested_peers
         st.requested_peers = peers
         if not infos:
             return changed   # subscriber 부재 — fallback 유지
         new_spec, events = qosmod.reconcile_command(
-            [i.qos_profile for i in infos], st.spec.qos)
+            [i.qos_profile for i in infos], st.spec.qos_for("command"))
+        violation = command_qos_violation(new_spec.liveliness, new_spec.deadline_ms)
+        if violation:
+            marker = f"unsupportedRequested{violation.title()}"
+            ev_all = list(dict.fromkeys([*events, marker]))
+            if ev_all != st.events:
+                st.events = ev_all
+                self._event(
+                    "commandStatus", "error",
+                    {"event": "unsupportedRequestedQoS", "interface": st.spec.interface,
+                     "robot": st.spec.robot_id, "policy": violation},
+                )
+                changed = True
+            return changed
         if new_spec == st.applied_qos:
             ev_all = list(dict.fromkeys(events))
             if ev_all != st.events:
@@ -431,10 +469,14 @@ class GenericROS2Adapter:
         check_compatible. (False, 이유)=거부, (True, 이유)=수락(+경고)."""
         iface = key[1]
         if direction == "observe":
-            offered = [i.qos_profile for i in
-                       self.node.get_publishers_info_by_topic(iface)]
+            offered = [i.qos_profile for i in self._remote_endpoint_infos(
+                self.node.get_publishers_info_by_topic(iface)
+            )]
             resolved, _ = qosmod.reconcile_observe(offered, candidate,
-                                                   has_explicit=True)
+                                                   has_explicit=True,
+                                                   explicit_fields=frozenset(
+                                                       QoSSpec.__dataclass_fields__
+                                                   ) - {"profile"})
             guarded, strict = qosmod.strictness_guard(resolved, offered,
                                                       self.qos_strictness)
             if strict and self.qos_strictness == "reject":
@@ -442,9 +484,13 @@ class GenericROS2Adapter:
             profile = qosmod.build_qos_profile(guarded)
             pairs = [(o, profile) for o in offered]
         else:
-            requested = [i.qos_profile for i in
-                         self.node.get_subscriptions_info_by_topic(iface)]
+            requested = [i.qos_profile for i in self._remote_endpoint_infos(
+                self.node.get_subscriptions_info_by_topic(iface)
+            )]
             resolved, _ = qosmod.reconcile_command(requested, candidate)
+            violation = command_qos_violation(resolved.liveliness, resolved.deadline_ms)
+            if violation:
+                return False, [f"unsupported command QoS requested: {violation}"]
             profile = qosmod.build_qos_profile(resolved)
             pairs = [(profile, r) for r in requested]
         warnings: list[str] = []
@@ -455,37 +501,60 @@ class GenericROS2Adapter:
             warnings.extend(reasons)
         return True, list(dict.fromkeys(warnings))
 
-    def rebind_interface(self, key: tuple[str, str], new_qos: Any) -> bool:
-        """qos_update 수락 경로(§4.5.3) — 설정 QoS 교체 후 단건 재바인딩.
-        observe는 seq를 보존한다. direction=both면 양방향 모두 재생성."""
-        ok = True
-        ost = self.observes.get(key)
-        if ost is not None:
-            ost.spec.qos = new_qos
+    def rebind_direction(self, key: tuple[str, str], new_qos: Any,
+                         direction: str) -> bool:
+        """Rebind only the endpoint direction whose configured QoS changed."""
+        if direction == "observe":
+            ost = self.observes.get(key)
+            if ost is None:
+                return False
+            old_qos = ost.spec.qos_for("observe")
+            ost.spec.set_qos_for("observe", new_qos)
             seq = ost.seq
             self.unbind_observe(key)
             if self.bind_observe(ost.spec):
                 self.observes[key].seq = seq
-            else:
-                ok = False
+                return True
+            ost.spec.set_qos_for("observe", old_qos)
+            if self.bind_observe(ost.spec):
+                self.observes[key].seq = seq
+            return False
         cst = self.commands.get(key)
-        if cst is not None:
-            cst.spec.qos = new_qos
-            self.unbind_command(key)
-            ok = self.bind_command(cst.spec) and ok
-        return ok
+        if cst is None:
+            return False
+        old_qos = cst.spec.qos_for("command")
+        cst.spec.set_qos_for("command", new_qos)
+        self.unbind_command(key)
+        if self.bind_command(cst.spec):
+            return True
+        cst.spec.set_qos_for("command", old_qos)
+        self.bind_command(cst.spec)
+        return False
+
+    def rebind_interface(self, key: tuple[str, str], new_qos: Any) -> bool:
+        """Rebind every existing direction for legacy callers."""
+        directions = [name for name, states in (
+            ("observe", self.observes), ("command", self.commands)
+        ) if key in states]
+        return bool(directions) and all(
+            self.rebind_direction(key, new_qos, direction) for direction in directions
+        )
 
     def qos_states(self) -> list[dict[str, Any]]:
         """게시 입력 QoSStateIR 스냅숏 — 방향별 1건 (direction=both는 2건)."""
         out: list[dict[str, Any]] = []
-        for (robot, iface), st in self.observes.items():
+        for (robot, iface), observe_state in self.observes.items():
             out.append({"robot_id": robot, "interface": iface, "direction": "observe",
-                        "configured": st.spec.qos, "applied": st.applied_qos,
-                        "peers": list(st.offered_peers), "events": list(st.events)})
-        for (robot, iface), st in self.commands.items():
+                        "configured": observe_state.spec.qos_for("observe"),
+                        "applied": observe_state.applied_qos,
+                        "peers": list(observe_state.offered_peers),
+                        "events": list(observe_state.events)})
+        for (robot, iface), command_state in self.commands.items():
             out.append({"robot_id": robot, "interface": iface, "direction": "command",
-                        "configured": st.spec.qos, "applied": st.applied_qos,
-                        "peers": list(st.requested_peers), "events": list(st.events)})
+                        "configured": command_state.spec.qos_for("command"),
+                        "applied": command_state.applied_qos,
+                        "peers": list(command_state.requested_peers),
+                        "events": list(command_state.events)})
         return out
 
     def pop_qos_dirty(self) -> set[tuple[str, str]]:
@@ -618,13 +687,25 @@ class GenericROS2Adapter:
         key = (spec.robot_id, spec.interface)
         if key in self.commands:
             return True
+        if not spec.msg_type:
+            return False
         msg_class = self._load_or_report("msg", spec.msg_type, spec)
         if msg_class is None:
             return False
 
-        infos = self.node.get_subscriptions_info_by_topic(spec.interface)
+        infos = self._remote_endpoint_infos(
+            self.node.get_subscriptions_info_by_topic(spec.interface)
+        )
         requested = [i.qos_profile for i in infos]
-        resolved, events = qosmod.reconcile_command(requested, spec.qos)
+        resolved, events = qosmod.reconcile_command(requested, spec.qos_for("command"))
+        violation = command_qos_violation(resolved.liveliness, resolved.deadline_ms)
+        if violation:
+            self._event(
+                "commandStatus", "error",
+                {"event": "unsupportedRequestedQoS", "interface": spec.interface,
+                 "robot": spec.robot_id, "policy": violation},
+            )
+            return False
         for ev in events:
             severity = "info" if ev == "noSubscriberFallback" else "warning"
             self._event("qosStatus", severity,
@@ -689,6 +770,14 @@ class GenericROS2Adapter:
             st.recent_hashes.append((self._payload_hash(parse_message(msg)), now))
         return True
 
+    def validate_command(self, spec: TopicSpec, canonical: dict[str, Any]) -> None:
+        """Validate a command payload without creating or publishing a ROS message."""
+        from rosidl_runtime_py.utilities import get_message
+
+        if not spec.msg_type:
+            raise TranscodeError("", "message type is unavailable")
+        from_canonical(canonical, get_message(spec.msg_type))
+
     # ------------------------------------------------------------------
     # service
     # ------------------------------------------------------------------
@@ -703,6 +792,8 @@ class GenericROS2Adapter:
         key = (spec.robot_id, spec.interface)
         if key in self.services:
             return True
+        if not spec.srv_type:
+            return False
         srv_class = self._load_or_report("srv", spec.srv_type, spec)
         if srv_class is None:
             return False
@@ -763,6 +854,8 @@ class GenericROS2Adapter:
         key = (spec.robot_id, spec.interface)
         if key in self.actions:
             return True
+        if not spec.action_type:
+            return False
         action_class = self._load_or_report("action", spec.action_type, spec)
         if action_class is None:
             return False
@@ -880,41 +973,46 @@ class GenericROS2Adapter:
 
     def tick(self) -> None:
         now = time.monotonic()
-        for st in self.observes.values():
-            thr = st.spec.stale_after_ms
-            if not thr or st.stale_flagged or st.last_arrival_mono is None:
+        for observe_state in self.observes.values():
+            thr = observe_state.spec.stale_after_ms
+            if (not thr or observe_state.stale_flagged
+                    or observe_state.last_arrival_mono is None):
                 continue
-            if (now - st.last_arrival_mono) * 1000.0 > thr:
-                st.stale_flagged = True
+            if (now - observe_state.last_arrival_mono) * 1000.0 > thr:
+                observe_state.stale_flagged = True
                 self._event("topicHealth", "warning",
-                            {"event": "staleTopic", "interface": st.spec.interface,
-                             "robot": st.spec.robot_id, "stale_after_ms": thr})
-        for st in self.commands.values():
-            safety = st.spec.command
-            if not safety or not safety.watchdog_ms or st.last_publish_mono is None:
+                            {"event": "staleTopic",
+                             "interface": observe_state.spec.interface,
+                             "robot": observe_state.spec.robot_id,
+                             "stale_after_ms": thr})
+        for command_state in self.commands.values():
+            safety = command_state.spec.command
+            if (not safety or not safety.watchdog_ms
+                    or command_state.last_publish_mono is None):
                 continue
-            if st.watchdog_fired:
+            if command_state.watchdog_fired:
                 continue
-            if (now - st.last_publish_mono) * 1000.0 > safety.watchdog_ms:
-                st.watchdog_fired = True
+            if (now - command_state.last_publish_mono) * 1000.0 > safety.watchdog_ms:
+                command_state.watchdog_fired = True
                 try:
-                    st.publisher.publish(st.msg_class())   # 0값/정지 페이로드
+                    command_state.publisher.publish(command_state.msg_class())
                     self._event("commandStatus", "warning",
-                                {"event": "watchdogStop", "interface": st.spec.interface,
-                                 "robot": st.spec.robot_id})
+                                {"event": "watchdogStop",
+                                 "interface": command_state.spec.interface,
+                                 "robot": command_state.spec.robot_id})
                 except Exception as e:
                     self._event("commandStatus", "error",
-                                {"event": "watchdogStopFailed", "interface": st.spec.interface,
-                                 "robot": st.spec.robot_id, "error": str(e)})
+                                {"event": "watchdogStopFailed",
+                                 "interface": command_state.spec.interface,
+                                 "robot": command_state.spec.robot_id,
+                                 "error": str(e)})
 
     def publish_safety_stops(self) -> None:
         """종료 2단계: 워치독이 걸린 모든 커맨드에 정지 페이로드 발행."""
         for st in self.commands.values():
             if st.spec.command and st.spec.command.watchdog_ms:
-                try:
+                with suppress(Exception):
                     st.publisher.publish(st.msg_class())
-                except Exception:
-                    pass
 
     # ------------------------------------------------------------------
 
@@ -935,14 +1033,14 @@ class GenericROS2Adapter:
     def shutdown(self) -> None:
         for key in list(self.observes):
             self.unbind_observe(key)
-        for st in self.commands.values():
-            self.node.destroy_publisher(st.publisher)
+        for command_state in self.commands.values():
+            self.node.destroy_publisher(command_state.publisher)
         self.commands.clear()
         for entry in self.services.values():
             self.node.destroy_client(entry["client"])
         self.services.clear()
-        for st in self.actions.values():
-            st.client.destroy()
+        for action_state in self.actions.values():
+            action_state.client.destroy()
         self.actions.clear()
 
 

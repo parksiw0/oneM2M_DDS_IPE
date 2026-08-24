@@ -16,7 +16,7 @@ from ipe.config.spec import TopicSpec
 from ipe.core.anomaly import AnomalyGate
 from ipe.core.common import MinIntervalGate
 from ipe.core.filter import DeltaFilter, WindowAggregator
-from ipe.core.normalize import normalize_ir
+from ipe.core.normalize import epoch_to_onem2m_ts, normalize_ir
 from ipe.core.payload import (
     build_cin_content,
     build_fcnt_attrs,
@@ -28,7 +28,11 @@ from ipe.core.payload import (
 # 의존하지 않게 하기 위함. 값은 runtime 쪽 클래스 이름과 일치해야 한다.
 from ipe.core.vocab import (
     CLASS_OBSERVE_BULK as QUEUE_OBSERVE_BULK,
+)
+from ipe.core.vocab import (
     CLASS_OBSERVE_LATEST as QUEUE_OBSERVE_LATEST,
+)
+from ipe.core.vocab import (
     CLASS_TERMINAL as QUEUE_TERMINAL,
 )
 from ipe.ir import TopicIR
@@ -59,6 +63,8 @@ class Op:
     oversized: bool = False      # 참조 콘텐츠로 강등됐으면 True
     rn: str | None = None        # 결정적 resourceName(멱등 게시) — 없으면 CSE 생성
     anomalous: bool = False      # escalate된 이상값 — 호출자가 이벤트를 낸다(§7.4)
+    et: str | None = None
+    expires_at: float | None = None
 
 
 SamplingGate = MinIntervalGate   # 샘플링 = 키별 최소 간격 게이트의 별칭
@@ -76,12 +82,14 @@ class Pipeline:
         topics: Iterable[TopicSpec],
         path_map: dict[tuple[str, str, str], str],
         large_payload_bytes: int = DEFAULT_LARGE_PAYLOAD_BYTES,
+        cse_timezone: str = "UTC",
     ) -> None:
         self._specs: dict[tuple[str, str], TopicSpec] = {
             (t.robot_id, t.interface): t for t in topics
         }
         self.path_map = path_map
         self.large_payload_bytes = large_payload_bytes
+        self.cse_timezone = cse_timezone
         self.sampler = SamplingGate()
         self.delta = DeltaFilter()
         self.window = WindowAggregator()
@@ -132,6 +140,11 @@ class Pipeline:
             content["anomaly"] = {"detector": flt.get("detector", "isolation_forest"),
                                   "score": round(a_score, 4), "isAnomaly": anomalous}
         content, oversized = self._guard_size(content)
+        lifespan_ms = spec.qos_for("observe").lifespan_ms
+        expires_at = (ir["ingest_ts"] + lifespan_ms / 1000.0
+                      if lifespan_ms is not None else None)
+        expiration_time = (epoch_to_onem2m_ts(expires_at, self.cse_timezone)
+                           if expires_at is not None else None)
 
         ops: list[Op] = []
         for view in VIEWS_BY_REPRESENTATION[spec.representation]:
@@ -169,6 +182,8 @@ class Pipeline:
                     queue_class=queue_class,
                     oversized=oversized,
                     anomalous=escalated,
+                    et=expiration_time,
+                    expires_at=expires_at,
                 )
             )
         return ops
