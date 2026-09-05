@@ -55,7 +55,12 @@ measurements/
 tests/
 tools/
 
+# Generated experiment results and plots
+/performance_results/
+/performance_graphs/
+
 # Runtime state
 *.db
 *.db-shm
 *.db-wal
+.ipe-postgres-password
