@@ -230,7 +230,7 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
 
         if getattr(self.args, "bootstrap_only", False):
             self._finish_route_staging()
-            log.info("bootstrap complete (--bootstrap-only)")
+            log.info("bootstrap complete (RUN_MODE=bootstrap)")
             self.lifecycle.set(IPEState.STOPPED, IPEPhase.IDLE)
             return self._abort_bootstrap(code=0)
 

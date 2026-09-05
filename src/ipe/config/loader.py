@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import copy
 import logging
-import os
-import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator
 from typing import Any, cast
 
 from cerberus import Validator
@@ -29,9 +27,15 @@ class ConfigError(Exception):
     pass
 
 
-def validate_config(raw: dict[str, Any], env: Mapping[str, str] | None = None) -> dict[str, Any]:
+def load_config() -> dict[str, Any]:
+    """Validate the settings declared in the project's config.py."""
+    import config as settings
+
+    return validate_config(settings.CONFIG)
+
+
+def validate_config(raw: dict[str, Any]) -> dict[str, Any]:
     cfg = copy.deepcopy(raw)
-    cfg = _substitute_env(cfg, os.environ if env is None else env)
     _normalize_qos_case(cfg)
 
     v = Validator(CONFIG_SCHEMA, purge_unknown=False)
@@ -43,34 +47,6 @@ def validate_config(raw: dict[str, Any], env: Mapping[str, str] | None = None) -
     _check_semantics(normalized)
     _probe_type_pins(normalized)
     return cast(dict[str, Any], normalized)
-
-
-# ---------------------------------------------------------------------------
-# env 참조 치환(B2): 문자열 전체가 ${VAR}일 때만 환경 변수로 치환하고, 미설정
-# 변수는 부팅을 중단한다(즉시 실패). 부분 보간("prefix-${VAR}")은 의도적 미지원.
-# ---------------------------------------------------------------------------
-
-_ENV_REF = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
-
-
-def _substitute_env(node: Any, env: Mapping[str, str], path: str = "") -> Any:
-    if isinstance(node, dict):
-        return {k: _substitute_env(v, env, f"{path}.{k}" if path else str(k))
-                for k, v in node.items()}
-    if isinstance(node, list):
-        return [_substitute_env(v, env, f"{path}[{i}]") for i, v in enumerate(node)]
-    if isinstance(node, str):
-        m = _ENV_REF.match(node)
-        if m:
-            var = m.group(1)
-            if var not in env:
-                raise ConfigError(
-                    f"{path}: references environment variable '{var}' which is not set. "
-                    f"env-ref substitution is fail-fast (DESIGN §18, B2) — export {var} "
-                    f"or replace the placeholder with a literal value."
-                )
-            return env[var]
-    return node
 
 
 # ---------------------------------------------------------------------------

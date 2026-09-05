@@ -35,6 +35,10 @@ mqtt = ["paho-mqtt>=2.1"]
 [project.scripts]
 ipe = "ipe.cli:main"
 
+[tool.setuptools]
+py-modules = ["config"]
+package-dir = {"" = ".", "ipe" = "src/ipe"}
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

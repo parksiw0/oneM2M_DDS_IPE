@@ -276,6 +276,8 @@ CONFIG_SCHEMA: dict[str, Any] = {
                 "default": "hybrid",
             },
             "domain_id": {"type": "integer", "min": 0, "default": 0},
+            "ros_peer": {"type": "string", "default": ""},
+            "rmw_implementation": {"type": "string", "default": ""},
             "allow": {"type": "list", "schema": {"type": "string"}, "default": ["/**"]},
             "deny": {"type": "list", "schema": {"type": "string"}, "default": []},
             "refresh_sec": {"type": ["integer", "float"], "min": 0, "default": 5},

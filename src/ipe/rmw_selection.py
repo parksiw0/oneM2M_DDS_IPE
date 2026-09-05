@@ -110,7 +110,7 @@ def select_rmw(
         suffix = f" Probe errors: {detail}" if detail else ""
         raise RMWSelectionError(
             f"No ROS 2 endpoints were discovered{target} on domain {domain_id}; "
-            f"start the robot or set RMW_IMPLEMENTATION explicitly.{suffix}"
+            f"start the robot or set discovery.rmw_implementation in config.py.{suffix}"
         )
 
     vendors: dict[str, int] = {}
@@ -121,7 +121,7 @@ def select_rmw(
         found = ", ".join(f"{vendor or 'unknown'} ({count})" for vendor, count in sorted(vendors.items()))
         raise RMWSelectionError(
             f"Mixed DDS endpoint vendors were discovered: {found}; "
-            "set RMW_IMPLEMENTATION explicitly."
+            "set discovery.rmw_implementation in config.py."
         )
 
     vendor_id, endpoint_count = next(iter(vendors.items()))
@@ -129,13 +129,13 @@ def select_rmw(
     if mapped is None:
         raise RMWSelectionError(
             f"DDS vendor ID {vendor_id or 'unknown'} is not supported for automatic selection; "
-            "set RMW_IMPLEMENTATION explicitly."
+            "set discovery.rmw_implementation in config.py."
         )
     implementation, vendor_name = mapped
     if implementation not in available_candidates:
         raise RMWSelectionError(
             f"The target uses {vendor_name} ({vendor_id}), but {implementation} is not available; "
-            "install it or set RMW_IMPLEMENTATION explicitly."
+            "install it or set discovery.rmw_implementation in config.py."
         )
     return RMWSelection(implementation, vendor_id, vendor_name, endpoint_count)
 
