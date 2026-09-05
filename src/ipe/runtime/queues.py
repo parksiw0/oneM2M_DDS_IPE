@@ -87,6 +87,18 @@ def _derive_latest_key(op: Any) -> Hashable | None:
     return (robot, interface, view)
 
 
+def _derive_order_key(op: Any) -> Hashable:
+    if isinstance(op, dict):
+        robot = op.get("robot_id", op.get("robot"))
+        interface = op.get("interface")
+    else:
+        robot = getattr(op, "robot_id", getattr(op, "robot", None))
+        interface = getattr(op, "interface", None)
+    if robot is None or interface is None:
+        return ("__global__",)
+    return (robot, interface)
+
+
 class OutboundQueue:
     """클래스별 정책 + get 시 클래스 우선순위를 가진 유한 아웃바운드 큐."""
 
@@ -108,6 +120,7 @@ class OutboundQueue:
         self._latest: OrderedDict[Hashable, Any] = OrderedDict()
         self._bulk: deque[Any] = deque()
         self._dropped = {CLASS_OBSERVE_BULK: 0}
+        self._active_keys: set[Hashable] = set()
 
     def put(self, op: Any, class_: str, key: Hashable | None = None) -> bool:
         """클래스 정책에 따른 논블로킹 put.
@@ -169,6 +182,46 @@ class OutboundQueue:
     def get_nowait(self) -> Any:
         return self.get(timeout=0)
 
+    def claim(self, timeout: float | None = None) -> Any:
+        """Claim the next operation while serializing each robot interface."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._cond:
+            while True:
+                op = self._pop_claimable()
+                if op is not None:
+                    self._active_keys.add(_derive_order_key(op))
+                    return op
+                if deadline is None:
+                    self._cond.wait()
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not self._cond.wait(remaining):
+                        op = self._pop_claimable()
+                        if op is not None:
+                            self._active_keys.add(_derive_order_key(op))
+                            return op
+                        raise Empty
+
+    def _pop_claimable(self) -> Any | None:
+        for index, op in enumerate(self._terminal):
+            if _derive_order_key(op) not in self._active_keys:
+                del self._terminal[index]
+                return op
+        for key, op in list(self._latest.items()):
+            if _derive_order_key(op) not in self._active_keys:
+                del self._latest[key]
+                return op
+        for index, op in enumerate(self._bulk):
+            if _derive_order_key(op) not in self._active_keys:
+                del self._bulk[index]
+                return op
+        return None
+
+    def release(self, op: Any) -> None:
+        with self._cond:
+            self._active_keys.discard(_derive_order_key(op))
+            self._cond.notify_all()
+
     def depths(self) -> dict[str, int]:
         with self._cond:
             return {
@@ -184,3 +237,7 @@ class OutboundQueue:
     def empty(self) -> bool:
         with self._cond:
             return not (self._terminal or self._latest or self._bulk)
+
+    def idle(self) -> bool:
+        with self._cond:
+            return not (self._terminal or self._latest or self._bulk or self._active_keys)

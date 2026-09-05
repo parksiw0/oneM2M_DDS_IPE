@@ -15,7 +15,10 @@ class RuntimeContext(Protocol):
     routes: Any
     protocol: str
     worker_client: Any
+    worker_clients: list[Any]
     worker_ops: Any
+    worker_ops_pool: list[Any]
+    outbound_worker_count: int
     prov_client: Any
     prov_ops: Any
     provisioner: Any
@@ -34,6 +37,7 @@ class RuntimeContext(Protocol):
     _prov_jobs: Any
     _stop_worker: Any
     _spool_pending: Any
+    _transport_state_lock: Any
     _muted_pipeline: set[tuple[str, str]]
     _confirm_pending: dict[str, tuple[str, str, str]]
     _approval_prompter: Any

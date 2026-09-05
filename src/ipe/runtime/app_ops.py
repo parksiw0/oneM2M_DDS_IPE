@@ -40,10 +40,14 @@ class OpsMixin(RuntimeContext):
                             {"event": "timeout", "goalId": corr})
 
     def _transport_status(self) -> dict[str, Any]:
-        st: dict[str, Any] = {"transport": self.protocol}
+        st: dict[str, Any] = {
+            "transport": self.protocol,
+            "outboundWorkers": self.outbound_worker_count,
+        }
         if self.protocol == "mqtt":
             st["connected"] = {
-                "worker": getattr(self.worker_client, "connected", None),
+                "worker": all(getattr(c, "connected", False)
+                              for c in self.worker_clients),
                 "prov": getattr(self.prov_client, "connected", None),
                 "listener": getattr(getattr(self, "server", None), "connected", None),
             }

@@ -51,37 +51,45 @@ class WorkersMixin(RuntimeContext):
         self._spool_pending.set()
 
     def _mark_cse_unavailable(self) -> None:
-        self._cse_transport_down = True
+        with self._transport_state_lock:
+            self._cse_transport_down = True
 
     def _mark_cse_available(self) -> bool:
-        if not self._cse_transport_down:
-            return False
-        self._cse_transport_down = False
+        with self._transport_state_lock:
+            if not self._cse_transport_down:
+                return False
+            self._cse_transport_down = False
         self._prov_jobs.put(("recover", None))
         return True
 
-    def _outbound_worker(self) -> None:
+    def _outbound_worker(self, worker_index: int) -> None:
         rec = self.rc.recovery
         retries = int(rec.get("retry_count", 3))
         base_ms = int(rec.get("retry_delay_ms", 500))
+        ops = self.worker_ops_pool[worker_index]
         next_spool_attempt = 0.0
         while not self._stop_worker.is_set():
-            # 유일한 CSE 쓰기 스레드 — 어떤 예외에도 죽지 않는다
             try:
                 now = time.monotonic()
-                if self._spool_pending.is_set() and now >= next_spool_attempt:
+                if (worker_index == 0 and self._spool_pending.is_set()
+                        and now >= next_spool_attempt):
                     self._spool_pending.clear()
-                    self._drain_spool()
+                    self._drain_spool(ops)
                     next_spool_attempt = time.monotonic() + max(0.5, base_ms / 1000.0)
                 try:
-                    op = self.outbound.get(timeout=0.5)
+                    op = self.outbound.claim(timeout=0.5)
                 except queue.Empty:
                     continue
-                self._send_with_retry(op, retries, base_ms)
+                try:
+                    self._send_with_retry(op, retries, base_ms, ops)
+                finally:
+                    self.outbound.release(op)
             except Exception:
                 log.exception("outbound worker iteration failed (isolated)")
 
-    def _send_with_retry(self, op: Op, retries: int, base_ms: int) -> None:
+    def _send_with_retry(
+        self, op: Op, retries: int, base_ms: int, ops: Any
+    ) -> None:
         from ipe.onem2m.client import backoff_delays
         delays = iter(backoff_delays(retries, base_ms))
         attempt = 0
@@ -91,27 +99,27 @@ class WorkersMixin(RuntimeContext):
             failure: Any = None
             try:
                 if op.kind == "update_fcnt":
-                    fr = self.worker_ops.update_fcnt(op.path, op.content)
+                    fr = ops.update_fcnt(op.path, op.content)
                     if fr.ok:
                         self._mark_cse_available()
                         return
                     failure = fr
                 elif op.kind == "update_cnt":
-                    cr = self.worker_ops.update_cnt(op.path, op.content)
+                    cr = ops.update_cnt(op.path, op.content)
                     if cr.ok:
                         self._mark_cse_available()
                         return
                     failure = cr
                 elif op.kind == "update_lbl":
-                    lr = self.worker_ops.update_lbl(op.path, op.content["labels"])
+                    lr = ops.update_lbl(op.path, op.content["labels"])
                     if lr.ok:
                         self._mark_cse_available()
                         return
                     failure = lr
                 else:
-                    r = self.worker_ops.create_cin(op.path, op.content,
-                                                   rn=getattr(op, "rn", None),
-                                                   et=getattr(op, "et", None))
+                    r = ops.create_cin(op.path, op.content,
+                                       rn=getattr(op, "rn", None),
+                                       et=getattr(op, "et", None))
                     if r.created or r.duplicate:
                         self._mark_cse_available()
                         return
@@ -143,7 +151,7 @@ class WorkersMixin(RuntimeContext):
                 return
             self._stop_worker.wait(next(delays) / 1000.0)
 
-    def _drain_spool(self) -> None:
+    def _drain_spool(self, ops: Any) -> None:
         import json as _json
         for row in self.state.spool_list(limit=20):
             data = _json.loads(row["payload"])
@@ -154,15 +162,15 @@ class WorkersMixin(RuntimeContext):
                 continue
             try:
                 if kind == "update_fcnt":
-                    r_ok = self.worker_ops.update_fcnt(data["path"], data["content"]).ok
+                    r_ok = ops.update_fcnt(data["path"], data["content"]).ok
                 elif kind == "update_cnt":
-                    r_ok = self.worker_ops.update_cnt(data["path"], data["content"]).ok
+                    r_ok = ops.update_cnt(data["path"], data["content"]).ok
                 elif kind == "update_lbl":
-                    r_ok = self.worker_ops.update_lbl(
+                    r_ok = ops.update_lbl(
                         data["path"], data["content"]["labels"]).ok
                 else:
-                    r = self.worker_ops.create_cin(data["path"], data["content"],
-                                                   rn=data.get("rn"), et=data.get("et"))
+                    r = ops.create_cin(data["path"], data["content"],
+                                       rn=data.get("rn"), et=data.get("et"))
                     if not (r.created or r.duplicate):
                         cls = classify(r.response)
                         if cls == "non_recoverable":

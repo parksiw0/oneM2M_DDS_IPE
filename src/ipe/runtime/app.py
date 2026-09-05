@@ -79,9 +79,20 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
             self.poa_path = ""
             self.poa = rc.cse.poa or f"http://127.0.0.1:{rc.notification_port}"
 
-        # 전송 클라이언트: 스레드(worker / provisioner)마다 1개 (HTTP=Session, MQTT=연결)
-        self.worker_client = make_onem2m_client(rc, rc.cse.origin)
-        self.worker_ops = ResourceOps(self.worker_client)
+        self.outbound_worker_count = int(rec.get("outbound_workers", 8))
+        if not 1 <= self.outbound_worker_count <= 8:
+            raise ValueError("outbound_workers must be within 1..8")
+        if self.protocol == "mqtt":
+            shared_client = make_onem2m_client(rc, rc.cse.origin)
+            self.worker_clients = [shared_client] * self.outbound_worker_count
+        else:
+            self.worker_clients = [
+                make_onem2m_client(rc, rc.cse.origin)
+                for _ in range(self.outbound_worker_count)
+            ]
+        self.worker_ops_pool = [ResourceOps(c) for c in self.worker_clients]
+        self.worker_client = self.worker_clients[0]
+        self.worker_ops = self.worker_ops_pool[0]
         self.prov_client = make_onem2m_client(rc, rc.cse.origin)
         self.prov_ops = ResourceOps(self.prov_client)
         self.provisioner = Provisioner(rc, self.prov_ops, self.state, self.poa,
@@ -109,9 +120,11 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
         self._prov_jobs: queue.Queue = queue.Queue()
         self._shutdown = threading.Event()
         self._stop_worker = threading.Event()
+        self.worker_threads: list[threading.Thread] = []
         self._spool_pending = threading.Event()
         if self.state.spool_counts():
             self._spool_pending.set()
+        self._transport_state_lock = threading.Lock()
         self._cse_transport_down = False
         self._muted_pipeline: set[tuple[str, str]] = set()
         self._confirm_pending: dict[str, tuple[str, str, str]] = {}   # proposalId -> spec 키
@@ -150,7 +163,8 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
         try:
             self.server = self._make_listener()
             self.server.start()
-            self.worker_client.start()
+            for client in {id(c): c for c in self.worker_clients}.values():
+                client.start()
             self.prov_client.start()
             self.lifecycle.set(IPEState.PREPARING, IPEPhase.TRANSPORT_READY)
 
@@ -186,7 +200,8 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
 
             # S5-S7: AE/CSE identity 뒤에만 robot 리소스와 SUB를 staged 생성한다.
             self.aei = self.provisioner.ensure_ae_identity()
-            self.worker_client.origin = self.aei
+            for client in {id(c): c for c in self.worker_clients}.values():
+                client.origin = self.aei
             self.prov_client.origin = self.aei
             self.provisioner.check_cse_identity()
             self.lifecycle.set(IPEState.PREPARING, IPEPhase.AE_REGISTERED)
@@ -257,9 +272,17 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
 
         self._publish_contracts()
 
-        self.worker_thread = threading.Thread(target=self._outbound_worker,
-                                              name="onem2m-worker", daemon=True)
-        self.worker_thread.start()
+        self.worker_threads = [
+            threading.Thread(
+                target=self._outbound_worker,
+                args=(index,),
+                name=f"onem2m-worker-{index + 1}",
+                daemon=True,
+            )
+            for index in range(self.outbound_worker_count)
+        ]
+        for thread in self.worker_threads:
+            thread.start()
         self.prov_thread = threading.Thread(target=self._prov_worker,
                                             name="provisioning-worker", daemon=True)
         self.prov_thread.start()
@@ -452,8 +475,8 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
                                   on_notify=self._on_notify, diag_fn=self._diag)
 
     def _stop_clients(self) -> None:
-        # stop()은 각 구현이 자체적으로 예외를 삼킨다(mqtt suppress, http session close)
-        for c in (getattr(self, "worker_client", None), getattr(self, "prov_client", None)):
+        clients = [*getattr(self, "worker_clients", []), getattr(self, "prov_client", None)]
+        for c in {id(c): c for c in clients if c is not None}.values():
             if c is not None:
                 c.stop()
 
@@ -564,7 +587,7 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
 
         self.emit_event("ipeHealth", "info", {"event": "shutdown"})
         flush_deadline = time.monotonic() + 5.0
-        while not self.outbound.empty() and time.monotonic() < flush_deadline:
+        while not self.outbound.idle() and time.monotonic() < flush_deadline:
             time.sleep(0.1)
         while True:
             try:
@@ -574,6 +597,9 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
             if op.queue_class == CLASS_TERMINAL:
                 self._spool_op(op)
         self._stop_worker.set()
+        join_deadline = time.monotonic() + 6.0
+        for thread in self.worker_threads:
+            thread.join(timeout=max(0.0, join_deadline - time.monotonic()))
         # 한 단계 실패가 나머지 정리를 막지 않게 단계별로 격리한다
         for step in (self._close_approval_prompt,
                      lambda: self.state.set_kv("anomaly_bufs",
@@ -582,8 +608,7 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
                      self.adapter.shutdown,
                      self.executor.shutdown,
                      self.node.destroy_node,
-                     self.worker_client.stop,
-                     self.prov_client.stop):
+                     self._stop_clients):
             try:
                 step()
             except Exception:

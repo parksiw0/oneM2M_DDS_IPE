@@ -407,6 +407,7 @@ CONFIG_SCHEMA: dict[str, Any] = {
             "inbound_max": {"type": "integer", "min": 1, "default": 1000},
             "control_lane_max": {"type": "integer", "min": 1, "default": 64},   # 2-레인 제어 큐
             "outbound_max": {"type": "integer", "min": 1, "default": 5000},
+            "outbound_workers": {"type": "integer", "min": 1, "max": 8, "default": 8},
             "catch_up_sec": {"type": ["integer", "float"], "min": 0, "default": 0},
             "reconcile_sec": {"type": ["integer", "float"], "min": 0, "default": 0},
             "cancel_orphan_goals": {"type": "boolean", "default": False},
