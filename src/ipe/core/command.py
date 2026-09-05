@@ -24,12 +24,6 @@ class CommandOutcome:
     clamped: dict[str, Any] = field(default_factory=dict)
 
 
-
-
-
-
-
-
 class CommandDispatchManager:
     """publish_fn(spec, payload) -> bool — 어댑터가 executor 스레드에서 소유하는 publish."""
 

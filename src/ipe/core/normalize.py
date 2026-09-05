@@ -82,8 +82,6 @@ def sanitize_value(v: Any) -> Any:
     return v
 
 
-
-
 def project_fields(
     payload: dict[str, Any], fields: list[str] | None
 ) -> dict[str, Any]:

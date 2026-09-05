@@ -18,6 +18,7 @@ log = logging.getLogger(__name__)
 
 SEVERITY_ORDER = {"info": 0, "warning": 1, "error": 2}
 
+
 class OpsMixin(RuntimeContext):
     def _tick_1s(self) -> None:
         self.adapter.tick()

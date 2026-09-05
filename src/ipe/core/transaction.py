@@ -21,7 +21,6 @@ if TYPE_CHECKING:
     from ipe.runtime.state import StatePersistence
 
 
-
 class VocabularyError(ValueError):
     pass
 

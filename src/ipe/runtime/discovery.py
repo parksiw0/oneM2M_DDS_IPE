@@ -8,8 +8,12 @@ from dataclasses import dataclass
 from typing import Any
 
 
-class GraphNotReady(RuntimeError):
-    pass
+class GraphNotReadyError(RuntimeError):
+    """The ROS graph did not provide a usable binding plan."""
+
+
+# Retain the existing import name for callers.
+GraphNotReady = GraphNotReadyError
 
 
 @dataclass(frozen=True)

@@ -26,6 +26,7 @@ log = logging.getLogger(__name__)
 
 GOAL_STATUS_TO_REASON = {4: "succeeded", 5: "canceled", 6: "aborted"}
 
+
 class DispatchMixin(RuntimeContext):
     _approval_prompter: Any
 

@@ -573,7 +573,7 @@ class GenericROS2Adapter:
     def _create_subscription_degrading(self, msg_class: Any, spec: TopicSpec,
                                        profile: Any, callback: Any) -> Any:
         """QoS 이벤트 콜백 등록 — 미지원 축은 하나씩 빼며 재시도(점진 강등)."""
-        SubscriptionEventCallbacks = _event_callbacks("sub")
+        subscription_callbacks_cls = _event_callbacks("sub")
 
         key = (spec.robot_id, spec.interface)
 
@@ -591,14 +591,14 @@ class GenericROS2Adapter:
                 "incompatible_type": _mk("incompatibleType"),
                 # matched(Iron+)는 CIN을 내지 않는 내부 재조정 트리거(§4.6.1)
                 "matched": lambda _info: self._mark_qos_dirty(key)}
-        axes, unsupported = _supported_axes(SubscriptionEventCallbacks, axes)
+        axes, unsupported = _supported_axes(subscription_callbacks_cls, axes)
         for axis in unsupported:
             self._report_unsupported_event_axis("subscription", axis)
         while True:
             try:
                 return self.node.create_subscription(
                     msg_class, spec.interface, callback, profile,
-                    event_callbacks=SubscriptionEventCallbacks(**axes))
+                    event_callbacks=subscription_callbacks_cls(**axes))
             except Exception as e:
                 name = type(e).__name__
                 if "UnsupportedEventType" in name and axes:
@@ -724,7 +724,7 @@ class GenericROS2Adapter:
         """발행자 생성 — 구독과 동일한 이벤트 축 점진 강등(§4.6.1).
         LivelinessLost는 의도적으로 미등록: command liveliness는 AUTOMATIC
         고정이라 lost == IPE 프로세스 정지와 동치다."""
-        PublisherEventCallbacks = _event_callbacks("pub")
+        publisher_callbacks_cls = _event_callbacks("pub")
 
         def _mk(category: str, severity: str, name: str) -> Callable[[Any], None]:
             def cb(info: Any) -> None:
@@ -737,14 +737,14 @@ class GenericROS2Adapter:
                 "deadline": _mk("qosStatus", "warning", "offeredDeadlineMissed"),
                 "incompatible_type": _mk("qosStatus", "warning", "incompatibleType"),
                 "matched": lambda _info: self._mark_qos_dirty(key)}
-        axes, unsupported = _supported_axes(PublisherEventCallbacks, axes)
+        axes, unsupported = _supported_axes(publisher_callbacks_cls, axes)
         for axis in unsupported:
             self._report_unsupported_event_axis("publisher", axis)
         while axes:
             try:
                 return self.node.create_publisher(
                     msg_class, spec.interface, profile,
-                    event_callbacks=PublisherEventCallbacks(**axes))
+                    event_callbacks=publisher_callbacks_cls(**axes))
             except Exception as e:
                 if "UnsupportedEventType" not in type(e).__name__:
                     break
