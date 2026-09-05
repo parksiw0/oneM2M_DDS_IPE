@@ -21,8 +21,11 @@ src/ipe/
 ├── config/        설정 검증·인터페이스 매핑
 ├── core/          데이터 처리·QoS 정책
 ├── onem2m/        CSE 통신·리소스 관리
-└── runtime/       자동 발견·전송 큐·워커·상태 저장
+└── runtime/       앱 실행·수신·송신·연결 관리·상태 저장
 ```
+
+`runtime/app.py`가 실행을 조립하고, `inbound.py`는 요청 처리, `outbound.py`는 데이터 송신·재시도,
+`bindings.py`는 자동 발견·연결 변경, `status.py`는 QoS 상태 게시를 담당합니다.
 
 ## 실행
 
