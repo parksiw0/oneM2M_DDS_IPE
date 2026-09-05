@@ -74,7 +74,7 @@ class OneM2MResponse:
 
     @property
     def ok(self) -> bool:
-        return 200 <= self.status < 300
+        return 200 <= self.status < 300 and (self.rsc is None or self.rsc < 4000)
 
 
 def classify(resp_or_exc: OneM2MResponse | BaseException) -> Classification:
@@ -141,15 +141,19 @@ def backoff_delays(
         return []
     if not 0.0 <= jitter <= 1.0:
         raise ValueError(f"jitter must be within [0, 1], got {jitter}")
-    if base_ms <= 0:
-        raise ValueError(f"base_ms must be positive, got {base_ms}")
+    if base_ms < 0:
+        raise ValueError(f"base_ms must be nonnegative, got {base_ms}")
+    if factor < 1 or max_ms < 0:
+        raise ValueError("factor must be >= 1 and max_ms must be nonnegative")
     draw = rng if rng is not None else random.random
     delays: list[float] = []
-    for i in range(retry_count):
-        d = min(base_ms * factor**i, max_ms)
+    delay = min(base_ms, max_ms)
+    for _ in range(retry_count):
+        d = delay
         if jitter:
             d += d * jitter * (2.0 * draw() - 1.0)
         delays.append(max(0.0, d))
+        delay = min(delay * factor, max_ms)
     return delays
 
 

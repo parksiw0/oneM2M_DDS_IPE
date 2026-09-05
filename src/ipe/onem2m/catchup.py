@@ -1,8 +1,8 @@
 """캐치업 스윕 (DESIGN §14.5).
 
 tinyIoT 알림은 fire-and-forget이라 놓친 NOTIFY는 구독 경로로 복구되지 않는다.
-입력 리프 CNT를 다시 읽어 저장된 마커보다 새로운 CIN을 일반 수락 경로로
-재주입하며, 중복 제거와 max_age 게이트가 재주입을 안전하게 만든다.
+입력 리프 CNT를 다시 읽어 마지막 완료 구간부터 일반 수락 경로로 재주입한다.
+NOTIFY 수신 위치와 복구 위치를 분리하고, 경계 시각의 중복은 admission이 거른다.
 """
 
 from __future__ import annotations
@@ -26,15 +26,24 @@ class CatchUpSweeper:
         self.input_cnts: dict[str, str] = {}
 
     def register(self, path_key: str, cnt_path: str) -> None:
+        self._initialize_marker(path_key)
         self.input_cnts[path_key] = cnt_path
 
     def replace(self, input_cnts: dict[str, str]) -> None:
         """활성 binding generation의 입력 CNT 집합으로 원자적 참조를 교체한다."""
+        for path_key in input_cnts:
+            self._initialize_marker(path_key)
         self.input_cnts = dict(input_cnts)
 
+    def _initialize_marker(self, path_key: str) -> None:
+        """Migrate an existing cursor once, before accepting new notifications."""
+        marker_key = f"catchup_cin_ct:{path_key}"
+        missing = object()
+        if self.state.get_kv(marker_key, missing) is missing:
+            self.state.set_kv(marker_key, self.state.get_kv(f"last_cin_ct:{path_key}"))
+
     def mark_processed(self, path_key: str, ct: str | None) -> None:
-        """마커 전진 — 리스너도 수락된 NOTIFY마다 호출하므로 정상 운영 중에는
-        스윕 윈도가 작게 유지된다."""
+        """Record the latest accepted NOTIFY timestamp without advancing recovery."""
         if ct:
             prev = self.state.get_kv(f"last_cin_ct:{path_key}")
             if prev is None or ct > prev:
@@ -54,22 +63,30 @@ class CatchUpSweeper:
         return injected
 
     def _sweep_one(self, path_key: str, cnt_path: str) -> int:
-        marker = self.state.get_kv(f"last_cin_ct:{path_key}")
+        # NOTIFY arrival order is not a contiguous history watermark. Only a
+        # completed scan prefix can advance recovery past older unseen CINs.
+        marker_key = f"catchup_cin_ct:{path_key}"
+        marker = self.state.get_kv(marker_key)
+        completed = marker
         cins = self.ops.list_child_cins(cnt_path)
         # tinyIoT ct 형식(yyyymmddThhmmss)은 사전순 정렬 == 시간순
         cins.sort(key=lambda c: (c.get("ct") or "", c.get("ri") or ""))
         count = 0
         for cin in cins:
             ct = cin.get("ct")
-            if marker is not None and ct is not None and ct <= marker:
+            # ct has second precision: replay the boundary second and let
+            # admission dedup distinguish different CINs with the same ct.
+            if marker is not None and ct is not None and ct < marker:
                 continue
             verdict = self.admission_fn(path_key, cin.get("ri", ""),
                                         cin.get("con"), ct)
-            # 방문한 모든 CIN에서 마커를 전진 — 중복/만료 포함 —
-            # 다음 스윕이 같은 구간을 재생하지 않게 한다
+            if verdict in ("overflow", "denied"):
+                break
             self.mark_processed(path_key, ct)
+            if ct and (completed is None or ct > completed):
+                completed = ct
             if verdict == "ok":
                 count += 1
-            elif verdict == "overflow":
-                break   # 큐 포화 — 다음 스윕이 마커부터 재개
+        if completed is not None and completed != marker:
+            self.state.set_kv(marker_key, completed)
         return count

@@ -589,6 +589,10 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
         flush_deadline = time.monotonic() + 5.0
         while not self.outbound.idle() and time.monotonic() < flush_deadline:
             time.sleep(0.1)
+        self._stop_worker.set()
+        self._join_workers()
+        # Workers may enqueue terminal status while completing their last job.
+        # Drain only after all producers have stopped.
         while True:
             try:
                 op = self.outbound.get_nowait()
@@ -596,10 +600,6 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
                 break
             if op.queue_class == CLASS_TERMINAL:
                 self._spool_op(op)
-        self._stop_worker.set()
-        join_deadline = time.monotonic() + 6.0
-        for thread in self.worker_threads:
-            thread.join(timeout=max(0.0, join_deadline - time.monotonic()))
         # 한 단계 실패가 나머지 정리를 막지 않게 단계별로 격리한다
         for step in (self._close_approval_prompt,
                      lambda: self.state.set_kv("anomaly_bufs",
@@ -624,14 +624,21 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
         log.info("shutdown complete")
         return 0
 
+    def _join_workers(self) -> None:
+        threads = list(self.worker_threads)
+        prov_thread = getattr(self, "prov_thread", None)
+        if prov_thread is not None:
+            threads.append(prov_thread)
+        for thread in threads:
+            thread.join(timeout=6.0)
+            if thread.is_alive():
+                log.warning("waiting for %s to finish before closing resources", thread.name)
+                thread.join()
+
     def _close_approval_prompt(self) -> None:
         if self._approval_prompter is not None:
             self._approval_prompter.close()
             self._approval_prompter = None
-
-
-
-
 
 
 def run(rc: ResolvedConfig, args: Any) -> int:

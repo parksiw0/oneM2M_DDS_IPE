@@ -113,13 +113,14 @@ class OutboundQueue:
             raise ValueError("maxsize must be >= 1")
         self._terminal_maxsize = terminal_maxsize if terminal_maxsize is not None else maxsize
         self._bulk_maxsize = bulk_maxsize if bulk_maxsize is not None else maxsize
+        self._latest_maxsize = maxsize
         if self._terminal_maxsize < 1 or self._bulk_maxsize < 1:
             raise ValueError("queue sizes must be >= 1")
         self._cond = threading.Condition()
         self._terminal: deque[Any] = deque()
         self._latest: OrderedDict[Hashable, Any] = OrderedDict()
         self._bulk: deque[Any] = deque()
-        self._dropped = {CLASS_OBSERVE_BULK: 0}
+        self._dropped = {CLASS_OBSERVE_BULK: 0, CLASS_OBSERVE_LATEST: 0}
         self._active_keys: set[Hashable] = set()
 
     def put(self, op: Any, class_: str, key: Hashable | None = None) -> bool:
@@ -146,6 +147,9 @@ class OutboundQueue:
                     )
                 # 기존 키를 교체해도 큐 내 위치는 유지된다(dict 삽입 순서
                 # 의미론) — 병합이 특정 키를 굶기지 못한다.
+                if key not in self._latest and len(self._latest) >= self._latest_maxsize:
+                    self._latest.popitem(last=False)
+                    self._dropped[CLASS_OBSERVE_LATEST] += 1
                 self._latest[key] = op
             else:  # CLASS_OBSERVE_BULK
                 if len(self._bulk) >= self._bulk_maxsize:
@@ -207,8 +211,9 @@ class OutboundQueue:
             if _derive_order_key(op) not in self._active_keys:
                 del self._terminal[index]
                 return op
-        for key, op in list(self._latest.items()):
+        for key, op in self._latest.items():
             if _derive_order_key(op) not in self._active_keys:
+                # Return immediately after deletion; do not advance the iterator.
                 del self._latest[key]
                 return op
         for index, op in enumerate(self._bulk):
@@ -216,6 +221,15 @@ class OutboundQueue:
                 del self._bulk[index]
                 return op
         return None
+
+    def try_claim(self, op: Any) -> bool:
+        """Reserve an interface for spool replay without enqueuing another copy."""
+        with self._cond:
+            key = _derive_order_key(op)
+            if key in self._active_keys:
+                return False
+            self._active_keys.add(key)
+            return True
 
     def release(self, op: Any) -> None:
         with self._cond:
