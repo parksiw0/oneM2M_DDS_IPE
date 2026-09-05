@@ -50,10 +50,17 @@ class IPEApp(DispatchMixin, WorkersMixin, OpsMixin):
         self.rc = rc
         self.args = args
         rec = rc.recovery
+        storage = rc.storage
         self.state = StatePersistence(
-            rc.storage.get("state_db", "ipe_state.db"),
-            max_spool_entries=rc.storage.get("max_spool_entries", 10000),
-            max_spool_mb=rc.storage.get("max_spool_mb", 64))
+            storage.get("state_db", "ipe_state.db"),
+            backend=storage.get("backend", "sqlite"),
+            dsn=storage.get("dsn"),
+            schema=storage.get("schema", "ipe_state"),
+            pool_min_size=storage.get("pool_min_size", 1),
+            pool_max_size=storage.get("pool_max_size", 8),
+            max_spool_entries=storage.get("max_spool_entries", 10000),
+            max_spool_mb=storage.get("max_spool_mb", 64),
+        )
         self.lifecycle = Lifecycle(self.state)
         self.inbound = InboundQueue(maxsize=rec.get("inbound_max", 1000),
                                     control_maxsize=rec.get("control_lane_max", 64))

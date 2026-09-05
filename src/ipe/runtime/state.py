@@ -1,10 +1,4 @@
-"""SQLite 기반 런타임 상태 저장소 (DESIGN v3 §13.7 / §13.8 / §16.1).
-
-인바운드 알림 admission 상태 머신, 서비스/액션 트랜잭션, KV 저장소,
-TERMINAL 스풀, 보존 기간 정리를 담당한다. 연결 모델은 스레드당 1연결
-(WAL + NORMAL + busy_timeout)이고, ":memory:"는 sqlite 특성상 연결마다
-별개 DB라 단일 공유 연결 + 락으로 대체한다(WAL 불가).
-"""
+"""Runtime state persistence for admission, transactions, KV, and spooling."""
 
 from __future__ import annotations
 
@@ -14,6 +8,15 @@ import threading
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager, suppress
 from typing import Any
+
+try:
+    import psycopg
+    from psycopg import sql
+    from psycopg_pool import ConnectionPool
+except ImportError:  # PostgreSQL is optional for SQLite-only test environments.
+    psycopg = None
+    sql = None
+    ConnectionPool = None
 
 # ---------------------------------------------------------------------------
 # 상태 어휘 (임의 문자열은 거부)
@@ -73,12 +76,17 @@ def _processed_row(row: tuple[Any, ...]) -> dict[str, Any]:
 
 
 class StatePersistence:
-    """IPE 런타임용 스레드 안전 sqlite 영속 계층."""
+    """Thread-safe runtime state backed by SQLite or PostgreSQL."""
 
     def __init__(
         self,
         path: str = ":memory:",
         *,
+        backend: str = "sqlite",
+        dsn: str | None = None,
+        schema: str = "ipe_state",
+        pool_min_size: int = 1,
+        pool_max_size: int = 8,
         max_spool_entries: int = 10000,
         max_spool_mb: int = 64,
     ) -> None:
@@ -86,30 +94,43 @@ class StatePersistence:
             raise ValueError("max_spool_entries must be >= 1")
         if max_spool_mb < 1:
             raise ValueError("max_spool_mb must be >= 1")
+        backend = backend.strip().lower()
+        if backend not in {"sqlite", "postgresql"}:
+            raise ValueError(f"unsupported state backend: {backend!r}")
+        if pool_min_size < 1:
+            raise ValueError("pool_min_size must be >= 1")
+        if pool_max_size < pool_min_size:
+            raise ValueError("pool_max_size must be >= pool_min_size")
+        self._backend = backend
         self._path = path
-        self._memory = path == ":memory:"
+        self._memory = backend == "sqlite" and path == ":memory:"
         self.max_spool_entries = max_spool_entries
         self.max_spool_bytes = max_spool_mb * 1024 * 1024
         self._closed = False
-        # 메모리 sqlite DB는 연결마다 별개 — 공유 연결 + 락이 스레드 간
-        # 상태 공유의 유일한 방법이다.
         self._mem_lock = threading.Lock()
         self._local = threading.local()
         self._all_conns: list[sqlite3.Connection] = []
         self._conns_lock = threading.Lock()
-        self._shared: sqlite3.Connection | None
-        if self._memory:
+        self._shared: sqlite3.Connection | None = None
+        self._pool: Any = None
+        if backend == "postgresql":
+            if psycopg is None or ConnectionPool is None or sql is None:
+                raise RuntimeError(
+                    "PostgreSQL state storage requires psycopg[binary,pool]"
+                )
+            self._init_postgresql(dsn, schema, pool_min_size, pool_max_size)
+            self._integrity_errors = (psycopg.IntegrityError,)
+        elif self._memory:
             self._shared = self._new_conn()
+            self._integrity_errors = (sqlite3.IntegrityError,)
         else:
-            self._shared = None
+            self._integrity_errors = (sqlite3.IntegrityError,)
         with self._conn() as conn:
             self._create_schema(conn)
 
     # -- 연결 관리 ------------------------------------------------------------
 
     def _new_conn(self) -> sqlite3.Connection:
-        # isolation_level=None -> autocommit. 다중 문장 원자성이 필요한 곳은
-        # 명시적 BEGIN IMMEDIATE를 쓴다.
         conn = sqlite3.connect(self._path, check_same_thread=False, isolation_level=None)
         if not self._memory:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -119,11 +140,39 @@ class StatePersistence:
             self._all_conns.append(conn)
         return conn
 
+    def _init_postgresql(
+        self,
+        dsn: str | None,
+        schema: str,
+        pool_min_size: int,
+        pool_max_size: int,
+    ) -> None:
+        conninfo = dsn or "postgresql://ipeuser@127.0.0.1:5432/ipedb"
+        with psycopg.connect(conninfo, autocommit=True) as conn:
+            conn.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema)))
+
+        def configure(conn: Any) -> None:
+            conn.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema)))
+
+        self._pool = ConnectionPool(
+            conninfo=conninfo,
+            min_size=pool_min_size,
+            max_size=pool_max_size,
+            kwargs={"autocommit": True, "application_name": "onem2m_dds_ipe"},
+            configure=configure,
+            open=True,
+        )
+        self._pool.wait()
+
     @contextmanager
-    def _conn(self) -> Iterator[sqlite3.Connection]:
-        """:memory:면 공유 연결+락, 아니면 호출 스레드 전용 연결을 내준다."""
+    def _conn(self) -> Iterator[Any]:
+        """Yield a backend connection for one state operation."""
         if self._closed:
-            raise sqlite3.ProgrammingError("StatePersistence is closed")
+            raise RuntimeError("StatePersistence is closed")
+        if self._backend == "postgresql":
+            with self._pool.connection() as conn:
+                yield _PostgresConnection(conn)
+            return
         if self._memory:
             shared = self._shared
             if shared is None:
@@ -138,8 +187,15 @@ class StatePersistence:
             yield conn
 
     @contextmanager
-    def _tx(self) -> Iterator[sqlite3.Connection]:
-        """읽기-수정-쓰기 시퀀스용 짧은 IMMEDIATE 트랜잭션."""
+    def _tx(self) -> Iterator[Any]:
+        """Yield a short transaction for read-modify-write sequences."""
+        if self._backend == "postgresql":
+            if self._closed:
+                raise RuntimeError("StatePersistence is closed")
+            with self._pool.connection() as raw, raw.transaction():
+                raw.execute("SELECT pg_advisory_xact_lock(hashtext(current_schema()))")
+                yield _PostgresConnection(raw)
+            return
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -149,8 +205,13 @@ class StatePersistence:
                 raise
             conn.execute("COMMIT")
 
-    @staticmethod
-    def _create_schema(conn: sqlite3.Connection) -> None:
+    def _create_schema(self, conn: Any) -> None:
+        timestamp_type = "DOUBLE PRECISION" if self._backend == "postgresql" else "REAL"
+        spool_id = (
+            "BIGSERIAL PRIMARY KEY"
+            if self._backend == "postgresql"
+            else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        )
         conn.execute(
             "CREATE TABLE IF NOT EXISTS processed ("
             " robot_id TEXT NOT NULL,"
@@ -158,7 +219,7 @@ class StatePersistence:
             " corr_id TEXT NOT NULL,"
             " event_id TEXT,"
             " state TEXT NOT NULL,"
-            " ts REAL NOT NULL,"
+            f" ts {timestamp_type} NOT NULL,"
             " PRIMARY KEY (robot_id, interface, corr_id))"
         )
         conn.execute(
@@ -168,18 +229,18 @@ class StatePersistence:
             " state TEXT NOT NULL,"
             " seq INTEGER NOT NULL DEFAULT 0,"
             " timeout_ms INTEGER NOT NULL DEFAULT 0,"
-            " started REAL NOT NULL,"
-            " updated REAL NOT NULL)"
+            f" started {timestamp_type} NOT NULL,"
+            f" updated {timestamp_type} NOT NULL)"
         )
         conn.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         conn.execute(
             "CREATE TABLE IF NOT EXISTS spool ("
-            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            f" id {spool_id},"
             " class TEXT NOT NULL,"
             " key TEXT,"
             " payload TEXT NOT NULL,"
             " nbytes INTEGER NOT NULL,"
-            " ts REAL NOT NULL)"
+            f" ts {timestamp_type} NOT NULL)"
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_spool_class ON spool(class)")
 
@@ -201,7 +262,7 @@ class StatePersistence:
                     (robot_id, interface, corr_id, event_id, ts),
                 )
             return "queued"
-        except sqlite3.IntegrityError:
+        except self._integrity_errors:
             pass
         with self._conn() as conn:
             cur = conn.execute(
@@ -317,7 +378,7 @@ class StatePersistence:
                     (corr_id, kind, initial_state, timeout_ms, ts, ts),
                 )
             return True
-        except sqlite3.IntegrityError:
+        except self._integrity_errors:
             return False
 
     def update_transaction(self, corr_id: str, state: str, ts: float) -> None:
@@ -508,6 +569,9 @@ class StatePersistence:
         if self._closed:
             return
         self._closed = True
+        if self._backend == "postgresql":
+            self._pool.close()
+            return
         with self._conns_lock:
             conns, self._all_conns = self._all_conns, []
         for conn in conns:
@@ -516,3 +580,13 @@ class StatePersistence:
                     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             with suppress(sqlite3.Error):
                 conn.close()
+
+
+class _PostgresConnection:
+    """Translate the store's SQLite-style placeholders for psycopg."""
+
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+
+    def execute(self, query: str, params: Iterable[Any] = ()) -> Any:
+        return self._conn.execute(query.replace("?", "%s"), tuple(params))

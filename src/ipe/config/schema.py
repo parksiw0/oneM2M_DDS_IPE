@@ -352,7 +352,16 @@ CONFIG_SCHEMA: dict[str, Any] = {
         "type": "dict",
         "required": False,
         "schema": {
+            "backend": {
+                "type": "string",
+                "allowed": ["sqlite", "postgresql"],
+                "default": "sqlite",
+            },
             "state_db": {"type": "string", "default": "ipe_state.db"},
+            "dsn": {"type": "string", "required": False, "nullable": True},
+            "schema": {"type": "string", "empty": False, "default": "ipe_state"},
+            "pool_min_size": {"type": "integer", "min": 1, "default": 1},
+            "pool_max_size": {"type": "integer", "min": 1, "default": 8},
             "max_spool_entries": {"type": "integer", "min": 0, "default": 10000},
             "max_spool_mb": {"type": "integer", "min": 0, "default": 64},
         },

@@ -14,4 +14,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install --no-cache-dir requests cerberus "paho-mqtt>=2.1"
+RUN pip3 install --no-cache-dir requests cerberus "paho-mqtt>=2.1" \
+      "psycopg[binary,pool]>=3.1,<4"
