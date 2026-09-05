@@ -122,6 +122,9 @@ def _check_semantics(cfg: dict[str, Any]) -> None:
         raise ConfigError(f"Duplicate robot id in 'robots': {ids}")
 
     _check_cse_protocol(cfg)
+    storage = cfg["storage"]
+    if storage["pool_max_size"] < storage["pool_min_size"]:
+        raise ConfigError("storage.pool_max_size must be >= storage.pool_min_size")
     _check_patterns(cfg)
     _check_mode_semantics(cfg)
     _check_qos_references(cfg)
@@ -381,6 +384,7 @@ def _probe_type_pins(cfg: dict[str, Any]) -> None:
 def _fmt_errors(errors: Any, prefix: str = "") -> str:
     """Cerberus 오류 dict를 읽기 좋은 'key.path: message' 줄들로 평탄화."""
     lines: list[str] = []
+
     def walk(e: Any, path: str) -> None:
         if isinstance(e, dict):
             for k, v in e.items():

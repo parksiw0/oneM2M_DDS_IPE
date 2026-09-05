@@ -9,15 +9,6 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager, suppress
 from typing import Any
 
-try:
-    import psycopg
-    from psycopg import sql
-    from psycopg_pool import ConnectionPool
-except ImportError:  # PostgreSQL is optional for SQLite-only test environments.
-    psycopg = None
-    sql = None
-    ConnectionPool = None
-
 # ---------------------------------------------------------------------------
 # 상태 어휘 (임의 문자열은 거부)
 # ---------------------------------------------------------------------------
@@ -46,7 +37,15 @@ TRANSACTION_KINDS: dict[str, frozenset[str]] = {
     "service": SERVICE_TX_STATES,
     "action": ACTION_TX_STATES,
 }
-_TX_TERMINAL_ALL = SERVICE_TX_TERMINAL | ACTION_TX_TERMINAL
+_TX_TERMINAL_BY_KIND = {"service": SERVICE_TX_TERMINAL, "action": ACTION_TX_TERMINAL}
+# Only trusted vocabulary constants are embedded here. A shared predicate also
+# lets both backends use the partial index when completed history grows.
+_ACTIVE_TX_WHERE = " OR ".join(
+    "(kind='{}' AND state IN ({}))".format(
+        kind, ",".join(f"'{state}'" for state in sorted(states - _TX_TERMINAL_BY_KIND[kind]))
+    )
+    for kind, states in TRANSACTION_KINDS.items()
+)
 
 _TX_COLUMNS = "corr_id, kind, state, seq, timeout_ms, started, updated"
 _PROCESSED_COLUMNS = "robot_id, interface, corr_id, event_id, state, ts"
@@ -113,20 +112,17 @@ class StatePersistence:
         self._conns_lock = threading.Lock()
         self._shared: sqlite3.Connection | None = None
         self._pool: Any = None
+        self._integrity_errors: tuple[type[Exception], ...] = (sqlite3.IntegrityError,)
         if backend == "postgresql":
-            if psycopg is None or ConnectionPool is None or sql is None:
-                raise RuntimeError(
-                    "PostgreSQL state storage requires psycopg[binary,pool]"
-                )
             self._init_postgresql(dsn, schema, pool_min_size, pool_max_size)
-            self._integrity_errors = (psycopg.IntegrityError,)
         elif self._memory:
             self._shared = self._new_conn()
-            self._integrity_errors = (sqlite3.IntegrityError,)
-        else:
-            self._integrity_errors = (sqlite3.IntegrityError,)
-        with self._conn() as conn:
-            self._create_schema(conn)
+        try:
+            with self._conn() as conn:
+                self._create_schema(conn)
+        except BaseException:
+            self.close()
+            raise
 
     # -- 연결 관리 ------------------------------------------------------------
 
@@ -147,6 +143,15 @@ class StatePersistence:
         pool_min_size: int,
         pool_max_size: int,
     ) -> None:
+        try:
+            import psycopg
+            from psycopg import sql
+            from psycopg_pool import ConnectionPool
+        except ImportError as exc:
+            raise RuntimeError(
+                "PostgreSQL state storage requires psycopg[binary,pool]"
+            ) from exc
+        self._integrity_errors = (psycopg.IntegrityError,)
         conninfo = dsn or "postgresql://ipeuser@127.0.0.1:5432/ipedb"
         with psycopg.connect(conninfo, autocommit=True) as conn:
             conn.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema)))
@@ -162,7 +167,11 @@ class StatePersistence:
             configure=configure,
             open=True,
         )
-        self._pool.wait()
+        try:
+            self._pool.wait()
+        except BaseException:
+            self._pool.close()
+            raise
 
     @contextmanager
     def _conn(self) -> Iterator[Any]:
@@ -243,6 +252,11 @@ class StatePersistence:
             f" ts {timestamp_type} NOT NULL)"
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_spool_class ON spool(class)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_spool_key ON spool(class, key)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_transactions_active"
+            f" ON transactions(kind, started) WHERE {_ACTIVE_TX_WHERE}"
+        )
 
     # -- admission 상태 머신 ---------------------------------------------------
 
@@ -280,7 +294,7 @@ class StatePersistence:
                 " WHERE robot_id=? AND interface=? AND corr_id=? AND state='queued'",
                 (ts, robot_id, interface, corr_id),
             )
-            return cur.rowcount == 1
+            return int(cur.rowcount) == 1
 
     def cas_dispatch(self, robot_id: str, interface: str, corr_id: str, ts: float) -> bool:
         """'queued' -> 'dispatched' 전이. 한 호출자만 이긴다."""
@@ -290,7 +304,7 @@ class StatePersistence:
                 " WHERE robot_id=? AND interface=? AND corr_id=? AND state='queued'",
                 (ts, robot_id, interface, corr_id),
             )
-            return cur.rowcount == 1
+            return int(cur.rowcount) == 1
 
     def finish(
         self, robot_id: str, interface: str, corr_id: str, terminal_state: str, ts: float
@@ -309,7 +323,7 @@ class StatePersistence:
                 f" AND state IN ({placeholders})",
                 (terminal_state, ts, robot_id, interface, corr_id, *PROCESSED_ACTIVE_STATES),
             )
-            return cur.rowcount == 1
+            return int(cur.rowcount) == 1
 
     def get_processed(self, robot_id: str, interface: str, corr_id: str) -> dict[str, Any] | None:
         with self._conn() as conn:
@@ -417,14 +431,14 @@ class StatePersistence:
         return _tx_row(row) if row else None
 
     def active_transactions(self, kind: str | None = None) -> list[dict[str, Any]]:
+        """Read only nonterminal rows; terminal vocabulary differs by kind."""
+        query = f"SELECT {_TX_COLUMNS} FROM transactions WHERE ({_ACTIVE_TX_WHERE})"
+        params: tuple[Any, ...] = ()
+        if kind is not None:
+            query += " AND kind=?"
+            params = (kind,)
         with self._conn() as conn:
-            if kind is None:
-                cur = conn.execute(f"SELECT {_TX_COLUMNS} FROM transactions")
-            else:
-                cur = conn.execute(
-                    f"SELECT {_TX_COLUMNS} FROM transactions WHERE kind=?", (kind,)
-                )
-            rows = cur.fetchall()
+            rows = conn.execute(query, params).fetchall()
         return [_tx_row(r) for r in rows]
 
     def sweep_timeouts(self, now: float) -> list[dict[str, Any]]:
@@ -433,13 +447,12 @@ class StatePersistence:
         timeout_ms == 0은 IPE 측 타임아웃 없음(여기서 스윕 안 함).
         전이된 행들을 반환한다(state는 이미 'timeout').
         """
-        placeholders = ",".join("?" * len(_TX_TERMINAL_ALL))
         with self._tx() as conn:
             rows = conn.execute(
                 f"SELECT {_TX_COLUMNS} FROM transactions"
-                f" WHERE timeout_ms > 0 AND state NOT IN ({placeholders})"
+                f" WHERE timeout_ms > 0 AND ({_ACTIVE_TX_WHERE})"
                 f" AND (? - started) * 1000.0 >= timeout_ms",
-                (*_TX_TERMINAL_ALL, now),
+                (now,),
             ).fetchall()
             swept = []
             for r in rows:
@@ -473,7 +486,7 @@ class StatePersistence:
     def delete_kv(self, key: str) -> bool:
         with self._conn() as conn:
             cur = conn.execute("DELETE FROM kv WHERE key=?", (key,))
-            return cur.rowcount == 1
+            return int(cur.rowcount) == 1
 
     # -- TERMINAL 스풀 -----------------------------------------------------------
 
@@ -493,19 +506,28 @@ class StatePersistence:
                 "INSERT INTO spool(class, key, payload, nbytes, ts) VALUES(?,?,?,?,?)",
                 (class_, key, payload_json, nbytes, ts),
             )
-            dropped = 0
-            while True:
-                count, total = conn.execute(
-                    "SELECT COUNT(*), COALESCE(SUM(nbytes), 0) FROM spool"
-                ).fetchone()
-                if count <= self.max_spool_entries and total <= self.max_spool_bytes:
-                    break
-                if count <= 1:
-                    break  # 마지막 남은(최신) 행은 절대 드롭하지 않는다
-                conn.execute(
-                    "DELETE FROM spool WHERE id=(SELECT MIN(id) FROM spool)"
-                )
+            dropped = self._trim_spool(conn)
+        return dropped
+
+    def _trim_spool(self, conn: Any) -> int:
+        """Aggregate once, scan evictions in bounded batches, then delete a prefix."""
+        count, total = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(nbytes), 0) FROM spool"
+        ).fetchone()
+        dropped, last_id = 0, 0
+        while count > 1 and (count > self.max_spool_entries or total > self.max_spool_bytes):
+            rows = conn.execute(
+                "SELECT id, nbytes FROM spool WHERE id > ? ORDER BY id LIMIT 256", (last_id,)
+            ).fetchall()
+            for row_id, nbytes in rows:
+                if count <= 1 or (count <= self.max_spool_entries and total <= self.max_spool_bytes):
+                    break  # Preserve the newest row even when it alone exceeds the byte limit.
+                last_id = row_id
+                count -= 1
+                total -= nbytes
                 dropped += 1
+        if dropped:
+            conn.execute("DELETE FROM spool WHERE id <= ?", (last_id,))
         return dropped
 
     def spool_list(self, limit: int = 100, class_: str | None = None) -> list[dict[str, Any]]:
@@ -534,9 +556,9 @@ class StatePersistence:
         if not ids:
             return 0
         placeholders = ",".join("?" * len(ids))
-        with self._conn() as conn:
+        with self._tx() as conn:
             cur = conn.execute(f"DELETE FROM spool WHERE id IN ({placeholders})", ids)
-            return cur.rowcount
+            return int(cur.rowcount)
 
     def spool_counts(self) -> dict[str, int]:
         with self._conn() as conn:
@@ -549,7 +571,6 @@ class StatePersistence:
         """보존 기간이 지난 종단 processed/transaction 행 삭제."""
         cutoff = now - retention_days * 86400.0
         p_terms = ",".join("?" * len(PROCESSED_TERMINAL_STATES))
-        t_terms = ",".join("?" * len(_TX_TERMINAL_ALL))
         with self._conn() as conn:
             cur = conn.execute(
                 f"DELETE FROM processed WHERE state IN ({p_terms}) AND ts <= ?",
@@ -557,8 +578,8 @@ class StatePersistence:
             )
             n_processed = cur.rowcount
             cur = conn.execute(
-                f"DELETE FROM transactions WHERE state IN ({t_terms}) AND updated <= ?",
-                (*_TX_TERMINAL_ALL, cutoff),
+                f"DELETE FROM transactions WHERE NOT ({_ACTIVE_TX_WHERE}) AND updated <= ?",
+                (cutoff,),
             )
             n_tx = cur.rowcount
         return {"processed": n_processed, "transactions": n_tx}
