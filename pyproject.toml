@@ -24,8 +24,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
-    "pytest-cov>=4.1",
     "ruff>=0.5",
     "mypy>=1.10",
     "types-requests",
@@ -64,12 +62,3 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = ["rclpy.*", "rosidl_parser.*", "rosidl_runtime_py.*", "sklearn.*"]
 ignore_missing_imports = true
-
-[tool.pytest.ini_options]
-testpaths = ["tests/unit"]
-pythonpath = ["src", "."]
-addopts = "-v --strict-markers --tb=short"
-markers = [
-    "integration: requires running TinyIoT CSE",
-    "e2e: requires PX4 SITL + Agent + TinyIoT",
-]

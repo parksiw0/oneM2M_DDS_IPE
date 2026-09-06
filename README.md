@@ -17,7 +17,6 @@ ROS 2의 토픽·서비스·액션을 자동 발견하고 oneM2M CSE와 연결�
 config.py          실행 파라미터
 main.py            네이티브 / Docker 실행
 Dockerfile         Docker 이미지 빌드
-tests/unit/        로컬 회귀 테스트 (Git 제외)
 src/ipe/
 ├── __init__.py    패키지 정보
 ├── __main__.py    python -m ipe 진입점
@@ -95,10 +94,8 @@ Docker는 `USE_DOCKER = True`, MQTT 의존성은 `python3 -m pip install -e ".[m
 
 ```bash
 python3 -m pip install -e ".[dev]"
-PYTHONDONTWRITEBYTECODE=1 python3 -B -m pytest -p no:cacheprovider
-ruff check --no-cache src config.py tests/unit
+ruff check --no-cache main.py src config.py
+mypy main.py src
 ```
 
-테스트 파일은 Git에서 제외하며, 위 테스트 명령은 로컬 `tests/unit/` 파일이 있을 때
-사용합니다. 단위 테스트는 외부 CSE와 ROS graph 없이 실행하며, 실제 DDS 연결과
-CSE 통합 실행은 별도로 확인해야 합니다.
+실제 DDS 연결과 CSE 통합 실행은 별도로 확인해야 합니다.
