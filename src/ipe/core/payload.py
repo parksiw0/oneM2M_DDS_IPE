@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 from ipe.core.common import get_path
 from ipe.core.common import set_path as _set_path
-from ipe.ir import TopicIR
+from ipe.core.models import TopicIR
 
 
 def ct_to_epoch(

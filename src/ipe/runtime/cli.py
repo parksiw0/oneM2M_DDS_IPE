@@ -1,3 +1,5 @@
+"""Configure the runtime and select discovery, planning, or bridge execution."""
+
 from __future__ import annotations
 
 import ipaddress
@@ -9,8 +11,8 @@ from types import SimpleNamespace
 
 import config as settings
 from ipe.adapter.rmw import CYCLONE_DDS_RMW, RMWSelectionError, cyclone_peer_uri, select_rmw
-from ipe.models import QoSSpec, ResolvedConfig
-from ipe.runtime.planning import ResolveError, resolve
+from ipe.qos.models import QoSSpec
+from ipe.runtime.planning import ResolvedConfig, ResolveError, resolve
 from ipe.runtime.settings import ConfigError, load_config
 
 log = logging.getLogger(__name__)

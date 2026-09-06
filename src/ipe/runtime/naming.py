@@ -9,9 +9,17 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 from functools import lru_cache
 
-from ipe.models import RobotSpec
+
+@dataclass(frozen=True)
+class RobotSpec:
+    id: str
+    namespace: str = ""
+    ae_per_robot: bool = False
+    ae_name: str | None = None  # 명시적 AE 이름 오버라이드 (기본 C<id>)
+
 
 # oneM2M resourceName: 보수적인 CSE 안전 문자 집합만 허용하고, 단일 경로
 # 세그먼트 안의 그 외 문자는 sanitize 문자로 치환한다. '/'는 경로 구분자

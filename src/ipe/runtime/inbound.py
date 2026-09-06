@@ -12,11 +12,11 @@ from typing import TYPE_CHECKING, Any
 from ipe.core.command import CommandDispatchManager
 from ipe.core.common import deep_merge as _deep_merge
 from ipe.core.common import project_top_level as _project
+from ipe.core.models import ActionSpec, ServiceSpec, TopicSpec
 from ipe.core.payload import ct_to_epoch as _ct_to_epoch
 from ipe.core.pipeline import Op
 from ipe.core.transaction import ActionTransactionManager, ServiceTransactionManager
 from ipe.core.vocab import CLASS_OBSERVE_BULK, CLASS_TERMINAL
-from ipe.models import ActionSpec, ServiceSpec, TopicSpec
 from ipe.onem2m.catchup import CatchUpSweeper
 from ipe.onem2m.notification import Notification
 from ipe.onem2m.resource_ops import ResourceOps
@@ -796,7 +796,7 @@ class InboundProcessor:
 
     def apply_saved_qos_overrides(self, rc: Any) -> None:
         """Restore accepted topic QoS requests before DDS endpoints are created."""
-        from ipe.models import QoSSpec
+        from ipe.qos.models import QoSSpec
 
         saved = self.state.get_kv("qos_overrides", {})
         for spec in rc.topics:

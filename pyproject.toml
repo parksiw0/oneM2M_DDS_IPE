@@ -33,7 +33,7 @@ dev = [
 mqtt = ["paho-mqtt>=2.1"]
 
 [project.scripts]
-ipe = "ipe.cli:main"
+ipe = "ipe.runtime.cli:main"
 
 [tool.setuptools]
 py-modules = ["config"]

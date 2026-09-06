@@ -15,6 +15,7 @@ from typing import Any
 from ipe.core.anomaly import AnomalyGate
 from ipe.core.common import MinIntervalGate
 from ipe.core.filter import DeltaFilter, WindowAggregator
+from ipe.core.models import TopicIR, TopicSpec
 from ipe.core.payload import (
     build_cin_content,
     build_fcnt_attrs,
@@ -35,8 +36,6 @@ from ipe.core.vocab import (
 from ipe.core.vocab import (
     CLASS_TERMINAL as QUEUE_TERMINAL,
 )
-from ipe.ir import TopicIR
-from ipe.models import TopicSpec
 from ipe.qos.lifespan import expires_at as sample_expiry
 
 # representation별로 path_map에 있어야 하는 뷰 — 프로비저닝과의 계약.

@@ -11,25 +11,20 @@ robot 스코프·충돌 검사 완료된 TopicSpec/ServiceSpec/ActionSpec.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from typing import Any
 
 from ipe.core.common import deep_merge as _deep_merge
-from ipe.core.transaction import termination_resolve_message, termination_violation
-from ipe.models import (
-    ACTION_QOS_CHANNELS,
+from ipe.core.models import (
     ActionSpec,
     CommandSafety,
-    CSESpec,
-    MqttSpec,
-    QosFcntSpec,
-    QoSSpec,
-    ResolvedConfig,
-    RobotSpec,
     SampleSpec,
     ServiceSpec,
     SourceTsSpec,
     TopicSpec,
 )
+from ipe.core.transaction import termination_resolve_message, termination_violation
+from ipe.onem2m.client import CSESpec, MqttSpec
 from ipe.qos.configuration import (
     QOS_INLINE_SCHEMA,
     QoSConfigError,
@@ -44,7 +39,9 @@ from ipe.qos.configuration import (
 from ipe.qos.configuration import (
     _resolve_qos as _qos_profile,
 )
+from ipe.qos.models import ACTION_QOS_CHANNELS, QosFcntSpec, QoSSpec
 from ipe.runtime.naming import (
+    RobotSpec,
     apply_captures,
     interface_segments,
     match_pattern,
@@ -58,6 +55,30 @@ from ipe.runtime.naming import (
 log = logging.getLogger("ipe.runtime.planning")
 
 Discovered = dict[str, Any]
+
+
+@dataclass
+class ResolvedConfig:
+    instance_id: str
+    cse: CSESpec
+    notification_host: str
+    notification_port: int
+    robots: dict[str, RobotSpec]
+    qos_profiles: dict[str, QoSSpec]
+    naming: dict[str, Any]
+    discovery: dict[str, Any]
+    defaults: dict[str, Any]
+    policy: dict[str, Any]
+    recovery: dict[str, Any]
+    dispatch: dict[str, Any] = field(default_factory=lambda: {"drain_budget": 32})
+    storage: dict[str, Any] = field(default_factory=dict)
+    logging: dict[str, Any] = field(default_factory=dict)
+    robots_strict: bool = False
+    topics: list[TopicSpec] = field(default_factory=list)
+    services: list[ServiceSpec] = field(default_factory=list)
+    actions: list[ActionSpec] = field(default_factory=list)
+    qos_fcnt: QosFcntSpec = field(default_factory=QosFcntSpec)
+    raw: dict[str, Any] = field(default_factory=dict)
 
 
 class ResolveError(Exception):

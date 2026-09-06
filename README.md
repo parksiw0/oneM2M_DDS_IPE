@@ -19,12 +19,11 @@ main.py            네이티브 / Docker 실행
 Dockerfile         Docker 이미지 빌드
 tests/unit/        로컬 회귀 테스트 (Git 제외)
 src/ipe/
-├── models.py      해석된 인터페이스·연결 설정의 공통 자료형
-├── ir.py          ROS 데이터·QoS 상태 전달 형식
-├── cli.py         실행 진입점
+├── __init__.py    패키지 정보
+├── __main__.py    python -m ipe 진입점
 ├── adapter/       ROS 2 연동·메시지 변환·RMW 선택
 ├── qos/           QoS별 조정·oneM2M 매핑·요청 해석
-├── core/          데이터 파이프라인·필터·명령·트랜잭션
+├── core/          공통 인터페이스 자료형·데이터 파이프라인·명령·트랜잭션
 ├── onem2m/        CSE 통신·리소스 관리
 └── runtime/       앱 실행·수신·송신·연결 관리·상태 저장
 ```
@@ -35,8 +34,15 @@ src/ipe/
 `runtime/naming.py`는 로봇 식별과 경로를 계산합니다. QoS 검증 규칙은
 `qos/configuration.py`, 전송 설정 규칙은 `onem2m/client.py`에서 제공합니다.
 
-`runtime/app.py`가 실행을 조립하고, `inbound.py`는 요청 처리, `outbound.py`는 데이터 송신·재시도,
+`runtime/cli.py`가 설정·실행 모드를 선택하고, `runtime/app.py`가 실행을 조립합니다.
+`inbound.py`는 요청 처리, `outbound.py`는 데이터 송신·재시도,
 `bindings.py`는 자동 발견·연결 변경, `status.py`는 QoS 상태 게시를 담당합니다.
+
+공통 토픽·서비스·액션 자료형과 토픽 전달 형식(`TopicIR`)은 `core/models.py`에 둡니다.
+QoS 자료형과 상태 전달 형식은 `qos/models.py`, CSE·MQTT 접속 자료형은
+`onem2m/client.py`에서 관리합니다. 로봇 식별 자료형은 `runtime/naming.py`,
+최종 연결 계획(`ResolvedConfig`)은 `runtime/planning.py`에 정의합니다.
+
 복구 작업은 종류별로 병합하고, 실패한 프로비저닝 결과는 기존 경로에 적용하지 않습니다.
 종료된 서비스·액션 요청은 늦은 응답으로 다시 변경하지 않습니다. 상태 DB의 종료 기록은
 `recovery.dedup_retention_days`에 따라 `cleanup_interval_sec` 간격으로 정리합니다.

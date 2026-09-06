@@ -10,10 +10,11 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
-from ipe.models import ActionSpec, ResolvedConfig, ServiceSpec, TopicSpec
+from ipe.core.models import ActionSpec, ServiceSpec, TopicSpec
 from ipe.onem2m.resource_ops import ResourceOps
 from ipe.runtime.dispatcher import InboundEvent, Route, RouteTable
 from ipe.runtime.lifecycle import IPEHealth, IPEPhase, IPEState, Lifecycle
+from ipe.runtime.planning import ResolvedConfig
 from ipe.runtime.provisioning import Provisioner
 from ipe.runtime.queues import ProvisioningQueue
 

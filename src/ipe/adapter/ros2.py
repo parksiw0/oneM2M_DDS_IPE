@@ -23,11 +23,11 @@ from typing import Any
 
 from ipe.adapter.messages import TranscodeError, extract_source_ts, from_canonical, parse_message
 from ipe.adapter.qos import build_qos_profile, check_compatible
-from ipe.ir import TopicIR
-from ipe.models import ACTION_QOS_CHANNELS, ActionSpec, ServiceSpec, TopicSpec
+from ipe.core.models import ActionSpec, ServiceSpec, TopicIR, TopicSpec
 from ipe.qos import engine as qosmod
 from ipe.qos.codec import endpoint_to_peer
 from ipe.qos.configuration import command_qos_violation
+from ipe.qos.models import ACTION_QOS_CHANNELS
 
 log = logging.getLogger(__name__)
 

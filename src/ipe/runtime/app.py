@@ -8,7 +8,6 @@ import threading
 from contextlib import suppress
 from typing import Any
 
-from ipe.models import ResolvedConfig
 from ipe.onem2m.client import idify, make_onem2m_client
 from ipe.onem2m.notification_server import NotificationServer
 from ipe.onem2m.resource_ops import ResourceOps
@@ -17,7 +16,7 @@ from ipe.runtime.discovery import GraphNotReady, await_graph_convergence
 from ipe.runtime.inbound import InboundProcessor
 from ipe.runtime.lifecycle import IPEHealth, IPEPhase, IPEState, Lifecycle
 from ipe.runtime.outbound import OutboundProcessor
-from ipe.runtime.planning import resolve
+from ipe.runtime.planning import ResolvedConfig, resolve
 from ipe.runtime.provisioning import Provisioner
 from ipe.runtime.state import StatePersistence
 from ipe.runtime.status import StatusPublisher

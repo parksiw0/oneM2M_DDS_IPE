@@ -12,8 +12,8 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
-from ipe.models import ResolvedConfig
 from ipe.runtime.naming import sanitize_segment
+from ipe.runtime.planning import ResolvedConfig
 
 log = logging.getLogger(__name__)
 
@@ -330,7 +330,7 @@ class Provisioner:
             res.path_map[(a.robot_id, a.interface, view)] = path
         self._input_sub(res, goal, "action_goal", a.robot_id, a.interface, a.rel_path)
         self._input_sub(res, cancel, "cancel", a.robot_id, a.interface, a.rel_path)
-        from ipe.models import ACTION_QOS_CHANNELS
+        from ipe.qos.models import ACTION_QOS_CHANNELS
         self._provision_static_qos_fcnt(
             res,
             parent,

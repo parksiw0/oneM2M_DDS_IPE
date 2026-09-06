@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypedDict
 
 
 @dataclass(frozen=True)
@@ -69,3 +69,19 @@ ACTION_QOS_CHANNELS = (
     "feedback_sub",
     "status_sub",
 )
+
+
+class QoSStateIR(TypedDict):
+    """어댑터 -> 앱 QoS 상태 운반 계약 (QoS_FCNT_설계서 §5.2).
+
+    qos FCNT 게시의 입력이며 TopicIR.metadata에는 싣지 않는다(CIN마다
+    QoS를 나르지 않음).
+    """
+
+    robot_id: str
+    interface: str
+    direction: str               # "observe" | "command"
+    configured: Any              # QoSSpec (config.py 해석 결과)
+    applied: Any                 # QoSSpec | None — 바인딩 전 None
+    peers: list[dict[str, Any]]  # qos.codec.endpoint_to_peer 원소
+    events: list[str]            # 마지막 조정·가드 어휘 (§4.6.2)

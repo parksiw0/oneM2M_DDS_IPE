@@ -1,26 +1,19 @@
-"""해석 완료된 설정 스펙 — 런타임을 향한 계약.
+"""Interface specifications and topic data shared by the adapter and pipeline.
 
-runtime.settings가 검증한 설정을 runtime.planning이 발견된 ROS2 인터페이스와 합쳐
-이 완전 해석된 스펙들로 바꾼다. 하류(어댑터·정책·라이프사이클)는 raw 설정
-dict가 아니라 언제나 스펙만 소비한다.
+Resolved interface specifications describe how each topic, service, or action
+is bridged. TopicIR carries an observed sample between processing modules.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
-from ipe.qos.models import ACTION_QOS_CHANNELS as ACTION_QOS_CHANNELS
-from ipe.qos.models import QosFcntSpec, QoSSpec
+from ipe.qos.models import QoSSpec
 
 Direction = Literal["observe", "command", "both"]
 Representation = Literal["historical", "latest", "both", "sampled"]
 FeedbackMode = Literal["log", "latest", "sampled", "combined"]
-
-
-# ---------------------------------------------------------------------------
-# 샘플링 / 필터 / 명령 안전장치
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -52,24 +45,6 @@ class SourceTsSpec:
 
     field: str | None = None  # 점 표기 경로; None이면 header.stamp 자동 탐지
     format: str = "ros_time"  # 레지스트리 이름 (ros_time/epoch_seconds/... + 어댑터 별칭)
-
-
-# ---------------------------------------------------------------------------
-# robot 식별
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class RobotSpec:
-    id: str
-    namespace: str = ""
-    ae_per_robot: bool = False
-    ae_name: str | None = None  # 명시적 AE 이름 오버라이드 (기본 C<id>)
-
-
-# ---------------------------------------------------------------------------
-# 인터페이스 스펙 (해석 완료, robot 스코프)
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -129,9 +104,6 @@ class ServiceSpec:
     source_rule: str = ""
 
 
-# 액션 클라이언트 QoS 채널: 키는 이 이름들로 제한
-
-
 @dataclass
 class ActionSpec:
     robot_id: str
@@ -152,69 +124,15 @@ class ActionSpec:
     source_rule: str = ""
 
 
-# ---------------------------------------------------------------------------
-# 최상위 해석 결과
-# ---------------------------------------------------------------------------
+class TopicIR(TypedDict):
+    """ROS2 토픽 관측 IR (ROS2 -> oneM2M)."""
 
-
-@dataclass(frozen=True)
-class MqttSpec:
-    """MQTT 바인딩 설정 (protocol: mqtt). 브로커 접속 + 토픽/QoS/TLS."""
-
-    host: str = "127.0.0.1"
-    port: int = 1883
-    client_id: str = "ros2-ipe"
-    keepalive: int = 60
-    qos: int = 1
-    clean_session: bool = False
-    topic_prefix: str = ""
-    response_timeout_ms: int = 5000
-    connect_timeout_ms: int = 10000
-    max_payload: int = 65536
-    tls: bool = False
-    tls_ca: str | None = None
-    tls_cert: str | None = None
-    tls_key: str | None = None
-    tls_insecure: bool = False
-    username: str | None = None
-    password: str | None = None
-
-
-@dataclass
-class CSESpec:
-    endpoint: str  # http 바인딩 베이스 URL (mqtt면 빈 문자열)
-    cse_base: str  # CSE 리소스 이름(CSE_BASE_NAME) — to 경로 루트
-    ae_name: str
-    timezone: str = "local"  # ct 해석 기준: IANA timezone 또는 local
-    protocol: str = "http"
-    cse_id: str = ""  # MQTT 토픽 receiver(CSE_BASE_RI) — mqtt 필수
-    origin: str = "CAdmin"
-    rvi: str = "3"
-    poa: str = ""
-    mqtt: MqttSpec | None = None
-    http_timeout_sec: float = 5.0
-    http_max_payload: int = 65536
-
-
-@dataclass
-class ResolvedConfig:
-    instance_id: str
-    cse: CSESpec
-    notification_host: str
-    notification_port: int
-    robots: dict[str, RobotSpec]
-    qos_profiles: dict[str, QoSSpec]
-    naming: dict[str, Any]
-    discovery: dict[str, Any]
-    defaults: dict[str, Any]
-    policy: dict[str, Any]
-    recovery: dict[str, Any]
-    dispatch: dict[str, Any] = field(default_factory=lambda: {"drain_budget": 32})
-    storage: dict[str, Any] = field(default_factory=dict)
-    logging: dict[str, Any] = field(default_factory=dict)
-    robots_strict: bool = False
-    topics: list[TopicSpec] = field(default_factory=list)
-    services: list[ServiceSpec] = field(default_factory=list)
-    actions: list[ActionSpec] = field(default_factory=list)
-    qos_fcnt: QosFcntSpec = field(default_factory=QosFcntSpec)
-    raw: dict[str, Any] = field(default_factory=dict)
+    interface_type: str          # 항상 "topic"
+    robot_id: str                # 소유 로봇 (경로·상관 키 스코프)
+    interface_name: str          # 예: "/tb3/odom"
+    message_type: str            # 예: "nav_msgs/msg/Odometry"
+    source_ts: float | None      # 메시지 헤더 stamp (epoch 초), 없을 수 있음
+    ingest_ts: float             # IPE 수신 시각 (epoch 초) — QoS 판정의 기준
+    seq: int                     # (robot, interface)별 단조 증가 시퀀스
+    payload: dict[str, Any]      # 파싱된 메시지 필드 (rosidl dict 형태)
+    metadata: dict[str, Any]     # source_node, qos, sim_time 플래그 등

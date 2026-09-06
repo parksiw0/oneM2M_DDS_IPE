@@ -32,7 +32,7 @@ from ipe.onem2m.client import (
 )
 
 if TYPE_CHECKING:
-    from ipe.models import MqttSpec
+    from ipe.onem2m.client import MqttSpec
 
 log = logging.getLogger(__name__)
 
