@@ -8,10 +8,10 @@ import time
 from types import SimpleNamespace
 
 import config as settings
-from ipe.config.loader import ConfigError, load_config
-from ipe.config.resolver import ResolveError, resolve
-from ipe.config.spec import QoSSpec, ResolvedConfig
-from ipe.rmw_selection import CYCLONE_DDS_RMW, RMWSelectionError, cyclone_peer_uri, select_rmw
+from ipe.adapter.rmw import CYCLONE_DDS_RMW, RMWSelectionError, cyclone_peer_uri, select_rmw
+from ipe.models import QoSSpec, ResolvedConfig
+from ipe.runtime.planning import ResolveError, resolve
+from ipe.runtime.settings import ConfigError, load_config
 
 log = logging.getLogger(__name__)
 
@@ -168,7 +168,12 @@ def _discover(log: logging.Logger, rc: ResolvedConfig, *, explain_plan: bool = F
                         start_parameter_services=False)
         except TypeError:
             node = Node("ipe_discover")
-        adapter = GenericROS2Adapter(node, lambda _ir: None, lambda *_: None)
+        adapter = GenericROS2Adapter(
+            node, lambda _ir: None, lambda *_: None,
+            qos_strictness=rc.policy.get("qos_strictness", "reject"),
+            self_echo_window_sec=rc.policy.get("self_echo_window_sec", 0.5),
+            qos_event_coalesce_sec=rc.policy.get("qos_event_coalesce_sec", 5.0),
+        )
         disc = rc.discovery
         state = await_graph_convergence(
             adapter.snapshot,

@@ -58,7 +58,7 @@ strict_optional = true
 disallow_untyped_defs = false
 
 [[tool.mypy.overrides]]
-module = "cerberus.*"
+module = ["cerberus.*", "paho.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
@@ -66,6 +66,8 @@ module = ["rclpy.*", "rosidl_parser.*", "rosidl_runtime_py.*", "sklearn.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
+testpaths = ["tests/unit"]
+pythonpath = ["src", "."]
 addopts = "-v --strict-markers --tb=short"
 markers = [
     "integration: requires running TinyIoT CSE",

@@ -12,8 +12,8 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
-from ipe.config.identity import sanitize_segment
-from ipe.config.spec import ResolvedConfig
+from ipe.models import ResolvedConfig
+from ipe.runtime.naming import sanitize_segment
 
 log = logging.getLogger(__name__)
 
@@ -218,7 +218,7 @@ class Provisioner:
         qf = self.rc.qos_fcnt
         if not qf.enabled:
             return
-        from ipe.core.qos import spec_to_fcnt_attrs
+        from ipe.qos.codec import spec_to_fcnt_attrs
         attrs = spec_to_fcnt_attrs(
             direction=direction, interface=t.interface, robot_id=t.robot_id,
             configured=t.qos_for(direction), msg_type=t.msg_type,
@@ -329,7 +329,7 @@ class Provisioner:
             res.path_map[(a.robot_id, a.interface, view)] = path
         self._input_sub(res, goal, "action_goal", a.robot_id, a.interface, a.rel_path)
         self._input_sub(res, cancel, "cancel", a.robot_id, a.interface, a.rel_path)
-        from ipe.config.spec import ACTION_QOS_CHANNELS
+        from ipe.models import ACTION_QOS_CHANNELS
         self._provision_static_qos_fcnt(
             res,
             parent,
@@ -356,7 +356,7 @@ class Provisioner:
         """Create one management FCNT for a logical service or action interface."""
         if not self.rc.qos_fcnt.enabled:
             return
-        from ipe.core.qos import interface_qos_fcnt_attrs
+        from ipe.qos.codec import interface_qos_fcnt_attrs
         attrs = interface_qos_fcnt_attrs(
             interface_kind=interface_kind,
             interface=spec.interface,

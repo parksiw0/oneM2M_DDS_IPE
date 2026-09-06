@@ -32,6 +32,8 @@ CONFIG = {
         "ae_name": "ros2-ipe",
         "origin": "Cros2-ipe",
         "rvi": "3",
+        "http_timeout_sec": 5.0,
+        "http_max_payload": 65536,                 # 인코딩된 요청 본문 바이트
         "timezone": "local",                        # 예: Asia/Seoul
         "mqtt": {
             "host": "127.0.0.1",
@@ -39,6 +41,9 @@ CONFIG = {
             "client_id": "ros2-ipe",
             "qos": 1,
             "keepalive": 60,
+            "clean_session": False,
+            "topic_prefix": "",
+            "max_payload": 65536,
             "response_timeout_ms": 5000,
             "connect_timeout_ms": 10000,
             "username": None,
@@ -54,6 +59,7 @@ CONFIG = {
 
     # ROS namespace가 없는 graph에 사용할 로봇 이름입니다.
     "robots": [{"id": "robot", "namespace": ""}],
+    "robots_strict": False,
     "discovery": {
         "mode": "auto-expose",
         "domain_id": 0,                              # 네이티브/Docker 공통 ROS_DOMAIN_ID
@@ -89,11 +95,25 @@ CONFIG = {
         "control_lane_max": 64,
         "retry_count": 3,
         "retry_delay_ms": 500,
+        "backoff": "exponential",                  # fixed / exponential
+        "cancel_orphan_goals": False,
         "catch_up_sec": 0,                          # 0: 주기적 catch-up 비활성화
         "reconcile_sec": 0,                         # 0: 주기적 CSE reconcile 비활성화
         "dedup_retention_days": 7,
     },
     "dispatch": {"drain_budget": 32},
+    "policy": {
+        "confirmation": "auto",
+        "qos_strictness": "reject",                 # reject / demote
+        "history_keep_all_limit": 1000,             # KEEP_ALL의 CSE 보관 상한(mni)
+        "default_stale_after_ms": 5000,
+        "stale_deadline_multiplier": 2,
+        "stale_exempt_topics": ["robot_description", "tf_static"],
+        "self_echo_window_sec": 0.5,
+        "qos_event_coalesce_sec": 5.0,
+        "max_total_write_hz": 0,                    # 0: 전역 쓰기 속도 제한 없음
+        "suitability": {"large_payload_bytes": 49152},
+    },
     "logging": {
         "level": "INFO",                            # DEBUG / INFO / WARNING / ERROR
         "heartbeat_sec": 30,
@@ -101,6 +121,13 @@ CONFIG = {
     },
     "qos_fcnt": {
         "enabled": True,
+        "type": "ros:tqos",
+        "cnd": "kr.ac.sejong.seslab.ros2.moduleclass.topicQos",
+        "service_type": "ros:sqos",
+        "service_cnd": "kr.ac.sejong.seslab.ros2.moduleclass.serviceQos",
+        "action_type": "ros:aqos",
+        "action_cnd": "kr.ac.sejong.seslab.ros2.moduleclass.actionQos",
+        "lbl_compat": True,
         "allow_update": False,
         "publish_min_interval_ms": 5000,
         "peers_max": 8,
@@ -114,12 +141,29 @@ CONFIG = {
             "history": "KEEP_LAST",
             "depth": 5,
         },
+        "command": {
+            "reliability": "RELIABLE",
+            "durability": "VOLATILE",
+            "history": "KEEP_LAST",
+            "depth": 10,
+        },
     },
     "defaults": {
+        # qos를 생략하면 sensor_data를 기준으로 publisher와 자동 조정합니다.
+        # qos를 명시하면 해당 필드는 사용자가 요청한 값으로 취급합니다.
         "topic_observe": {"representation": "latest"},
-        "topic_command": {"access": {"enabled": not OBSERVE_ONLY}},
-        "service": {"access": {"enabled": not OBSERVE_ONLY}},
-        "action": {"access": {"enabled": not OBSERVE_ONLY}},
+        "topic_command": {
+            "qos": "command",
+            "command": {"max_age_ms": 5000},
+            "access": {"enabled": not OBSERVE_ONLY},
+        },
+        "service": {"timeout_ms": 5000, "access": {"enabled": not OBSERVE_ONLY}},
+        "action": {
+            "timeout_ms": 0,                        # 0: 서버 소멸을 discovery로 감지
+            "feedback": "sampled",
+            "feedback_sample": {"min_interval_ms": 500},
+            "access": {"enabled": not OBSERVE_ONLY},
+        },
     },
     "naming": {"path_style": "flat", "sanitize": "_"},
     "bridge": {"topics": [], "services": [], "actions": []},

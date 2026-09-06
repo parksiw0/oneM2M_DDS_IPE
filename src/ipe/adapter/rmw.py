@@ -58,7 +58,7 @@ def select_rmw(
         command = [
             sys.executable,
             "-m",
-            "ipe.rmw_selection",
+            "ipe.adapter.rmw",
             "--probe",
             "--timeout-sec",
             str(probe_timeout),
@@ -118,7 +118,9 @@ def select_rmw(
         vendor_id = str(endpoint.get("vendor_id", ""))
         vendors[vendor_id] = vendors.get(vendor_id, 0) + 1
     if len(vendors) != 1:
-        found = ", ".join(f"{vendor or 'unknown'} ({count})" for vendor, count in sorted(vendors.items()))
+        found = ", ".join(
+            f"{vendor or 'unknown'} ({count})" for vendor, count in sorted(vendors.items())
+        )
         raise RMWSelectionError(
             f"Mixed DDS endpoint vendors were discovered: {found}; "
             "set discovery.rmw_implementation in config.py."
@@ -144,7 +146,7 @@ def _parse_probe_output(stdout: str) -> dict[str, Any] | None:
     for line in reversed(stdout.splitlines()):
         if line.startswith(PROBE_PREFIX):
             try:
-                value = json.loads(line[len(PROBE_PREFIX):])
+                value = json.loads(line[len(PROBE_PREFIX) :])
             except json.JSONDecodeError:
                 return None
             return value if isinstance(value, dict) else None
@@ -248,7 +250,7 @@ def _probe_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _probe_parser().parse_args(argv)
     if not args.probe:
-        print("rmw_selection is an internal probe module", file=sys.stderr)
+        print("ipe.adapter.rmw is an internal probe module", file=sys.stderr)
         return 2
     try:
         return _run_probe(args.timeout_sec, args.robot_namespace)

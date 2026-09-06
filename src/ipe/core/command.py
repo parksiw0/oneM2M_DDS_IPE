@@ -12,8 +12,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from ipe.config.spec import TopicSpec
 from ipe.core.common import TokenBucket, get_path, set_path
+from ipe.models import TopicSpec
 
 
 @dataclass

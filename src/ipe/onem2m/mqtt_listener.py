@@ -26,7 +26,7 @@ from ipe.onem2m.notification import Notification, parse_notification
 from ipe.onem2m.notification_server import ACK_RESULTS
 
 if TYPE_CHECKING:
-    from ipe.config.spec import MqttSpec
+    from ipe.models import MqttSpec
 
 log = logging.getLogger(__name__)
 

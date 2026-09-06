@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from ipe.config.spec import ResolvedConfig
+    from ipe.models import ResolvedConfig
 
 log = logging.getLogger(__name__)
 
@@ -219,7 +219,10 @@ def make_onem2m_client(rc: ResolvedConfig, origin: str) -> OneM2MClient:
     if proto == "http":
         from ipe.onem2m.http_client import OneM2MHTTPClient
 
-        return OneM2MHTTPClient(rc.cse.endpoint, origin=origin, rvi=rc.cse.rvi)
+        return OneM2MHTTPClient(
+            rc.cse.endpoint, origin=origin, rvi=rc.cse.rvi,
+            timeout=rc.cse.http_timeout_sec, max_payload=rc.cse.http_max_payload,
+        )
     if proto == "mqtt":
         try:
             from ipe.onem2m.mqtt_client import OneM2MMQTTClient
@@ -235,3 +238,53 @@ def make_onem2m_client(rc: ResolvedConfig, origin: str) -> OneM2MClient:
         return OneM2MMQTTClient(mqtt, rc.cse.cse_id, rc.cse.cse_base,
                                 origin=origin, rvi=rc.cse.rvi)
     raise ValueError(f"unknown cse.protocol {proto!r} (expected 'http' or 'mqtt')")
+
+
+# Transport configuration shared by HTTP and MQTT clients.
+CSE_SETTINGS_FIELD = {
+        "type": "dict",
+        "required": True,
+        "schema": {
+            # endpoint는 http에서만 필수 — 교차검증은 loader._check_cse_protocol.
+            "endpoint": {"type": "string", "required": False, "regex": r"^https?://.+"},
+            "cse_base": {"type": "string", "required": True, "empty": False},
+            # oneM2M 표준 UTC 또는 tinyIoT가 사용하는 CSE 로컬 ct 해석 기준.
+            "timezone": {"type": "string", "empty": False, "default": "local"},
+            "ae_name": {"type": "string", "required": True, "empty": False},
+            "protocol": {"type": "string", "allowed": ["http", "mqtt"], "default": "http"},
+            # MQTT 토픽 receiver 세그먼트(CSE-ID / CSE_BASE_RI). cse_base(CSE 리소스
+            # 이름)와 다를 수 있어 별도 필드 — mqtt에서 필수(loader 교차검증).
+            "cse_id": {"type": "string", "required": False},
+            "origin": {"type": "string", "default": "CAdmin"},
+            "rvi": {"type": "string", "default": "3"},
+            "http_timeout_sec": {"type": ["integer", "float"], "min": 0.001, "default": 5.0},
+            "http_max_payload": {"type": "integer", "min": 1, "default": 65536},
+            "poa": {"type": "string", "required": False},
+            # MQTT 바인딩 설정 (protocol: mqtt 일 때만 사용)
+            "mqtt": {
+                "type": "dict",
+                "required": False,
+                "schema": {
+                    "host": {"type": "string", "default": "127.0.0.1"},
+                    "port": {"type": "integer", "min": 1, "max": 65535, "default": 1883},
+                    "client_id": {"type": "string", "default": "ros2-ipe"},
+                    "keepalive": {"type": "integer", "min": 1, "default": 60},
+                    "qos": {"type": "integer", "allowed": [0, 1, 2], "default": 1},
+                    "clean_session": {"type": "boolean", "default": False},
+                    "topic_prefix": {"type": "string", "default": ""},
+                    "response_timeout_ms": {"type": "integer", "min": 1, "default": 5000},
+                    "connect_timeout_ms": {"type": "integer", "min": 1, "default": 10000},
+                    # tinyIoT MAX_PAYLOAD_SIZE 와 동일 기본값
+                    "max_payload": {"type": "integer", "min": 1, "default": 65536},
+                    "tls": {"type": "boolean", "default": False},
+                    "tls_ca": {"type": "string", "required": False, "nullable": True},
+                    "tls_cert": {"type": "string", "required": False, "nullable": True},
+                    "tls_key": {"type": "string", "required": False, "nullable": True},
+                    "tls_insecure": {"type": "boolean", "default": False},
+                    "username": {"type": "string", "required": False, "nullable": True},
+                    "password": {"type": "string", "required": False, "nullable": True},
+                },
+                "default": {},
+            },
+        },
+    }

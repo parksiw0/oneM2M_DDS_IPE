@@ -10,7 +10,7 @@ from __future__ import annotations
 import base64
 import binascii
 import importlib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 try:
@@ -29,7 +29,15 @@ try:
 except ImportError:  # ROS 없이도(CI) 임포트는 가능해야 함; 변환 호출 시점에 명시적으로 실패
     _HAVE_ROSIDL = False
 
-__all__ = ["TranscodeError", "to_canonical", "from_canonical", "make_input_example"]
+__all__ = [
+    "TranscodeError",
+    "to_canonical",
+    "from_canonical",
+    "make_input_example",
+    "parse_message",
+    "extract_source_ts",
+    "register_ts_format",
+]
 
 _JSON_SAFE_INT_MAX = 2**53
 
@@ -79,9 +87,12 @@ class TranscodeError(ValueError):
 # 인트로스펙션 헬퍼
 # ---------------------------------------------------------------------------
 
+
 def _require_rosidl() -> None:
     if not _HAVE_ROSIDL:
-        raise TranscodeError("", "rosidl_parser is required for transcoding (ROS environment not sourced)")
+        raise TranscodeError(
+            "", "rosidl_parser is required for transcoding (ROS environment not sourced)"
+        )
 
 
 def _iter_fields(msg_class: Any) -> list[tuple[str, Any]]:
@@ -107,7 +118,10 @@ def _is_byte_sequence(slot: AbstractNestedType) -> bool:
 # 읽기 경로: rosidl dict 형태 -> 정준 JSON-safe dict
 # ---------------------------------------------------------------------------
 
-def to_canonical(payload: Mapping[str, Any], msg_class: type, int64_as_string: bool = False) -> dict[str, Any]:
+
+def to_canonical(
+    payload: Mapping[str, Any], msg_class: type, int64_as_string: bool = False
+) -> dict[str, Any]:
     """``message_to_ordereddict`` 출력(또는 원시 속성 dict) -> 정준 dict.
 
     NaN/Inf float는 여기서 치환하지 않고 그대로 통과시킨다(치환은 normalize 소관).
@@ -118,7 +132,9 @@ def to_canonical(payload: Mapping[str, Any], msg_class: type, int64_as_string: b
 
 def _read_struct(payload: Any, msg_class: type, path: str, i64s: bool) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
-        raise TranscodeError(path, f"expected mapping for {msg_class.__name__}, got {type(payload).__name__}")
+        raise TranscodeError(
+            path, f"expected mapping for {msg_class.__name__}, got {type(payload).__name__}"
+        )
     out: dict[str, Any] = {}
     for name, slot in _iter_fields(msg_class):
         if name == _EMPTY_STRUCT_MEMBER or name not in payload:
@@ -152,7 +168,9 @@ def _read_basic(value: Any, typename: str, path: str, i64s: bool) -> Any:
         if typename in _INT_RANGES:
             if isinstance(value, str):  # char/wchar는 1글자 str로 올 수 있음
                 if len(value) != 1:
-                    raise TranscodeError(path, f"expected single char, got {len(value)}-char string")
+                    raise TranscodeError(
+                        path, f"expected single char, got {len(value)}-char string"
+                    )
                 return ord(value)
             v = int(value)
             if i64s and typename in _INT64_TYPENAMES and abs(v) > _JSON_SAFE_INT_MAX:
@@ -161,7 +179,9 @@ def _read_basic(value: Any, typename: str, path: str, i64s: bool) -> Any:
     except TranscodeError:
         raise
     except (TypeError, ValueError) as exc:
-        raise TranscodeError(path, f"cannot read {typename} from {type(value).__name__}: {exc}") from exc
+        raise TranscodeError(
+            path, f"cannot read {typename} from {type(value).__name__}: {exc}"
+        ) from exc
     return value
 
 
@@ -195,7 +215,9 @@ def _read_sequence(value: Any, slot: AbstractNestedType, path: str, i64s: bool) 
         items = list(value)
     except TypeError as exc:
         raise TranscodeError(path, f"expected sequence, got {type(value).__name__}") from exc
-    return [_read_value(item, slot.value_type, f"{path}[{i}]", i64s) for i, item in enumerate(items)]
+    return [
+        _read_value(item, slot.value_type, f"{path}[{i}]", i64s) for i, item in enumerate(items)
+    ]
 
 
 def _container_to_bytes(value: Any, path: str) -> bytes:
@@ -232,7 +254,10 @@ def _container_to_bytes(value: Any, path: str) -> bytes:
 # 쓰기 경로: 정준 dict -> set_message_fields가 받는 dict
 # ---------------------------------------------------------------------------
 
-def from_canonical(canonical: Mapping[str, Any], msg_class: type, int64_as_string: bool = False) -> dict[str, Any]:
+
+def from_canonical(
+    canonical: Mapping[str, Any], msg_class: type, int64_as_string: bool = False
+) -> dict[str, Any]:
     """정준 dict를 ``set_message_fields(msg_class(), ...)``용으로 검증·강제 변환.
 
     엄격 검증: 미지 필드, NaN/Inf, 타입 불일치, 범위 초과, 고정/제한 길이 위반은
@@ -245,7 +270,9 @@ def from_canonical(canonical: Mapping[str, Any], msg_class: type, int64_as_strin
 
 def _write_struct(value: Any, msg_class: type, path: str, i64s: bool) -> dict[str, Any]:
     if not isinstance(value, Mapping):
-        raise TranscodeError(path, f"expected object for {msg_class.__name__}, got {type(value).__name__}")
+        raise TranscodeError(
+            path, f"expected object for {msg_class.__name__}, got {type(value).__name__}"
+        )
     slots = dict(_iter_fields(msg_class))
     out: dict[str, Any] = {}
     for key, item in value.items():
@@ -280,7 +307,9 @@ def _write_basic(value: Any, typename: str, path: str, i64s: bool) -> Any:
     if typename in _FLOAT_TYPENAMES:
         return _write_float(value, typename, path)
     if typename in _OCTET_TYPENAMES:
-        return bytes([_write_int(value, typename, path, i64s)])  # rclpy의 스칼라 byte는 1바이트 bytes
+        return bytes(
+            [_write_int(value, typename, path, i64s)]
+        )  # rclpy의 스칼라 byte는 1바이트 bytes
     if typename in _INT_RANGES:
         return _write_int(value, typename, path, i64s)
     return value
@@ -342,7 +371,9 @@ def _check_length(n: int, slot: AbstractNestedType, path: str) -> None:
 def _write_sequence(value: Any, slot: AbstractNestedType, path: str, i64s: bool) -> Any:
     if _is_byte_sequence(slot):
         if not isinstance(value, str):
-            raise TranscodeError(path, f"expected base64 string for byte array, got {type(value).__name__}")
+            raise TranscodeError(
+                path, f"expected base64 string for byte array, got {type(value).__name__}"
+            )
         try:
             raw = base64.b64decode(value, validate=True)
         except (binascii.Error, ValueError) as exc:
@@ -351,19 +382,149 @@ def _write_sequence(value: Any, slot: AbstractNestedType, path: str, i64s: bool)
         if slot.value_type.typename in _OCTET_TYPENAMES:
             return [bytes([b]) for b in raw]  # rclpy의 byte[]는 1바이트 bytes의 시퀀스
         return raw  # rclpy의 uint8[]은 bytes를 그대로 받음
-    if (isinstance(value, str | bytes | bytearray | Mapping)
-            or not isinstance(value, list | tuple)):
+    if isinstance(value, str | bytes | bytearray | Mapping) or not isinstance(value, list | tuple):
         raise TranscodeError(path, f"expected array, got {type(value).__name__}")
     _check_length(len(value), slot, path)
-    return [_write_value(item, slot.value_type, f"{path}[{i}]", i64s) for i, item in enumerate(value)]
+    return [
+        _write_value(item, slot.value_type, f"{path}[{i}]", i64s) for i, item in enumerate(value)
+    ]
 
 
 # ---------------------------------------------------------------------------
 # 정준 입력 예시(config CNT input_example)
 # ---------------------------------------------------------------------------
 
+
 def make_input_example(msg_class: type) -> dict[str, Any]:
     """기본 생성 인스턴스로 만든 해당 타입의 정준 dict 예시."""
     from rosidl_runtime_py import message_to_ordereddict
 
     return to_canonical(message_to_ordereddict(msg_class()), msg_class)
+
+
+def parse_message(msg: Any) -> dict[str, Any]:
+    """임의 ROS2 메시지 -> 정준 JSON-safe dict. 타입별 코드 없음."""
+    from rosidl_runtime_py import message_to_ordereddict
+
+    return to_canonical(message_to_ordereddict(msg), type(msg))
+
+
+# ---------------------------------------------------------------------------
+# source-ts 포맷 레지스트리
+#
+# 선언적 추출: `source_ts: {field, format}`이 등록된 변환기(원시 필드 값 ->
+# epoch 초 | None)를 지정한다. 펌웨어 고유 토큰은 어댑터가 등록하는
+# 별칭이다 — 코어는 절대 하드코딩하지 않는다.
+# ---------------------------------------------------------------------------
+
+TsFormatFn = Callable[[Any], "float | None"]
+
+
+def _as_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ros_time_dict(value: Any) -> float | None:
+    """{sec, nanosec} dict → epoch 초. 그 외 형태는 None — 폴백은 호출자 몫."""
+    if isinstance(value, dict) and "sec" in value:
+        return float(value.get("sec", 0) + value.get("nanosec", 0) / 1e9)
+    return None
+
+
+def _fmt_ros_time(value: Any) -> float | None:
+    # 폴백 차이는 의도: _fmt는 문자열 숫자도 허용(_as_float),
+    # _coerce_ros_time은 int/float만 받는다.
+    ts = _ros_time_dict(value)
+    return ts if ts is not None else _as_float(value)
+
+
+def _fmt_epoch_seconds(value: Any) -> float | None:
+    return _as_float(value)
+
+
+def _fmt_milliseconds(value: Any) -> float | None:
+    f = _as_float(value)
+    return None if f is None else f / 1e3
+
+
+def _fmt_microseconds(value: Any) -> float | None:
+    f = _as_float(value)
+    return None if f is None else f / 1e6
+
+
+def _fmt_nanoseconds(value: Any) -> float | None:
+    f = _as_float(value)
+    return None if f is None else f / 1e9
+
+
+FORMAT_REGISTRY: dict[str, TsFormatFn] = {
+    "ros_time": _fmt_ros_time,
+    "epoch_seconds": _fmt_epoch_seconds,
+    "milliseconds": _fmt_milliseconds,
+    "microseconds": _fmt_microseconds,
+    "nanoseconds": _fmt_nanoseconds,
+}
+
+
+def register_ts_format(name: str, fn: TsFormatFn) -> None:
+    """source-ts 포맷 변환기 등록/덮어쓰기 (어댑터 확장점)."""
+    FORMAT_REGISTRY[name] = fn
+
+
+# 펌웨어 별칭 등록 예시 (PX4는 epoch 마이크로초를 발행한다).
+register_ts_format("px4_microseconds", _fmt_microseconds)
+
+
+def extract_source_ts(
+    payload: dict[str, Any], field: str | None = None, fmt: str | None = None
+) -> float | None:
+    """메시지 페이로드에서 source 타임스탬프(epoch 초)를 추출한다.
+
+    field가 있으면 ``fmt``가 가리키는 레지스트리 변환기를 적용한다(미등록
+    이름은 ValueError — 설정 오류는 시끄럽게 드러나야 한다). field가 없으면
+    표준 `header.stamp` / `stamp` {sec, nanosec} 관례를 탐색한다. 쓸 만한
+    스탬프가 없으면 None을 반환한다(어댑터는 ingest_ts에 의존).
+    """
+    if field is not None:
+        value = _get_nested(payload, field)
+        if value is None:
+            return None
+        if fmt is None:
+            return _coerce_ros_time(value)
+        fn = FORMAT_REGISTRY.get(fmt)
+        if fn is None:
+            raise ValueError(
+                f"unknown source_ts format {fmt!r}; registered: {sorted(FORMAT_REGISTRY)}"
+            )
+        return fn(value)
+
+    stamp = _get_nested(payload, "header.stamp")
+    if stamp is None:
+        stamp = payload.get("stamp")
+    return _coerce_ros_time(stamp)
+
+
+def _coerce_ros_time(value: Any) -> float | None:
+    ts = _ros_time_dict(value)
+    if ts is not None:
+        return ts
+    if isinstance(value, int | float):
+        return float(value)
+    return None
+
+
+def _get_nested(d: dict[str, Any], path: str) -> Any:
+    current: Any = d
+    for part in path.split("."):
+        if isinstance(current, dict):
+            current = current.get(part)
+        else:
+            return None
+        if current is None:
+            return None
+    return current

@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
-from ipe.config.spec import ActionSpec, ResolvedConfig, ServiceSpec, TopicSpec
+from ipe.models import ActionSpec, ResolvedConfig, ServiceSpec, TopicSpec
 from ipe.onem2m.resource_ops import ResourceOps
 from ipe.runtime.dispatcher import InboundEvent, Route, RouteTable
 from ipe.runtime.lifecycle import IPEHealth, IPEPhase, IPEState, Lifecycle
@@ -559,7 +559,7 @@ class BindingManager:
                 self._resource_removal_pending.pop(key, None)
 
     def _reconcile_discovery(self, snap: dict[str, Any]) -> None:
-        from ipe.config.resolver import resolve
+        from ipe.runtime.planning import resolve
 
         if self._resource_removal_pending:
             self._remove_interfaces(list(self._resource_removal_pending.items()))

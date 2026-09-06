@@ -11,7 +11,7 @@ import re
 from collections.abc import Iterable
 from functools import lru_cache
 
-from ipe.config.spec import RobotSpec
+from ipe.models import RobotSpec
 
 # oneM2M resourceName: 보수적인 CSE 안전 문자 집합만 허용하고, 단일 경로
 # 세그먼트 안의 그 외 문자는 sanitize 문자로 치환한다. '/'는 경로 구분자
@@ -24,7 +24,7 @@ def sanitize_segment(seg: str, repl: str = "_") -> str:
     out = _ILLEGAL.sub(repl, seg)
     if not out:
         out = repl
-    if out[0].isdigit():           # oneM2M rn은 숫자로 시작하면 안 된다
+    if out[0].isdigit():  # oneM2M rn은 숫자로 시작하면 안 된다
         out = repl + out
     return out[:_MAX_SEGMENT]
 
@@ -34,6 +34,7 @@ def sanitize_segment(seg: str, repl: str = "_") -> str:
 #   '**' -> '/' 포함 임의 문자      '*' -> '/' 제외 임의 문자
 #   '{robot}' -> 세그먼트 하나의 이름 있는 캡처 ('/' 불포함)
 # ---------------------------------------------------------------------------
+
 
 @lru_cache(maxsize=1024)
 def compile_pattern(pattern: str) -> re.Pattern[str]:
@@ -95,7 +96,7 @@ def pattern_specificity(pattern: str) -> int:
         c = pattern[i]
         if c == "{":
             j = pattern.find("}", i)
-            if j == -1:        # 형식 오류; compile_pattern이 크게 알린다
+            if j == -1:  # 형식 오류; compile_pattern이 크게 알린다
                 literal += 1
                 i += 1
                 continue
@@ -134,6 +135,7 @@ def unresolved_captures(text: str) -> list[str]:
 # robot 판정
 # ---------------------------------------------------------------------------
 
+
 def resolve_robot(interface: str, robots: Iterable[RobotSpec]) -> RobotSpec:
     """가장 긴 비어 있지 않은 namespace prefix가 이긴다; 없으면 첫/기본 robot."""
     best: RobotSpec | None = None
@@ -162,6 +164,7 @@ def resolve_robot(interface: str, robots: Iterable[RobotSpec]) -> RobotSpec:
 # 인터페이스 -> 경로 세그먼트
 # ---------------------------------------------------------------------------
 
+
 def interface_segments(
     robot: RobotSpec,
     interface: str,
@@ -176,7 +179,7 @@ def interface_segments(
     ns = robot.namespace.rstrip("/")
     rel = interface
     if ns and (interface == ns or interface.startswith(ns + "/")):
-        rel = interface[len(ns):]
+        rel = interface[len(ns) :]
     rel = rel.strip("/")
     parts = [p for p in rel.split("/") if p] or [interface.strip("/").replace("/", sanitize)]
     # root namespace에서 광고된 endpoint는 namespace만으로 robot을 식별할 수

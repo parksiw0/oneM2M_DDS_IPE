@@ -12,16 +12,16 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from ipe.config.spec import TopicSpec
 from ipe.core.anomaly import AnomalyGate
 from ipe.core.common import MinIntervalGate
 from ipe.core.filter import DeltaFilter, WindowAggregator
-from ipe.core.normalize import epoch_to_onem2m_ts, normalize_ir
 from ipe.core.payload import (
     build_cin_content,
     build_fcnt_attrs,
     build_fcnt_update,
     build_reference_content,
+    epoch_to_onem2m_ts,
+    normalize_ir,
 )
 
 # 큐 클래스 문자열을 의도적으로 로컬에 중복 정의 — core가 runtime.queues에
@@ -36,6 +36,8 @@ from ipe.core.vocab import (
     CLASS_TERMINAL as QUEUE_TERMINAL,
 )
 from ipe.ir import TopicIR
+from ipe.models import TopicSpec
+from ipe.qos.lifespan import expires_at as sample_expiry
 
 # representation별로 path_map에 있어야 하는 뷰 — 프로비저닝과의 계약.
 VIEWS_BY_REPRESENTATION: dict[str, tuple[str, ...]] = {
@@ -53,21 +55,21 @@ DEFAULT_LARGE_PAYLOAD_BYTES = 49152
 class Op:
     """파이프라인이 만드는 oneM2M 쓰기 연산 1건."""
 
-    kind: str                    # "create_cin"
-    path: str                    # oneM2M 절대 리소스 경로
-    content: dict[str, Any]      # con 본문 dict (봉투는 oneM2M 계층이 씌운다)
+    kind: str  # "create_cin"
+    path: str  # oneM2M 절대 리소스 경로
+    content: dict[str, Any]  # con 본문 dict (봉투는 oneM2M 계층이 씌운다)
     robot_id: str
     interface: str
-    view: str                    # "history" | "latest" | "fcnt" | 게시물 종류
-    queue_class: str             # QUEUE_OBSERVE_LATEST | QUEUE_OBSERVE_BULK
-    oversized: bool = False      # 참조 콘텐츠로 강등됐으면 True
-    rn: str | None = None        # 결정적 resourceName(멱등 게시) — 없으면 CSE 생성
-    anomalous: bool = False      # escalate된 이상값 — 호출자가 이벤트를 낸다(§7.4)
+    view: str  # "history" | "latest" | "fcnt" | 게시물 종류
+    queue_class: str  # QUEUE_OBSERVE_LATEST | QUEUE_OBSERVE_BULK
+    oversized: bool = False  # 참조 콘텐츠로 강등됐으면 True
+    rn: str | None = None  # 결정적 resourceName(멱등 게시) — 없으면 CSE 생성
+    anomalous: bool = False  # escalate된 이상값 — 호출자가 이벤트를 낸다(§7.4)
     et: str | None = None
     expires_at: float | None = None
 
 
-SamplingGate = MinIntervalGate   # 샘플링 = 키별 최소 간격 게이트의 별칭
+SamplingGate = MinIntervalGate  # 샘플링 = 키별 최소 간격 게이트의 별칭
 
 
 def _state_key(robot_id: str, interface: str) -> str:
@@ -118,7 +120,8 @@ class Pipeline:
         a_mode = flt.get("anomaly_mode", "escalate")
         if is_anomaly_filter:
             anomalous, a_score = self.anomaly.evaluate(
-                _state_key(spec.robot_id, spec.interface), flt, ir["payload"])
+                _state_key(spec.robot_id, spec.interface), flt, ir["payload"]
+            )
             if anomalous and a_mode == "suppress":
                 self.anomaly.note_suppressed(_state_key(spec.robot_id, spec.interface))
                 return []
@@ -131,46 +134,50 @@ class Pipeline:
 
         normalized = normalize_ir(ir, spec.selected_fields)
 
-        if spec.filter and not is_anomaly_filter and \
-                not self._apply_filter(spec, normalized, now):
+        if spec.filter and not is_anomaly_filter and not self._apply_filter(spec, normalized, now):
             return []
 
         content = build_cin_content(normalized, ir)
         if is_anomaly_filter and (anomalous or a_mode == "tag"):
-            content["anomaly"] = {"detector": flt.get("detector", "isolation_forest"),
-                                  "score": round(a_score, 4), "isAnomaly": anomalous}
+            content["anomaly"] = {
+                "detector": flt.get("detector", "isolation_forest"),
+                "score": round(a_score, 4),
+                "isAnomaly": anomalous,
+            }
         content, oversized = self._guard_size(content)
-        lifespan_ms = spec.qos_for("observe").lifespan_ms
-        expires_at = (ir["ingest_ts"] + lifespan_ms / 1000.0
-                      if lifespan_ms is not None else None)
-        expiration_time = (epoch_to_onem2m_ts(expires_at, self.cse_timezone)
-                           if expires_at is not None else None)
+        expires_at = sample_expiry(spec.qos_for("observe"), ir["ingest_ts"])
+        expiration_time = (
+            epoch_to_onem2m_ts(expires_at, self.cse_timezone) if expires_at is not None else None
+        )
 
         ops: list[Op] = []
         for view in VIEWS_BY_REPRESENTATION[spec.representation]:
             # latest 의미를 FCNT가 맡는 배치(프로비저닝이 fcnt 경로를 등록한 경우)
-            if view == "latest" and spec.flexcontainer and \
-                    (spec.robot_id, spec.interface, "fcnt") in self.path_map:
+            if (
+                view == "latest"
+                and spec.flexcontainer
+                and (spec.robot_id, spec.interface, "fcnt") in self.path_map
+            ):
                 attrs = build_fcnt_attrs(normalized, spec.flexcontainer["field_map"])
                 if attrs:
-                    ops.append(Op(
-                        kind="update_fcnt",
-                        path=self.path_map[(spec.robot_id, spec.interface, "fcnt")],
-                        content=build_fcnt_update(spec.flexcontainer["type"], attrs),
-                        robot_id=spec.robot_id,
-                        interface=spec.interface,
-                        view="fcnt",
-                        queue_class=QUEUE_TERMINAL if escalated else QUEUE_OBSERVE_LATEST,
-                        oversized=oversized,
-                        anomalous=escalated,
-                    ))
+                    ops.append(
+                        Op(
+                            kind="update_fcnt",
+                            path=self.path_map[(spec.robot_id, spec.interface, "fcnt")],
+                            content=build_fcnt_update(spec.flexcontainer["type"], attrs),
+                            robot_id=spec.robot_id,
+                            interface=spec.interface,
+                            view="fcnt",
+                            queue_class=QUEUE_TERMINAL if escalated else QUEUE_OBSERVE_LATEST,
+                            oversized=oversized,
+                            anomalous=escalated,
+                        )
+                    )
                 continue
             path = self.path_map[(spec.robot_id, spec.interface, view)]
-            queue_class = (
-                QUEUE_OBSERVE_LATEST if view == "latest" else QUEUE_OBSERVE_BULK
-            )
+            queue_class = QUEUE_OBSERVE_LATEST if view == "latest" else QUEUE_OBSERVE_BULK
             if escalated:
-                queue_class = QUEUE_TERMINAL   # 관측 백로그 추월 + 드롭 금지(§7.4)
+                queue_class = QUEUE_TERMINAL  # 관측 백로그 추월 + 드롭 금지(§7.4)
             ops.append(
                 Op(
                     kind="create_cin",
@@ -188,9 +195,7 @@ class Pipeline:
             )
         return ops
 
-    def _apply_filter(
-        self, spec: TopicSpec, normalized: dict[str, Any], now: float
-    ) -> bool:
+    def _apply_filter(self, spec: TopicSpec, normalized: dict[str, Any], now: float) -> bool:
         """델타/윈도우 필터 적용 — normalized["fields"]를 제자리에서 바꿀 수 있다.
 
         메시지를 보류하면 False.

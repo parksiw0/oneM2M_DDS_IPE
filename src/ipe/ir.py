@@ -34,7 +34,7 @@ class QoSStateIR(TypedDict):
     robot_id: str
     interface: str
     direction: str               # "observe" | "command"
-    configured: Any              # QoSSpec (YAML 해석 결과)
+    configured: Any              # QoSSpec (config.py 해석 결과)
     applied: Any                 # QoSSpec | None — 바인딩 전 None
-    peers: list[dict[str, Any]]  # core.qos.endpoint_to_peer 원소
+    peers: list[dict[str, Any]]  # qos.codec.endpoint_to_peer 원소
     events: list[str]            # 마지막 조정·가드 어휘 (§4.6.2)

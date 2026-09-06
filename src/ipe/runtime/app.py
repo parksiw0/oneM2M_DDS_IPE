@@ -8,8 +8,7 @@ import threading
 from contextlib import suppress
 from typing import Any
 
-from ipe.config.resolver import resolve
-from ipe.config.spec import ResolvedConfig
+from ipe.models import ResolvedConfig
 from ipe.onem2m.client import idify, make_onem2m_client
 from ipe.onem2m.notification_server import NotificationServer
 from ipe.onem2m.resource_ops import ResourceOps
@@ -18,6 +17,7 @@ from ipe.runtime.discovery import GraphNotReady, await_graph_convergence
 from ipe.runtime.inbound import InboundProcessor
 from ipe.runtime.lifecycle import IPEHealth, IPEPhase, IPEState, Lifecycle
 from ipe.runtime.outbound import OutboundProcessor
+from ipe.runtime.planning import resolve
 from ipe.runtime.provisioning import Provisioner
 from ipe.runtime.state import StatePersistence
 from ipe.runtime.status import StatusPublisher
@@ -276,6 +276,8 @@ class IPEApp:
             self.outbound.on_topic_ir,
             self.outbound.emit_event,
             qos_strictness=self.registry.rc.policy.get("qos_strictness", "reject"),
+            self_echo_window_sec=self.registry.rc.policy.get("self_echo_window_sec", 0.5),
+            qos_event_coalesce_sec=self.registry.rc.policy.get("qos_event_coalesce_sec", 5.0),
         )
         self.executor = SingleThreadedExecutor()
         self.executor.add_node(self.node)

@@ -7,7 +7,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
-from ipe.core.policy import Op
+from ipe.core.pipeline import Op
 from ipe.core.vocab import CLASS_OBSERVE_BULK, CLASS_TERMINAL
 
 if TYPE_CHECKING:
@@ -62,72 +62,12 @@ class StatusPublisher:
         direction: str,
         applied: Any,
     ) -> dict[str, dict[str, Any]]:
-        """Resolve policy records to the actual oneM2M resource or IPE handler."""
-        targets: dict[str, dict[str, Any]] = {
-            "RELIABILITY": {
-                "handler": "ros2EndpointAndOneM2MRetry",
-                "result": "APPROXIMATED",
-            },
-            "DEADLINE": {
-                "handler": "ros2EndpointEvent",
-                "result": "APPLIED_AT_ROS2_ENDPOINT",
-            },
-            "LIVELINESS": {
-                "handler": "ros2EndpointEvent",
-                "result": "APPLIED_AT_ROS2_ENDPOINT",
-            },
-            "DURABILITY": {
-                "handler": "ros2EndpointAndCseRetention",
-                "result": "APPROXIMATED",
-            },
-        }
-        if direction != "observe":
-            targets["HISTORY"] = {
-                "result": "PRESERVED",
-                "reason": "DDS writer cache depth does not control command retention",
-            }
-            targets["LIFESPAN"] = {
-                "result": "PRESERVED",
-                "reason": "command freshness is enforced by the command safety gate",
-            }
-            return targets
-        history_path = self.registry.path_map.get((robot, iface, "history"))
-        latest_path = self.registry.path_map.get((robot, iface, "latest"))
-        state_path = self.registry.path_map.get((robot, iface, "fcnt"))
-        if history_path and applied.history == "KEEP_LAST":
-            targets["HISTORY"] = {
-                "resource": history_path,
-                "attribute": "mni",
-                "value": applied.depth,
-                "result": "APPROXIMATED",
-            }
-        elif history_path:
-            targets["HISTORY"] = {
-                "resource": history_path,
-                "result": "APPROXIMATED",
-                "reason": "KEEP_ALL remains bounded by the CSE retention limit",
-            }
-        else:
-            targets["HISTORY"] = {
-                "resource": latest_path or state_path,
-                "result": "CONSTRAINED_BY_REPRESENTATION",
-                "reason": "the interface exposes only the latest value",
-            }
-        if applied.lifespan_ms is None:
-            targets["LIFESPAN"] = {"result": "NOT_CONFIGURED"}
-        elif history_path or latest_path:
-            targets["LIFESPAN"] = {
-                "resources": [path for path in (history_path, latest_path) if path],
-                "attribute": "contentInstance.et",
-                "result": "APPROXIMATED",
-            }
-        else:
-            targets["LIFESPAN"] = {
-                "resource": state_path,
-                "result": "UNSUPPORTED",
-                "reason": "a mutable data flexContainer has no per-sample expirationTime",
-            }
-        return targets
+        from ipe.qos.engine import topic_mapping
+        paths = {view: self.registry.path_map[(robot, iface, view)]
+                 for view in ("history", "latest", "fcnt", "command")
+                 if (robot, iface, view) in self.registry.path_map}
+        limit = self.registry.rc.policy.get("history_keep_all_limit", 1000)
+        return topic_mapping(applied, direction, paths, limit)
 
     def _topic_data_refs(self, robot: str, iface: str, direction: str) -> list[dict[str, str]]:
         """Return the concrete oneM2M data resources managed by a topic QoS FCNT."""
@@ -168,7 +108,7 @@ class StatusPublisher:
         캐시 비교(불변이면 생략)와 키별 최소 간격이 플래핑을 막고,
         lbl_compat면 기존 qos:* lbl 스킴을 포인터와 함께 병행 게시한다.
         """
-        from ipe.core.qos import spec_to_fcnt_attrs, spec_to_metadata
+        from ipe.qos.codec import spec_to_fcnt_attrs, spec_to_metadata
 
         qf = self.registry.rc.qos_fcnt
         smode = self.registry.rc.policy.get("qos_strictness", "reject")

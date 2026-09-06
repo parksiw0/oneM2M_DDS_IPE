@@ -9,17 +9,18 @@ from collections.abc import Callable
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
-from ipe.config.spec import ActionSpec, ServiceSpec, TopicSpec
 from ipe.core.command import CommandDispatchManager
 from ipe.core.common import deep_merge as _deep_merge
 from ipe.core.common import project_top_level as _project
-from ipe.core.normalize import ct_to_epoch as _ct_to_epoch
-from ipe.core.policy import Op
+from ipe.core.payload import ct_to_epoch as _ct_to_epoch
+from ipe.core.pipeline import Op
 from ipe.core.transaction import ActionTransactionManager, ServiceTransactionManager
 from ipe.core.vocab import CLASS_OBSERVE_BULK, CLASS_TERMINAL
+from ipe.models import ActionSpec, ServiceSpec, TopicSpec
 from ipe.onem2m.catchup import CatchUpSweeper
 from ipe.onem2m.notification import Notification
 from ipe.onem2m.resource_ops import ResourceOps
+from ipe.qos.requests import parse_cf_update, policy_changes_to_cf
 from ipe.runtime.dispatcher import InboundEvent
 from ipe.runtime.queues import InboundQueue
 from ipe.runtime.state import StatePersistence
@@ -674,7 +675,7 @@ class InboundProcessor:
                 spec, corr, goal, on_goal_response, on_feedback, on_result
             )
         except Exception as e:
-            from ipe.core.transcode import TranscodeError
+            from ipe.adapter.messages import TranscodeError
 
             reason = "goalRejected" if isinstance(e, TranscodeError) else "failed"
             terminal = "rejected" if isinstance(e, TranscodeError) else "failed"
@@ -733,51 +734,6 @@ class InboundProcessor:
                 )
             )
 
-    _QOS_CF_ENUMS = {
-        "cfRlb": ("reliability", ("RELIABLE", "BEST_EFFORT")),
-        "cfDrb": ("durability", ("VOLATILE", "TRANSIENT_LOCAL")),
-        "cfHst": ("history", ("KEEP_LAST", "KEEP_ALL")),
-        "cfLiv": ("liveliness", ("AUTOMATIC", "MANUAL_BY_TOPIC")),
-    }
-    _QOS_CF_DURS = {
-        "cfDdl": "deadline_ms",
-        "cfLsp": "lifespan_ms",
-        "cfLse": "liveliness_lease_duration_ms",
-    }
-
-    def _parse_cf_update(self, payload: dict[str, Any], base: Any) -> tuple[Any | None, str]:
-        """NOTIFY rep의 cf* → 후보 QoSSpec. (None, 사유) = 도메인 위반."""
-        from dataclasses import replace
-
-        updates: dict[str, Any] = {}
-        for sn, (fld, allowed) in self._QOS_CF_ENUMS.items():
-            if sn not in payload:
-                continue
-            v = str(payload[sn]).upper()
-            if v not in allowed:
-                return None, f"{sn}: '{payload[sn]}' not in {allowed}"
-            updates[fld] = v
-        if "cfDpt" in payload:
-            d = payload["cfDpt"]
-            if not isinstance(d, int) or isinstance(d, bool) or d < 1:
-                return None, f"cfDpt: expected integer >= 1, got {d!r}"
-            updates["depth"] = d
-        for sn, fld in self._QOS_CF_DURS.items():
-            if sn not in payload:
-                continue
-            v = payload[sn]
-            if isinstance(v, str) and v.upper() == "INF":
-                updates[fld] = None
-            elif isinstance(v, int) and not isinstance(v, bool) and v >= 0:
-                updates[fld] = v
-            elif isinstance(v, str) and v.isdigit():
-                updates[fld] = int(v)
-            else:
-                return None, f"{sn}: expected 'INF' or decimal ms, got {v!r}"
-        cand = replace(base, **updates)
-        if cand.liveliness == "MANUAL_BY_TOPIC" and cand.liveliness_lease_duration_ms is None:
-            return None, "liveliness MANUAL_BY_TOPIC requires cfLse (B8)"
-        return cand, ""
 
     def _apply_qos_candidate(
         self,
@@ -787,7 +743,7 @@ class InboundProcessor:
         candidate: Any,
     ) -> tuple[bool, str, list[str]]:
         """Validate, rebind, persist, and publish one topic-direction QoS change."""
-        from ipe.config.rules import command_qos_violation
+        from ipe.qos.configuration import command_qos_violation
 
         if direction == "command":
             violation = command_qos_violation(
@@ -826,7 +782,7 @@ class InboundProcessor:
 
     def apply_saved_qos_overrides(self, rc: Any) -> None:
         """Restore accepted topic QoS requests before DDS endpoints are created."""
-        from ipe.config.spec import QoSSpec
+        from ipe.models import QoSSpec
 
         saved = self.state.get_kv("qos_overrides", {})
         for spec in rc.topics:
@@ -845,54 +801,6 @@ class InboundProcessor:
                         "ignored invalid saved QoS override for %s: %s", spec.interface, exc
                     )
 
-    @staticmethod
-    def _policy_changes_to_cf(changes: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
-        from ipe.core.dds_qos import DDS_QOS_POLICY_NAMES
-
-        aliases = {
-            "RELIABILITY": "cfRlb",
-            "DURABILITY": "cfDrb",
-            "DEADLINE": "cfDdl",
-            "LIFESPAN": "cfLsp",
-        }
-        translated: dict[str, Any] = {}
-        for raw_name, value in changes.items():
-            name = str(raw_name).upper()
-            if name not in DDS_QOS_POLICY_NAMES:
-                return None, f"unknown DDS QoS policy: {raw_name}"
-            if name in aliases:
-                if isinstance(value, dict):
-                    value = value.get("durationMs", value.get("value"))
-                translated[aliases[name]] = value
-                continue
-            if name == "HISTORY":
-                if isinstance(value, str):
-                    translated["cfHst"] = value
-                elif isinstance(value, dict):
-                    translated["cfHst"] = value.get("kind")
-                    if "depth" in value:
-                        translated["cfDpt"] = value["depth"]
-                else:
-                    return None, "HISTORY must be a kind or an object"
-                continue
-            if name == "LIVELINESS":
-                if isinstance(value, str):
-                    translated["cfLiv"] = value
-                elif isinstance(value, dict):
-                    translated["cfLiv"] = value.get("kind")
-                    if "leaseDurationMs" in value:
-                        translated["cfLse"] = value["leaseDurationMs"]
-                else:
-                    return None, "LIVELINESS must be a kind or an object"
-                continue
-            return None, f"{name} is not changeable through the active ROS 2 RMW adapter"
-        if not translated:
-            return None, "changes must contain at least one supported policy"
-        if "cfHst" in translated and translated["cfHst"] is None:
-            return None, "HISTORY.kind is required"
-        if "cfLiv" in translated and translated["cfLiv"] is None:
-            return None, "LIVELINESS.kind is required"
-        return translated, ""
 
     def _dispatch_qos_update(self, ev: InboundEvent, corr: str) -> None:
         now = time.time()
@@ -923,7 +831,7 @@ class InboundProcessor:
             _reject("qos update not allowed" if spec is not None else "notBound")
             return
         base = spec.qos_for(direction)
-        candidate, why = self._parse_cf_update(payload, base)
+        candidate, why = parse_cf_update(payload, base)
         if candidate is None:
             _reject(why)
             return
@@ -1017,11 +925,11 @@ class InboundProcessor:
                     interface=interface,
                 )
                 return
-        translated, why = self._policy_changes_to_cf(changes)
+        translated, why = policy_changes_to_cf(changes)
         if translated is None:
             reject(why, robot=robot, interface=interface)
             return
-        candidate, why = self._parse_cf_update(translated, spec.qos_for(direction))
+        candidate, why = parse_cf_update(translated, spec.qos_for(direction))
         if candidate is None:
             reject(why, robot=robot, interface=interface)
             return
@@ -1157,7 +1065,7 @@ class InboundProcessor:
     def _input_example(self, kind: str, spec: Any) -> dict[str, Any] | None:
         from rosidl_runtime_py.utilities import get_action, get_message, get_service
 
-        from ipe.core.transcode import make_input_example
+        from ipe.adapter.messages import make_input_example
 
         if kind == "command" and spec.msg_type:
             return make_input_example(get_message(spec.msg_type))

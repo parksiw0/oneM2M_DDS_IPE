@@ -9,18 +9,24 @@ from typing import Any, cast
 
 from cerberus import Validator
 
-from ipe.config.identity import compile_pattern
-from ipe.config.rules import (
-    command_qos_load_message,
-    command_qos_violation,
-    qos_ref_load_message,
-    termination_load_message,
-    termination_violation,
-    undefined_qos_ref,
+from ipe.core.transaction import termination_load_message, termination_violation
+from ipe.onem2m.client import CSE_SETTINGS_FIELD
+from ipe.qos.configuration import (
+    QOS_FCNT_FIELD,
+    QOS_PROFILES_FIELD,
+    QoSConfigError,
+    _normalize_qos_case,
+    validate_qos_config,
 )
-from ipe.config.schema import CONFIG_SCHEMA, QOS_ENUM_KEYS
+from ipe.runtime.naming import compile_pattern
+from ipe.runtime.planning import (
+    ACTION_ITEM_SCHEMA,
+    DEFAULTS_SCHEMA,
+    SERVICE_ITEM_SCHEMA,
+    TOPIC_ITEM_SCHEMA,
+)
 
-log = logging.getLogger("ipe.config.loader")
+log = logging.getLogger("ipe.runtime.settings")
 
 
 class ConfigError(Exception):
@@ -49,59 +55,6 @@ def validate_config(raw: dict[str, Any]) -> dict[str, Any]:
     return cast(dict[str, Any], normalized)
 
 
-# ---------------------------------------------------------------------------
-# 케이스 정규화 (best_effort / BEST_EFFORT 둘 다 허용)
-# ---------------------------------------------------------------------------
-
-def _upper_qos(d: dict[str, Any]) -> None:
-    for k in QOS_ENUM_KEYS:
-        if isinstance(d.get(k), str):
-            d[k] = d[k].upper()
-
-
-def _iter_qos_values(cfg: dict[str, Any]) -> Iterator[tuple[str, str, Any]]:
-    """qos_profiles 밖의 모든 `qos:` 값을 전수 순회(문자열 프로파일 참조 포함) —
-    토픽/서비스 항목, 액션 채널 맵, defaults 블록까지 빠짐없이 포함해야 한다.
-
-    (정규화·lease 검사용 라벨, 참조 검사용 라벨, 값)을 낸다. 라벨이 둘인 이유:
-    기존 오류 문구가 검사 종류별로 다른 좌표 표기를 쓴다 — 문구 보존.
-    인라인 dict만 필요한 소비자는 isinstance로 거른다(검증 전 호출되는
-    케이스 정규화가 임의 타입을 만나도 안전해야 한다).
-    """
-    bridge = cfg.get("bridge") or {}
-    for kind in ("topics", "services"):
-        for i, item in enumerate(bridge.get(kind, []) or []):
-            q = item.get("qos")
-            if q is not None:
-                yield f"bridge.{kind}[{i}].qos", f"bridge.{kind}[{i}] '{_label(item)}'", q
-    for i, item in enumerate(bridge.get("actions", []) or []):
-        q = item.get("qos")
-        if isinstance(q, dict):   # 액션 qos는 채널 맵만 유효 — 그 외는 스키마 몫
-            lab = f"bridge.actions[{i}] '{_label(item)}'"
-            for ch, chq in q.items():
-                yield f"bridge.actions[{i}].qos.{ch}", f"{lab} qos.{ch}", chq
-    for bname, block in (cfg.get("defaults") or {}).items():
-        if not isinstance(block, dict):
-            continue
-        q = block.get("qos")
-        if q is None:
-            continue
-        if bname == "action" and isinstance(q, dict):   # action defaults는 채널 맵
-            for ch, chq in q.items():
-                yield f"defaults.action.qos.{ch}", f"defaults.action.qos.{ch}", chq
-        else:
-            yield f"defaults.{bname}.qos", f"defaults.{bname}.qos", q
-
-
-def _normalize_qos_case(cfg: dict[str, Any]) -> None:
-    for prof in (cfg.get("qos_profiles") or {}).values():
-        if isinstance(prof, dict):
-            _upper_qos(prof)
-    for _, _ref, q in _iter_qos_values(cfg):
-        if isinstance(q, dict):
-            _upper_qos(q)
-
-
 def _normalize_robot_namespaces(cfg: dict[str, Any]) -> None:
     """비어 있지 않은 namespace에 선행 '/'를 붙인다 — `namespace: robot1`
     표기에서 prefix 매칭이 조용히 실패하지 않도록."""
@@ -115,6 +68,7 @@ def _normalize_robot_namespaces(cfg: dict[str, Any]) -> None:
 # 의미론적 교차 필드 검사
 # ---------------------------------------------------------------------------
 
+
 def _check_semantics(cfg: dict[str, Any]) -> None:
     robots = cfg.get("robots", [])
     ids = [r["id"] for r in robots]
@@ -127,10 +81,11 @@ def _check_semantics(cfg: dict[str, Any]) -> None:
         raise ConfigError("storage.pool_max_size must be >= storage.pool_min_size")
     _check_patterns(cfg)
     _check_mode_semantics(cfg)
-    _check_qos_references(cfg)
     _check_filters_and_sampling(cfg)
-    _check_qos_lease_and_history(cfg)
-    _check_command_qos(cfg)
+    try:
+        validate_qos_config(cfg)
+    except QoSConfigError as exc:
+        raise ConfigError(str(exc)) from exc
     _check_termination_invariant(cfg)
     _check_flexcontainer(cfg)
 
@@ -145,8 +100,7 @@ def _check_cse_protocol(cfg: dict[str, Any]) -> None:
     proto = cse.get("protocol", "http")
     if proto == "http" and not cse.get("endpoint"):
         raise ConfigError(
-            "cse.endpoint is required when cse.protocol is 'http' "
-            "(e.g. http://localhost:3000)."
+            "cse.endpoint is required when cse.protocol is 'http' (e.g. http://localhost:3000)."
         )
     if proto == "mqtt" and not cse.get("cse_id"):
         raise ConfigError(
@@ -226,14 +180,6 @@ def _check_mode_semantics(cfg: dict[str, Any]) -> None:
             )
 
 
-def _check_qos_references(cfg: dict[str, Any]) -> None:
-    qos_names = set((cfg.get("qos_profiles") or {}).keys())
-    for _, ref_label, q in _iter_qos_values(cfg):
-        bad = undefined_qos_ref(q, qos_names, empty_base_violates=False)
-        if bad:
-            raise ConfigError(qos_ref_load_message(*bad, where=ref_label))
-
-
 def _check_filters_and_sampling(cfg: dict[str, Any]) -> None:
     defaults = cfg.get("defaults") or {}
     bridge = cfg.get("bridge", {})
@@ -272,62 +218,14 @@ def _check_filters_and_sampling(cfg: dict[str, Any]) -> None:
 
     for i, item in enumerate(bridge.get("actions", []) or []):
         where = f"bridge.actions[{i}]"
-        if (item.get("feedback") == "sampled" and "feedback_sample" not in item
-                and "feedback_sample" not in (defaults.get("action") or {})):
+        if (
+            item.get("feedback") == "sampled"
+            and "feedback_sample" not in item
+            and "feedback_sample" not in (defaults.get("action") or {})
+        ):
             raise ConfigError(
                 f"{where} '{_label(item)}' feedback 'sampled' requires 'feedback_sample'."
             )
-
-
-def _check_qos_lease_and_history(cfg: dict[str, Any]) -> None:
-    """MANUAL_BY_TOPIC => lease 필수 — qos_profiles뿐 아니라 인라인/defaults
-    QoS 맵에도 적용해야 한다(B8). KEEP_ALL+depth는 경고만."""
-    profiles = cfg.get("qos_profiles") or {}
-
-    def check(d: dict[str, Any], where: str) -> None:
-        if d.get("liveliness") == "MANUAL_BY_TOPIC" and "liveliness_lease_duration_ms" not in d:
-            base = profiles.get(d.get("profile") or "") or {}
-            if "liveliness_lease_duration_ms" not in base:
-                raise ConfigError(
-                    f"{where}: liveliness MANUAL_BY_TOPIC requires "
-                    f"'liveliness_lease_duration_ms'."
-                )
-        if d.get("history") == "KEEP_ALL" and "depth" in d:
-            log.warning("%s: depth is ignored with history KEEP_ALL", where)
-
-    for name, prof in profiles.items():
-        if isinstance(prof, dict):
-            check(prof, f"qos_profiles.{name}")
-    for label, _ref, q in _iter_qos_values(cfg):
-        if isinstance(q, dict):
-            check(q, label)
-
-
-def _effective_qos_dict(value: Any, profiles: dict[str, Any]) -> dict[str, Any]:
-    """qos 참조(프로파일 이름 또는 인라인 맵)를 dict 하나로 평탄화."""
-    if isinstance(value, str):
-        return dict(profiles.get(value) or {})
-    if isinstance(value, dict):
-        base = dict(profiles.get(value.get("profile") or "") or {})
-        base.update({k: v for k, v in value.items() if k != "profile"})
-        return base
-    return {}
-
-
-def _check_command_qos(cfg: dict[str, Any]) -> None:
-    """command 퍼블리셔는 MANUAL_BY_TOPIC liveliness나 유한 deadline을 요구하면
-    안 된다 — IPE에는 assert_liveliness 주기가 없어서 그런 오퍼는 구조적으로
-    전달 불가. 술어는 rules.command_qos_violation(resolver와 공유)."""
-    profiles = cfg.get("qos_profiles") or {}
-    default_cmd_qos = (cfg.get("defaults") or {}).get("topic_command", {}).get("qos")
-    for i, item in enumerate(cfg.get("bridge", {}).get("topics") or []):
-        if item.get("direction") != "command":
-            continue
-        eff = _effective_qos_dict(item.get("qos", default_cmd_qos), profiles)
-        violation = command_qos_violation(eff.get("liveliness"), eff.get("deadline_ms"))
-        if violation:
-            raise ConfigError(command_qos_load_message(
-                violation, f"bridge.topics[{i}] '{_label(item)}'"))
 
 
 def _check_termination_invariant(cfg: dict[str, Any]) -> None:
@@ -356,6 +254,7 @@ def _check_termination_invariant(cfg: dict[str, Any]) -> None:
 #     ConfigError
 # ---------------------------------------------------------------------------
 
+
 def _probe_type_pins(cfg: dict[str, Any]) -> None:
     try:
         from rosidl_runtime_py.utilities import get_action, get_message, get_service
@@ -372,7 +271,10 @@ def _probe_type_pins(cfg: dict[str, Any]) -> None:
             log.warning(
                 "%s '%s': type pin '%s' not loadable in this environment (%s) — "
                 "skipping probe; binding will enforce it at runtime (§3.2)",
-                where, _label(item), pin, e,
+                where,
+                _label(item),
+                pin,
+                e,
             )
         except Exception as e:
             raise ConfigError(
@@ -397,5 +299,235 @@ def _fmt_errors(errors: Any, prefix: str = "") -> str:
                     lines.append(f"{path}: {item}")
         else:
             lines.append(f"{path}: {e}")
+
     walk(errors, prefix)
     return "; ".join(lines)
+
+
+# Process-level settings. Domain-specific schemas are supplied by their owners.
+CONFIG_SCHEMA: dict[str, Any] = {
+    "ipe": {
+        "type": "dict",
+        "required": False,
+        "schema": {"instance_id": {"type": "string", "default": "ros2-ipe"}},
+        "default": {},
+    },
+    "cse": CSE_SETTINGS_FIELD,
+    "notification_server": {
+        "type": "dict",
+        "required": False,
+        "schema": {
+            "host": {"type": "string", "default": "0.0.0.0"},
+            "port": {"type": "integer", "min": 1, "max": 65535, "default": 5050},
+        },
+        "default": {},
+    },
+    "robots": {
+        "type": "list",
+        "required": False,
+        "minlength": 1,
+        "schema": {
+            "type": "dict",
+            "schema": {
+                "id": {"type": "string", "required": True, "empty": False},
+                "namespace": {"type": "string", "default": ""},
+                "ae_per_robot": {"type": "boolean", "default": False},
+                "ae_name": {"type": "string", "required": False},
+            },
+        },
+        "default": [{"id": "default", "namespace": "", "ae_per_robot": False}],
+    },
+    "robots_strict": {"type": "boolean", "default": False},  # 미등록 {robot} 거부
+    "discovery": {
+        "type": "dict",
+        "required": False,
+        "schema": {
+            "mode": {
+                "type": "string",
+                "allowed": ["config-only", "auto-expose", "hybrid"],
+                "default": "hybrid",
+            },
+            "domain_id": {"type": "integer", "min": 0, "default": 0},
+            "ros_peer": {"type": "string", "default": ""},
+            "rmw_implementation": {"type": "string", "default": ""},
+            "allow": {"type": "list", "schema": {"type": "string"}, "default": ["/**"]},
+            "deny": {"type": "list", "schema": {"type": "string"}, "default": []},
+            "refresh_sec": {"type": ["integer", "float"], "min": 0, "default": 5},
+            "vanish_grace_polls": {"type": "integer", "min": 1, "default": 2},  # 소멸 디바운스
+            "graph_settle_timeout_sec": {
+                "type": ["integer", "float"],
+                "min": 0.1,
+                "default": 10,
+            },
+            "graph_stable_polls": {"type": "integer", "min": 1, "default": 2},
+            "graph_poll_sec": {
+                "type": ["integer", "float"],
+                "min": 0.05,
+                "default": 0.5,
+            },
+        },
+        "default": {},
+    },
+    "naming": {
+        "type": "dict",
+        "required": False,
+        "schema": {
+            "path_style": {
+                "type": "string",
+                "allowed": ["flat", "nested", "aliased"],
+                "default": "nested",
+            },
+            "sanitize": {"type": "string", "default": "_"},
+        },
+        "default": {},
+    },
+    "qos_profiles": QOS_PROFILES_FIELD,
+    "defaults": {"type": "dict", "required": False, "schema": DEFAULTS_SCHEMA, "default": {}},
+    "bridge": {
+        "type": "dict",
+        "required": False,
+        "schema": {
+            "topics": {
+                "type": "list",
+                "schema": {"type": "dict", "schema": TOPIC_ITEM_SCHEMA},
+                "default": [],
+            },
+            "services": {
+                "type": "list",
+                "schema": {"type": "dict", "schema": SERVICE_ITEM_SCHEMA},
+                "default": [],
+            },
+            "actions": {
+                "type": "list",
+                "schema": {"type": "dict", "schema": ACTION_ITEM_SCHEMA},
+                "default": [],
+            },
+        },
+        "default": {"topics": [], "services": [], "actions": []},
+    },
+    "policy": {
+        "type": "dict",
+        "required": False,
+        "schema": {
+            "suitability": {
+                "type": "dict",
+                "schema": {
+                    "high_rate_hz": {"type": ["integer", "float"], "min": 0, "default": 20},
+                    # tinyIoT 하드 리밋 65536에서 인코딩 여유분을 뺀 값
+                    "large_payload_bytes": {"type": "integer", "min": 0, "default": 49152},
+                    "realtime_critical_deny": {"type": "boolean", "default": True},
+                },
+                "default": {},
+            },
+            "confirmation": {"type": "string", "allowed": ["auto", "required"], "default": "auto"},
+            "max_total_write_hz": {"type": ["integer", "float"], "min": 0, "default": 0},
+            # observe 방향 QoS 엄격성 가드 동작
+            "qos_strictness": {
+                "type": "string",
+                "allowed": ["reject", "demote"],
+                "default": "reject",
+            },
+            "history_keep_all_limit": {"type": "integer", "min": 1, "default": 1000},
+            "default_stale_after_ms": {"type": "integer", "min": 0, "default": 5000},
+            "stale_deadline_multiplier": {"type": "integer", "min": 1, "default": 2},
+            "stale_exempt_topics": {
+                "type": "list",
+                "schema": {"type": "string"},
+                "default": ["robot_description", "tf_static"],
+            },
+            "self_echo_window_sec": {"type": ["integer", "float"], "min": 0, "default": 0.5},
+            "qos_event_coalesce_sec": {"type": ["integer", "float"], "min": 0, "default": 5.0},
+        },
+        "default": {},
+    },
+    "dispatch": {
+        "type": "dict",
+        "required": False,
+        "schema": {"drain_budget": {"type": "integer", "min": 1, "default": 32}},
+        "default": {},
+    },
+    "storage": {
+        "type": "dict",
+        "required": False,
+        "schema": {
+            "backend": {
+                "type": "string",
+                "allowed": ["sqlite", "postgresql"],
+                "default": "sqlite",
+            },
+            "state_db": {"type": "string", "default": "ipe_state.db"},
+            "dsn": {"type": "string", "required": False, "nullable": True},
+            "schema": {"type": "string", "empty": False, "default": "ipe_state"},
+            "pool_min_size": {"type": "integer", "min": 1, "default": 1},
+            "pool_max_size": {"type": "integer", "min": 1, "default": 8},
+            "max_spool_entries": {"type": "integer", "min": 1, "default": 10000},
+            "max_spool_mb": {"type": "integer", "min": 1, "default": 64},
+        },
+        "default": {},
+    },
+    "logging": {
+        "type": "dict",
+        "required": False,
+        "schema": {
+            "heartbeat_sec": {"type": ["integer", "float"], "min": 1, "default": 30},
+            "level": {
+                "type": "string",
+                "allowed": ["DEBUG", "INFO", "WARNING", "ERROR"],
+                "default": "INFO",
+            },
+            "status_severity_min": {
+                "type": "string",
+                "allowed": ["info", "warning", "error"],
+                "default": "info",
+            },
+        },
+        "default": {},
+    },
+    "transfer": {
+        "type": "dict",
+        "required": False,
+        "schema": {"default_unit": {"type": "string", "default": "sampled"}},
+        "default": {},
+    },
+    "recovery": {
+        "type": "dict",
+        "required": False,
+        "schema": {
+            "retry_count": {"type": "integer", "min": 0, "default": 3},
+            "retry_delay_ms": {"type": "integer", "min": 0, "default": 500},
+            "backoff": {
+                "type": "string",
+                "allowed": ["fixed", "exponential"],
+                "default": "exponential",
+            },
+            "on_failure": {
+                "type": "string",
+                "allowed": ["skip", "retry", "rebind", "reprovision"],
+                "default": "retry",
+            },
+            "queue_overflow": {
+                "type": "string",
+                "allowed": ["reject", "drop_oldest"],
+                "default": "reject",
+            },
+            "inbound_max": {"type": "integer", "min": 1, "default": 1000},
+            "control_lane_max": {"type": "integer", "min": 1, "default": 64},  # 2-레인 제어 큐
+            "outbound_max": {"type": "integer", "min": 1, "default": 5000},
+            "outbound_workers": {"type": "integer", "min": 1, "max": 8, "default": 8},
+            "catch_up_sec": {"type": ["integer", "float"], "min": 0, "default": 0},
+            "reconcile_sec": {"type": ["integer", "float"], "min": 0, "default": 0},
+            "cancel_orphan_goals": {"type": "boolean", "default": False},
+            "dedup_retention_days": {"type": "integer", "min": 0, "default": 7},
+        },
+        "default": {},
+    },
+    "schema_validation": {
+        "type": "dict",
+        "required": False,
+        "schema": {"enabled": {"type": "boolean", "default": False}},
+        "default": {},
+    },
+    # QoS flexContainer 게시 (QoS_FCNT_설계서 §4~5)
+    "qos_fcnt": QOS_FCNT_FIELD,
+    "expose": {"type": "list", "required": False, "default": []},  # 예약 필드(D2)
+}

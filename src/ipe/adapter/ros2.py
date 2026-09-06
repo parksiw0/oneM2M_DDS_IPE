@@ -21,16 +21,15 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
 
-from ipe.adapter.transform import extract_source_ts, parse_message
-from ipe.config.rules import command_qos_violation
-from ipe.config.spec import ACTION_QOS_CHANNELS, ActionSpec, QoSSpec, ServiceSpec, TopicSpec
-from ipe.core import qos as qosmod
-from ipe.core.transcode import TranscodeError, from_canonical
+from ipe.adapter.messages import TranscodeError, extract_source_ts, from_canonical, parse_message
+from ipe.adapter.qos import build_qos_profile, check_compatible
 from ipe.ir import TopicIR
+from ipe.models import ACTION_QOS_CHANNELS, ActionSpec, QoSSpec, ServiceSpec, TopicSpec
+from ipe.qos import engine as qosmod
+from ipe.qos.codec import endpoint_to_peer
+from ipe.qos.configuration import command_qos_violation
 
 log = logging.getLogger(__name__)
-
-SELF_ECHO_WINDOW_SEC = 0.5
 
 EventHook = Callable[[str, str, dict[str, Any]], None]   # (category, severity, payload)
 
@@ -121,16 +120,16 @@ class _ActionState:
     pending_cancel: set[str] = field(default_factory=set)        # handle보다 cancel이 먼저 온 goalId
 
 
-QOS_EVENT_COALESCE_SEC = 5.0
-
-
 class GenericROS2Adapter:
     def __init__(self, node: Any, on_topic_ir: Callable[[TopicIR], None], on_event: EventHook,
-                 qos_strictness: str = "reject") -> None:
+                 qos_strictness: str = "reject", *, self_echo_window_sec: float = 0.5,
+                 qos_event_coalesce_sec: float = 5.0) -> None:
         self.node = node
         self.on_topic_ir = on_topic_ir
         self.on_event = on_event
         self.qos_strictness = qos_strictness
+        self.self_echo_window_sec = self_echo_window_sec
+        self.qos_event_coalesce_sec = qos_event_coalesce_sec
         self.observes: dict[tuple[str, str], _ObserveState] = {}
         self.commands: dict[tuple[str, str], _CommandState] = {}
         self.services: dict[tuple[str, str], dict[str, Any]] = {}
@@ -358,7 +357,7 @@ class GenericROS2Adapter:
             severity = "info" if ev == "noPublisherFallback" else "warning"
             self._event("qosStatus", severity,
                         {"event": ev, "interface": spec.interface, "robot": spec.robot_id})
-        profile = qosmod.build_qos_profile(resolved)
+        profile = build_qos_profile(resolved)
 
         def callback(msg: Any, _key: tuple[str, str] = key) -> None:
             self._on_observe_msg(_key, msg)
@@ -368,7 +367,7 @@ class GenericROS2Adapter:
             return False
         self.observes[key] = _ObserveState(
             spec=spec, subscription=sub, applied_qos=resolved,
-            offered_peers=[qosmod.endpoint_to_peer(i, "pub") for i in infos],
+            offered_peers=[endpoint_to_peer(i, "pub") for i in infos],
             events=list(dict.fromkeys([*events, *strict_events])))
         log.info("observe bound: %s [%s] (%s)", spec.interface, spec.msg_type, spec.robot_id)
         return True
@@ -397,7 +396,7 @@ class GenericROS2Adapter:
         infos = self._remote_endpoint_infos(
             self.node.get_publishers_info_by_topic(st.spec.interface)
         )
-        peers = [qosmod.endpoint_to_peer(i, "pub") for i in infos]
+        peers = [endpoint_to_peer(i, "pub") for i in infos]
         changed = peers != st.offered_peers
         st.offered_peers = peers
         if not infos:
@@ -430,7 +429,7 @@ class GenericROS2Adapter:
         infos = self._remote_endpoint_infos(
             self.node.get_subscriptions_info_by_topic(st.spec.interface)
         )
-        peers = [qosmod.endpoint_to_peer(i, "sub") for i in infos]
+        peers = [endpoint_to_peer(i, "sub") for i in infos]
         changed = peers != st.requested_peers
         st.requested_peers = peers
         if not infos:
@@ -481,7 +480,7 @@ class GenericROS2Adapter:
                                                       self.qos_strictness)
             if strict and self.qos_strictness == "reject":
                 return False, strict
-            profile = qosmod.build_qos_profile(guarded)
+            profile = build_qos_profile(guarded)
             pairs = [(o, profile) for o in offered]
         else:
             requested = [i.qos_profile for i in self._remote_endpoint_infos(
@@ -491,11 +490,11 @@ class GenericROS2Adapter:
             violation = command_qos_violation(resolved.liveliness, resolved.deadline_ms)
             if violation:
                 return False, [f"unsupported command QoS requested: {violation}"]
-            profile = qosmod.build_qos_profile(resolved)
+            profile = build_qos_profile(resolved)
             pairs = [(profile, r) for r in requested]
         warnings: list[str] = []
         for pub_q, sub_q in pairs:
-            ok, reasons = qosmod.check_compatible(pub_q, sub_q)
+            ok, reasons = check_compatible(pub_q, sub_q)
             if not ok:
                 return False, reasons
             warnings.extend(reasons)
@@ -531,6 +530,7 @@ class GenericROS2Adapter:
         self.bind_command(cst.spec)
         return False
 
+
     def rebind_interface(self, key: tuple[str, str], new_qos: Any) -> bool:
         """Rebind every existing direction for legacy callers."""
         directions = [name for name, states in (
@@ -565,7 +565,7 @@ class GenericROS2Adapter:
     def _mark_qos_dirty(self, key: tuple[str, str]) -> None:
         now = time.monotonic()
         last = self._qos_dirty_last.get(key)
-        if last is not None and now - last < QOS_EVENT_COALESCE_SEC:
+        if last is not None and now - last < self.qos_event_coalesce_sec:
             return
         self._qos_dirty_last[key] = now
         self._qos_dirty.add(key)
@@ -660,7 +660,7 @@ class GenericROS2Adapter:
         페이로드가 연속 억제되는 경로를 구조적으로 차단한다(§10)."""
         h = self._payload_hash(payload)
         fresh = [(ph, ts) for ph, ts in cmd.recent_hashes
-                 if now - ts < SELF_ECHO_WINDOW_SEC]
+                 if now - ts < self.self_echo_window_sec]
         for i, (ph, _ts) in enumerate(fresh):
             if ph == h:
                 del fresh[i]
@@ -710,11 +710,11 @@ class GenericROS2Adapter:
             severity = "info" if ev == "noSubscriberFallback" else "warning"
             self._event("qosStatus", severity,
                         {"event": ev, "interface": spec.interface, "robot": spec.robot_id})
-        profile = qosmod.build_qos_profile(resolved)
+        profile = build_qos_profile(resolved)
         pub = self._create_publisher_degrading(msg_class, spec, profile, key)
         self.commands[key] = _CommandState(
             spec=spec, publisher=pub, msg_class=msg_class, applied_qos=resolved,
-            requested_peers=[qosmod.endpoint_to_peer(i, "sub") for i in infos],
+            requested_peers=[endpoint_to_peer(i, "sub") for i in infos],
             events=list(events))
         log.info("command bound: %s [%s] (%s)", spec.interface, spec.msg_type, spec.robot_id)
         return True
@@ -799,7 +799,7 @@ class GenericROS2Adapter:
             return False
         kwargs: dict[str, Any] = {"callback_group": self._reentrant_group()}
         if spec.qos is not None:
-            kwargs["qos_profile"] = qosmod.build_qos_profile(spec.qos)
+            kwargs["qos_profile"] = build_qos_profile(spec.qos)
         client = self.node.create_client(srv_class, spec.interface, **kwargs)
         self.services[key] = {"spec": spec, "client": client, "srv_class": srv_class}
         return True
@@ -862,7 +862,7 @@ class GenericROS2Adapter:
         from rclpy.action import ActionClient
         kwargs: dict[str, Any] = {"callback_group": self._reentrant_group()}
         for chan, q in (spec.qos or {}).items():
-            kwargs[_ACTION_CHAN_KWARG[chan]] = qosmod.build_qos_profile(q)
+            kwargs[_ACTION_CHAN_KWARG[chan]] = build_qos_profile(q)
         client = ActionClient(self.node, action_class, spec.interface, **kwargs)
         self.actions[key] = _ActionState(spec=spec, client=client, action_class=action_class)
         return True
@@ -1022,7 +1022,7 @@ class GenericROS2Adapter:
             k = (str(payload.get("interface")), str(payload.get("event")))
             now = time.monotonic()
             last = self._qos_event_last.get(k)
-            if last is not None and now - last < QOS_EVENT_COALESCE_SEC:
+            if last is not None and now - last < self.qos_event_coalesce_sec:
                 return
             self._qos_event_last[k] = now
         try:

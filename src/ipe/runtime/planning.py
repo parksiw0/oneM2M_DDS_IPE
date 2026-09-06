@@ -13,25 +13,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from ipe.config.identity import (
-    apply_captures,
-    interface_segments,
-    match_pattern,
-    pattern_specificity,
-    resolve_robot,
-    robot_ae,
-    sanitize_segment,
-    unresolved_captures,
-)
-from ipe.config.rules import (
-    command_qos_resolve_message,
-    command_qos_violation,
-    qos_ref_resolve_message,
-    termination_resolve_message,
-    termination_violation,
-    undefined_qos_ref,
-)
-from ipe.config.spec import (
+from ipe.core.common import deep_merge as _deep_merge
+from ipe.core.transaction import termination_resolve_message, termination_violation
+from ipe.models import (
     ACTION_QOS_CHANNELS,
     ActionSpec,
     CommandSafety,
@@ -46,9 +30,32 @@ from ipe.config.spec import (
     SourceTsSpec,
     TopicSpec,
 )
-from ipe.core.common import deep_merge as _deep_merge
+from ipe.qos.configuration import (
+    QOS_INLINE_SCHEMA,
+    QoSConfigError,
+    _explicit_qos_fields,
+    _parse_qos_profiles,
+    command_qos_resolve_message,
+    command_qos_violation,
+)
+from ipe.qos.configuration import (
+    _action_qos as _qos_channels,
+)
+from ipe.qos.configuration import (
+    _resolve_qos as _qos_profile,
+)
+from ipe.runtime.naming import (
+    apply_captures,
+    interface_segments,
+    match_pattern,
+    pattern_specificity,
+    resolve_robot,
+    robot_ae,
+    sanitize_segment,
+    unresolved_captures,
+)
 
-log = logging.getLogger("ipe.config.resolver")
+log = logging.getLogger("ipe.runtime.planning")
 
 Discovered = dict[str, Any]
 
@@ -65,16 +72,20 @@ _BUILTIN_SENSOR_DATA = QoSSpec(
 )
 _DISCOVERY_REPRESENTATION = "latest"
 _BUILTIN_FEEDBACK_SAMPLE_MS = 500
-_DEFAULT_STALE_AFTER_MS = 5000
-_STATIC_LATCHED_TOPICS = frozenset({"robot_description", "tf_static"})
 
 # 내장 deny: 숨김 인터페이스('_'로 시작하는 세그먼트 — */_action/* 내부 포함)와
 # 노드별 파라미터 서비스 6종. 모드와 무관하게 주입되며 명시적 `name` 항목은
 # 여전히 이긴다.
-_PARAM_SERVICE_SUFFIXES = frozenset({
-    "get_parameters", "set_parameters", "list_parameters",
-    "describe_parameters", "get_parameter_types", "set_parameters_atomically",
-})
+_PARAM_SERVICE_SUFFIXES = frozenset(
+    {
+        "get_parameters",
+        "set_parameters",
+        "list_parameters",
+        "describe_parameters",
+        "get_parameter_types",
+        "set_parameters_atomically",
+    }
+)
 
 
 def _builtin_denied(kind: str, interface: str) -> bool:
@@ -90,66 +101,11 @@ def _builtin_denied(kind: str, interface: str) -> bool:
 # QoS
 # ---------------------------------------------------------------------------
 
-def _parse_qos_profiles(raw: dict[str, Any]) -> dict[str, QoSSpec]:
-    out: dict[str, QoSSpec] = {}
-    for name, d in raw.items():
-        # 내장 기본값 위에 프로파일 키가 덮어씀; profile=출처 이름(pfRef)
-        out[name] = QoSSpec(profile=name).merged(d)
-    return out
-
-
-def _resolve_qos(value: Any, profiles: dict[str, QoSSpec], missing: QoSSpec) -> QoSSpec:
-    """`qos:` 값 해석. 마법의 'default' 프로파일은 없다: 베이스 없는 인라인
-    맵은 내장 안전 베이스 QoSSpec()에서 시작하고, 값이 아예 없으면 호출자가
-    고른 fail-safe `missing`을 쓴다."""
-    if value is None:
-        return missing
-    bad = undefined_qos_ref(value, profiles, empty_base_violates=True)
-    if bad:
-        raise ResolveError(qos_ref_resolve_message(*bad))
-    if isinstance(value, str):
-        return profiles[value]
-    if isinstance(value, dict):
-        base_name = value.get("profile")
-        base = profiles[base_name] if base_name else QoSSpec()
-        return base.merged(value)
-    raise ResolveError(f"qos must be a profile name or a map, got {type(value).__name__}")
-
-
-def _explicit_qos_fields(value: Any) -> frozenset[str]:
-    """Return QoS fields explicitly supplied by a topic rule or profile reference."""
-    if isinstance(value, str):
-        return frozenset(QoSSpec.__dataclass_fields__) - {"profile"}
-    if isinstance(value, dict):
-        fields = {key for key in value if key in QoSSpec.__dataclass_fields__}
-        if value.get("profile"):
-            fields.update(QoSSpec.__dataclass_fields__)
-        fields.discard("profile")
-        return frozenset(fields)
-    return frozenset()
-
-
-def _action_qos(value: Any, profiles: dict[str, QoSSpec], interface: str) -> dict[str, QoSSpec]:
-    """액션 클라이언트 채널별 QoS. 지정하지 않은 채널은 부재로 남긴다
-    (= rclpy 채널 기본값)."""
-    if not value:
-        return {}
-    if not isinstance(value, dict):
-        raise ResolveError(f"action '{interface}': qos must be a channel map (§8.5)")
-    out: dict[str, QoSSpec] = {}
-    for ch, v in value.items():
-        if ch not in ACTION_QOS_CHANNELS:
-            raise ResolveError(
-                f"action '{interface}': unknown qos channel '{ch}' "
-                f"(allowed: {', '.join(ACTION_QOS_CHANNELS)})"
-            )
-        out[ch] = _resolve_qos(v, profiles, QoSSpec())
-    return out
-
 
 # ---------------------------------------------------------------------------
 # 규칙 수집 + 병합
 # ---------------------------------------------------------------------------
+
 
 def _matching_rules(
     interface: str, rules: list[dict[str, Any]]
@@ -204,6 +160,7 @@ def _merge_rules(
 # 후보 인터페이스 집합
 # ---------------------------------------------------------------------------
 
+
 def _candidates(
     kind: str,
     rules: list[dict[str, Any]],
@@ -226,7 +183,9 @@ def _candidates(
         if builtin_conflict or _denied(name, deny):
             log.warning(
                 "explicit %s entry '%s' matches a deny pattern — explicit names are "
-                "never denied (§5.2); remove the entry to stop bridging it", kind, name,
+                "never denied (§5.2); remove the entry to stop bridging it",
+                kind,
+                name,
             )
         cand[name] = disc.get(name, [rule["type"]] if rule.get("type") else [])
 
@@ -256,6 +215,7 @@ def _denied(interface: str, deny: list[str]) -> bool:
 # ---------------------------------------------------------------------------
 # robot 식별: robot: > {robot} 캡처 > namespace prefix > 기본 robot
 # ---------------------------------------------------------------------------
+
 
 def _robot_for(
     merged: dict[str, Any],
@@ -290,14 +250,17 @@ def _robot_for(
         dyn = RobotSpec(id=cap, namespace=ns)
         by_id[cap] = dyn
         robots.append(dyn)
-        log.info("dynamic robot '%s' registered from {robot} capture (interface '%s')",
-                 cap, interface)
+        log.info(
+            "dynamic robot '%s' registered from {robot} capture (interface '%s')", cap, interface
+        )
         return dyn
     # 설정 비의존 discovery에서는 원격 endpoint node namespace가 robot 경계다.
     # root namespace('/')는 robot 식별 정보를 주지 않으므로 catch-all robot을 쓴다.
-    namespaces = sorted({x.rstrip("/") for x in (owner_namespaces or [])
-                         if x and x.startswith("/") and x != "/"},
-                        key=len, reverse=True)
+    namespaces = sorted(
+        {x.rstrip("/") for x in (owner_namespaces or []) if x and x.startswith("/") and x != "/"},
+        key=len,
+        reverse=True,
+    )
     if len(namespaces) == 1:
         namespace = namespaces[0]
         for robot in robots:
@@ -310,16 +273,22 @@ def _robot_for(
             dyn = RobotSpec(id=robot_id, namespace=namespace)
             by_id[robot_id] = dyn
             robots.append(dyn)
-            log.info("dynamic robot '%s' registered from endpoint namespace '%s'",
-                     robot_id, namespace)
+            log.info(
+                "dynamic robot '%s' registered from endpoint namespace '%s'", robot_id, namespace
+            )
             return dyn
     fallback = resolve_robot(interface, robots)
     # 일부 RMW는 endpoint의 node namespace를 UNKNOWN으로만 제공한다. 설정 없는
     # 자동 Discovery에서는 /{robot}/... 형태의 ROS 이름이 가진 첫 namespace를
     # robot 경계로 사용할 수 있다. 단일 세그먼트(/scan)는 추론하지 않는다.
     parts = [part for part in interface.strip("/").split("/") if part]
-    if (infer_interface_namespace and not strict and len(parts) > 1
-            and fallback.id == "robot" and not fallback.namespace):
+    if (
+        infer_interface_namespace
+        and not strict
+        and len(parts) > 1
+        and fallback.id == "robot"
+        and not fallback.namespace
+    ):
         namespace = f"/{parts[0]}"
         robot_id = sanitize_segment(parts[0])
         if robot_id in by_id:
@@ -327,8 +296,7 @@ def _robot_for(
         dyn = RobotSpec(id=robot_id, namespace=namespace)
         by_id[robot_id] = dyn
         robots.append(dyn)
-        log.info("dynamic robot '%s' inferred from interface namespace '%s'",
-                 robot_id, namespace)
+        log.info("dynamic robot '%s' inferred from interface namespace '%s'", robot_id, namespace)
         return dyn
     return fallback
 
@@ -336,6 +304,7 @@ def _robot_for(
 # ---------------------------------------------------------------------------
 # 경로
 # ---------------------------------------------------------------------------
+
 
 def _substituted(template: str, captures: dict[str, str], interface: str, what: str) -> str:
     out = apply_captures(template, captures)
@@ -373,6 +342,7 @@ def _rel_path(
 # ---------------------------------------------------------------------------
 # 소형 필드 빌더
 # ---------------------------------------------------------------------------
+
 
 def _sample(d: dict[str, Any] | None) -> SampleSpec | None:
     if not d:
@@ -428,6 +398,7 @@ def _type_and_source(merged: dict[str, Any], types: list[str], src: str) -> tupl
 # 최상위 resolve
 # ---------------------------------------------------------------------------
 
+
 def _mqtt_spec(cse_c: dict[str, Any]) -> MqttSpec:
     m = cse_c.get("mqtt") or {}
     return MqttSpec(
@@ -458,6 +429,7 @@ def resolve(config: dict[str, Any], discovered: Discovered | None = None) -> Res
     if cse_timezone != "local":
         try:
             from zoneinfo import ZoneInfo
+
             ZoneInfo(cse_timezone)
         except (KeyError, ValueError) as e:
             raise ResolveError(f"invalid cse.timezone: {cse_timezone!r}") from e
@@ -472,15 +444,22 @@ def resolve(config: dict[str, Any], discovered: Discovered | None = None) -> Res
         rvi=cse_c.get("rvi", "3"),
         poa=cse_c.get("poa", ""),
         mqtt=_mqtt_spec(cse_c) if protocol == "mqtt" else None,
+        http_timeout_sec=cse_c.get("http_timeout_sec", 5.0),
+        http_max_payload=cse_c.get("http_max_payload", 65536),
     )
     robots = []
     for r in config.get("robots", [{"id": "default"}]):
         ns = r.get("namespace", "")
-        if ns and not ns.startswith("/"):   # raw dict가 직접 들어오는 경우 방어
+        if ns and not ns.startswith("/"):  # raw dict가 직접 들어오는 경우 방어
             ns = "/" + ns
-        robots.append(RobotSpec(id=r["id"], namespace=ns,
-                                ae_per_robot=r.get("ae_per_robot", False),
-                                ae_name=r.get("ae_name")))
+        robots.append(
+            RobotSpec(
+                id=r["id"],
+                namespace=ns,
+                ae_per_robot=r.get("ae_per_robot", False),
+                ae_name=r.get("ae_name"),
+            )
+        )
     by_id = {r.id: r for r in robots}
     strict = bool(config.get("robots_strict", False))
     profiles = _parse_qos_profiles(config["qos_profiles"])
@@ -495,8 +474,20 @@ def resolve(config: dict[str, Any], discovered: Discovered | None = None) -> Res
     default_confirm = policy.get("confirmation", "auto")
 
     bridge = config.get("bridge", {})
-    ctx = _Ctx(robots, by_id, strict, profiles, naming, defaults, default_confirm,
-               mode, allow, deny, refresh)
+    ctx = _Ctx(
+        robots,
+        by_id,
+        strict,
+        profiles,
+        naming,
+        defaults,
+        default_confirm,
+        mode,
+        allow,
+        deny,
+        refresh,
+        policy,
+    )
     topics = _resolve_topics(bridge.get("topics", []), discovered, ctx)
     services = _resolve_services(bridge.get("services", []), discovered, ctx)
     actions = _resolve_actions(bridge.get("actions", []), discovered, ctx)
@@ -506,11 +497,8 @@ def resolve(config: dict[str, Any], discovered: Discovered | None = None) -> Res
         # 설정 없는 실행에서는 실제 Binding Plan에 포함된 Robot만 Skeleton을
         # 만든다. Namespace에서 동적으로 식별된 경우 기본 catch-all Robot은
         # 리소스 트리에 남기지 않는다.
-        used_robot_ids = {
-            spec.robot_id for group in (topics, services, actions) for spec in group
-        }
-        by_id = {robot_id: robot for robot_id, robot in by_id.items()
-                 if robot_id in used_robot_ids}
+        used_robot_ids = {spec.robot_id for group in (topics, services, actions) for spec in group}
+        by_id = {robot_id: robot for robot_id, robot in by_id.items() if robot_id in used_robot_ids}
 
     qf = config.get("qos_fcnt", {})
     qos_fcnt = QosFcntSpec(
@@ -518,13 +506,9 @@ def resolve(config: dict[str, Any], discovered: Discovered | None = None) -> Res
         type=qf.get("type", "ros:tqos"),
         cnd=qf.get("cnd", "kr.ac.sejong.seslab.ros2.moduleclass.topicQos"),
         service_type=qf.get("service_type", "ros:sqos"),
-        service_cnd=qf.get(
-            "service_cnd", "kr.ac.sejong.seslab.ros2.moduleclass.serviceQos"
-        ),
+        service_cnd=qf.get("service_cnd", "kr.ac.sejong.seslab.ros2.moduleclass.serviceQos"),
         action_type=qf.get("action_type", "ros:aqos"),
-        action_cnd=qf.get(
-            "action_cnd", "kr.ac.sejong.seslab.ros2.moduleclass.actionQos"
-        ),
+        action_cnd=qf.get("action_cnd", "kr.ac.sejong.seslab.ros2.moduleclass.actionQos"),
         lbl_compat=bool(qf.get("lbl_compat", True)),
         allow_update=bool(qf.get("allow_update", False)),
         publish_min_interval_ms=int(qf.get("publish_min_interval_ms", 5000)),
@@ -558,11 +542,36 @@ def resolve(config: dict[str, Any], discovered: Discovered | None = None) -> Res
 class _Ctx:
     """세 종류별 resolver가 공유하는 해석 컨텍스트."""
 
-    __slots__ = ("robots", "by_id", "strict", "profiles", "naming", "defaults",
-                 "default_confirm", "mode", "allow", "deny", "refresh")
+    __slots__ = (
+        "robots",
+        "by_id",
+        "strict",
+        "profiles",
+        "naming",
+        "defaults",
+        "default_confirm",
+        "mode",
+        "allow",
+        "deny",
+        "refresh",
+        "policy",
+    )
 
-    def __init__(self, robots, by_id, strict, profiles, naming, defaults,
-                 default_confirm, mode, allow, deny, refresh):
+    def __init__(
+        self,
+        robots,
+        by_id,
+        strict,
+        profiles,
+        naming,
+        defaults,
+        default_confirm,
+        mode,
+        allow,
+        deny,
+        refresh,
+        policy,
+    ):
         self.robots = robots
         self.by_id = by_id
         self.strict = strict
@@ -574,6 +583,7 @@ class _Ctx:
         self.allow = allow
         self.deny = deny
         self.refresh = refresh
+        self.policy = policy
 
 
 def _merged_for(
@@ -605,10 +615,17 @@ def _iter_candidates(kind, rules, discovered, ctx: _Ctx, dblock, check=None):
         merged = _deep_merge(block, merged)
         if check is not None:
             check(interface, merged)
-        owners = ((discovered or {}).get("owners", {}).get(kind, {}).get(interface, []))
-        robot = _robot_for(merged, interface, caps, ctx.robots, ctx.by_id, ctx.strict,
-                           owner_namespaces=owners,
-                           infer_interface_namespace=(src == "discovery-default"))
+        owners = (discovered or {}).get("owners", {}).get(kind, {}).get(interface, [])
+        robot = _robot_for(
+            merged,
+            interface,
+            caps,
+            ctx.robots,
+            ctx.by_id,
+            ctx.strict,
+            owner_namespaces=owners,
+            infer_interface_namespace=(src == "discovery-default"),
+        )
         rel, leaf = _rel_path(robot, interface, merged, ctx.naming, caps)
         yield interface, types, merged, caps, src, robot, rel, leaf
 
@@ -624,9 +641,7 @@ def _resolve_topics(rules, discovered, ctx: _Ctx) -> list[TopicSpec]:
             return command
         if direction == "both":
             command_controls = {
-                key: command[key]
-                for key in ("access", "command")
-                if key in command
+                key: command[key] for key in ("access", "command") if key in command
             }
             return _deep_merge(observe, command_controls)
         return observe
@@ -641,13 +656,16 @@ def _resolve_topics(rules, discovered, ctx: _Ctx) -> list[TopicSpec]:
 
     out: list[TopicSpec] = []
     for interface, types, merged, _caps, src, robot, rel, leaf in _iter_candidates(
-            "topics", rules, discovered, ctx, dblock, check):
+        "topics", rules, discovered, ctx, dblock, check
+    ):
         direction = merged.get("direction", "observe")
         representation = merged.get("representation", _DISCOVERY_REPRESENTATION)
 
         raw_qos = merged.get("qos")
         observe_base = ctx.profiles.get("sensor_data", _BUILTIN_SENSOR_DATA)
-        command_base = QoSSpec()
+        command_base = _resolve_qos(
+            ctx.defaults.get("topic_command", {}).get("qos"), ctx.profiles, QoSSpec()
+        )
         if direction == "command":
             qos = _resolve_qos(raw_qos, ctx.profiles, command_base)
             command_qos = None
@@ -656,7 +674,9 @@ def _resolve_topics(rules, discovered, ctx: _Ctx) -> list[TopicSpec]:
             command_qos = (
                 _resolve_qos(raw_qos, ctx.profiles, command_base)
                 if direction == "both" and raw_qos is not None
-                else command_base if direction == "both" else None
+                else command_base
+                if direction == "both"
+                else None
             )
 
         if direction in ("command", "both"):
@@ -670,51 +690,59 @@ def _resolve_topics(rules, discovered, ctx: _Ctx) -> list[TopicSpec]:
             log.warning(
                 "observe topic '%s': lifespan_ms on a subscription expires samples by "
                 "SOURCE timestamp — clock-skewed robots may silently drop everything; "
-                "prefer stale_after_ms (§8.4)", interface,
+                "prefer stale_after_ms (§8.4)",
+                interface,
             )
 
         stale = merged.get("stale_after_ms")
         topic_leaf = interface.rsplit("/", 1)[-1]
-        if (stale is None and direction in ("observe", "both")
-                and topic_leaf not in _STATIC_LATCHED_TOPICS):
-            stale = qos.deadline_ms * 2 if qos.deadline_ms else _DEFAULT_STALE_AFTER_MS
+        exempt_topics = ctx.policy.get("stale_exempt_topics", ["robot_description", "tf_static"])
+        if stale is None and direction in ("observe", "both") and topic_leaf not in exempt_topics:
+            stale = (
+                qos.deadline_ms * ctx.policy.get("stale_deadline_multiplier", 2)
+                if qos.deadline_ms
+                else ctx.policy.get("default_stale_after_ms", 5000)
+            )
 
         mtype, source_rule = _type_and_source(merged, types, src)
         enabled, confirm = _access(merged, ctx.default_confirm)
         if src == "discovery-default" and direction == "both" and confirm == "auto":
             confirm = "on_first_use"
-        out.append(TopicSpec(
-            robot_id=robot.id,
-            interface=interface,
-            msg_type=mtype,
-            direction=direction,
-            representation=representation,
-            qos=qos,
-            qos_explicit="qos" in merged,
-            qos_explicit_fields=_explicit_qos_fields(raw_qos),
-            command_qos=command_qos,
-            sample=_sample(merged.get("sample")),
-            filter=merged.get("filter"),
-            selected_fields=merged.get("selected_fields"),
-            stale_after_ms=stale,
-            source_ts=_source_ts(merged.get("source_ts")),
-            flexcontainer=merged.get("flexcontainer"),
-            role=merged.get("role"),
-            group=merged.get("group"),
-            leaf=leaf,
-            rel_path=rel,
-            command=_command_safety(merged.get("command")),
-            access_enabled=enabled,
-            confirm=confirm,
-            source_rule=source_rule,
-        ))
+        out.append(
+            TopicSpec(
+                robot_id=robot.id,
+                interface=interface,
+                msg_type=mtype,
+                direction=direction,
+                representation=representation,
+                qos=qos,
+                qos_explicit="qos" in merged,
+                qos_explicit_fields=_explicit_qos_fields(raw_qos),
+                command_qos=command_qos,
+                sample=_sample(merged.get("sample")),
+                filter=merged.get("filter"),
+                selected_fields=merged.get("selected_fields"),
+                stale_after_ms=stale,
+                source_ts=_source_ts(merged.get("source_ts")),
+                flexcontainer=merged.get("flexcontainer"),
+                role=merged.get("role"),
+                group=merged.get("group"),
+                leaf=leaf,
+                rel_path=rel,
+                command=_command_safety(merged.get("command")),
+                access_enabled=enabled,
+                confirm=confirm,
+                source_rule=source_rule,
+            )
+        )
     return out
 
 
 def _resolve_services(rules, discovered, ctx: _Ctx) -> list[ServiceSpec]:
     out: list[ServiceSpec] = []
     for interface, types, merged, _caps, src, robot, rel, leaf in _iter_candidates(
-            "services", rules, discovered, ctx, ctx.defaults.get("service", {})):
+        "services", rules, discovered, ctx, ctx.defaults.get("service", {})
+    ):
         timeout = merged.get("timeout_ms", 5000)
         if termination_violation(timeout, ctx.refresh):
             raise ResolveError(termination_resolve_message("service", interface))
@@ -722,25 +750,31 @@ def _resolve_services(rules, discovered, ctx: _Ctx) -> list[ServiceSpec]:
         sqos = _resolve_qos(qv, ctx.profiles, QoSSpec()) if qv is not None else None
         mtype, source_rule = _type_and_source(merged, types, src)
         enabled, confirm = _access(merged, ctx.default_confirm)
-        out.append(ServiceSpec(
-            robot_id=robot.id, interface=interface,
-            srv_type=mtype,
-            qos=sqos,
-            timeout_ms=timeout,
-            request_fields=merged.get("request_fields"),
-            response_fields=merged.get("response_fields"),
-            request_template=merged.get("request_template", {}),
-            leaf=leaf, rel_path=rel,
-            access_enabled=enabled, confirm=confirm,
-            source_rule=source_rule,
-        ))
+        out.append(
+            ServiceSpec(
+                robot_id=robot.id,
+                interface=interface,
+                srv_type=mtype,
+                qos=sqos,
+                timeout_ms=timeout,
+                request_fields=merged.get("request_fields"),
+                response_fields=merged.get("response_fields"),
+                request_template=merged.get("request_template", {}),
+                leaf=leaf,
+                rel_path=rel,
+                access_enabled=enabled,
+                confirm=confirm,
+                source_rule=source_rule,
+            )
+        )
     return out
 
 
 def _resolve_actions(rules, discovered, ctx: _Ctx) -> list[ActionSpec]:
     out: list[ActionSpec] = []
     for interface, types, merged, _caps, src, robot, rel, leaf in _iter_candidates(
-            "actions", rules, discovered, ctx, ctx.defaults.get("action", {})):
+        "actions", rules, discovered, ctx, ctx.defaults.get("action", {})
+    ):
         timeout = merged.get("timeout_ms", 0)
         if termination_violation(timeout, ctx.refresh):
             raise ResolveError(termination_resolve_message("action", interface))
@@ -751,21 +785,26 @@ def _resolve_actions(rules, discovered, ctx: _Ctx) -> list[ActionSpec]:
             fsample = SampleSpec(min_interval_ms=_BUILTIN_FEEDBACK_SAMPLE_MS)
         mtype, source_rule = _type_and_source(merged, types, src)
         enabled, confirm = _access(merged, ctx.default_confirm)
-        out.append(ActionSpec(
-            robot_id=robot.id, interface=interface,
-            action_type=mtype,
-            qos=_action_qos(merged.get("qos"), ctx.profiles, interface),
-            feedback=feedback,
-            feedback_sample=fsample,
-            goal_fields=merged.get("goal_fields"),
-            feedback_fields=merged.get("feedback_fields"),
-            result_fields=merged.get("result_fields"),
-            goal_template=merged.get("goal_template", {}),
-            timeout_ms=timeout,
-            leaf=leaf, rel_path=rel,
-            access_enabled=enabled, confirm=confirm,
-            source_rule=source_rule,
-        ))
+        out.append(
+            ActionSpec(
+                robot_id=robot.id,
+                interface=interface,
+                action_type=mtype,
+                qos=_action_qos(merged.get("qos"), ctx.profiles, interface),
+                feedback=feedback,
+                feedback_sample=fsample,
+                goal_fields=merged.get("goal_fields"),
+                feedback_fields=merged.get("feedback_fields"),
+                result_fields=merged.get("result_fields"),
+                goal_template=merged.get("goal_template", {}),
+                timeout_ms=timeout,
+                leaf=leaf,
+                rel_path=rel,
+                access_enabled=enabled,
+                confirm=confirm,
+                source_rule=source_rule,
+            )
+        )
     return out
 
 
@@ -774,6 +813,7 @@ def _resolve_actions(rules, discovered, ctx: _Ctx) -> list[ActionSpec]:
 # robot_id는 경로 입력일 뿐이다. `both` 표현은 기본 경로와 latest/history 뷰를
 # 모두 점유한다.
 # ---------------------------------------------------------------------------
+
 
 def _check_collisions(
     topics: list[TopicSpec],
@@ -784,8 +824,7 @@ def _check_collisions(
 ) -> None:
     seen: dict[str, str] = {}
 
-    def chk(robot_id: str, branch: str, rel: str, who: str,
-            views: tuple[str, ...] = ("",)) -> None:
+    def chk(robot_id: str, branch: str, rel: str, who: str, views: tuple[str, ...] = ("",)) -> None:
         ae = robot_ae(by_id[robot_id], shared_ae)
         for view in views:
             # 공유 AE에서도 robot CNT가 최상위 격리 경계다. rel_path에는 더 이상
@@ -804,15 +843,187 @@ def _check_collisions(
     for t in topics:
         who = f"{t.interface} (robot={t.robot_id})"
         # "/qos" 뷰는 qos FCNT 자리(QoS_FCNT_설계서 §4.4) — 사용자 경로의 선점을 조기 검출
-        views = (("", "/last", "/hist", "/state", "/qos")
-                 if t.representation == "both" else ("", "/qos"))
+        views = (
+            ("", "/last", "/hist", "/state", "/qos") if t.representation == "both" else ("", "/qos")
+        )
         if t.direction in ("observe", "both"):
             chk(t.robot_id, "topics/observe", t.rel_path, who, views)
         if t.direction in ("command", "both"):
             chk(t.robot_id, "topics/command", t.rel_path, who, ("", "/qos"))
     for s in services:
-        chk(s.robot_id, "services", s.rel_path, f"{s.interface} (robot={s.robot_id})",
-            ("", "/qos"))
+        chk(s.robot_id, "services", s.rel_path, f"{s.interface} (robot={s.robot_id})", ("", "/qos"))
     for a in actions:
-        chk(a.robot_id, "actions", a.rel_path, f"{a.interface} (robot={a.robot_id})",
-            ("", "/qos"))
+        chk(a.robot_id, "actions", a.rel_path, f"{a.interface} (robot={a.robot_id})", ("", "/qos"))
+
+
+def _resolve_qos(value, profiles, missing):
+    try:
+        return _qos_profile(value, profiles, missing)
+    except QoSConfigError as exc:
+        raise ResolveError(str(exc)) from exc
+
+
+def _action_qos(value, profiles, interface):
+    try:
+        return _qos_channels(value, profiles, interface)
+    except QoSConfigError as exc:
+        raise ResolveError(str(exc)) from exc
+
+
+# Interface rule schema. Partial defaults must not inject per-interface defaults.
+SAMPLE_SCHEMA: dict[str, Any] = {
+    "rate_hz": {"type": "float", "min": 0.0},
+    "min_interval_ms": {"type": "integer", "min": 0},
+}
+
+FILTER_SCHEMA: dict[str, Any] = {
+    "type": {"type": "string", "allowed": ["delta", "window", "anomaly"], "required": True},
+    "fields": {"type": "list", "schema": {"type": "string"}},
+    "min_change": {"type": "float", "min": 0.0},
+    "max_interval_ms": {"type": "integer", "min": 0},
+    "mode": {"type": "string", "allowed": ["count", "time"], "default": "count"},
+    "size": {"type": ["integer", "float"], "min": 0},
+    "aggregations": {
+        "type": "list",
+        "schema": {"type": "string", "allowed": ["mean", "min", "max", "std", "last"]},
+    },
+    # anomaly 전용(§7.4)
+    "detector": {"type": "string", "allowed": ["isolation_forest", "mad"]},
+    "anomaly_mode": {"type": "string", "allowed": ["tag", "escalate", "suppress"]},
+    "window": {"type": "integer", "min": 8},
+    "retrain_every": {"type": "integer", "min": 1},
+    "contamination": {"type": "float", "min": 0.001, "max": 0.5},
+    "min_samples": {"type": "integer", "min": 1},
+    "threshold": {"type": "float", "min": 0.1},
+}
+
+COMMAND_SAFETY_SCHEMA: dict[str, Any] = {
+    "rate_limit_hz": {"type": "float", "min": 0.0},
+    "clamp": {
+        "type": "dict",
+        "keysrules": {"type": "string"},
+        "valuesrules": {
+            "type": "list",
+            "items": [{"type": ["integer", "float"]}, {"type": ["integer", "float"]}],
+        },
+    },
+    "watchdog_ms": {"type": "integer", "min": 0},
+    "max_age_ms": {"type": "integer", "min": 0},  # 수신 신선도 게이트
+    "liveliness_lease_ms": {"type": "integer", "min": 1},  # 로봇 측 IPE 사망 감지
+}
+
+ACCESS_SCHEMA: dict[str, Any] = {
+    "enabled": {"type": "boolean"},
+    "confirm": {
+        "type": "string",
+        "allowed": ["auto", "required", "on_first_use"],
+    },
+}
+
+SOURCE_TS_SCHEMA: dict[str, Any] = {
+    "field": {"type": "string", "empty": False},  # 메시지 내 점 표기 경로
+    "format": {"type": "string", "empty": False},  # 레지스트리 이름; 어댑터가 별칭 추가 가능
+}
+
+_QOS_FIELD = {"type": ["string", "dict"], "schema": QOS_INLINE_SCHEMA}
+
+TOPIC_ITEM_SCHEMA: dict[str, Any] = {
+    "name": {"type": "string", "empty": False},
+    "match": {"type": "string", "empty": False},
+    "type": {"type": "string"},  # 선택적 타입 고정; 로드 프로브 대상
+    "direction": {"type": "string", "allowed": ["observe", "command", "both"]},
+    "representation": {
+        "type": "string",
+        "allowed": ["historical", "latest", "both", "sampled"],
+    },
+    "qos": _QOS_FIELD,
+    "sample": {"type": "dict", "schema": SAMPLE_SCHEMA},
+    "filter": {"type": "dict", "schema": FILTER_SCHEMA},
+    "selected_fields": {"type": "list", "schema": {"type": "string"}},
+    "stale_after_ms": {"type": "integer", "min": 0},  # 신선도 워치독
+    "source_ts": {"type": "dict", "schema": SOURCE_TS_SCHEMA},
+    "role": {"type": "string"},
+    "group": {"type": "string"},
+    "alias": {"type": "string"},
+    "alias_template": {"type": "string"},
+    "path": {"type": "string"},  # {capture} 포함 가능
+    "command": {"type": "dict", "schema": COMMAND_SAFETY_SCHEMA},
+    "access": {"type": "dict", "schema": ACCESS_SCHEMA},
+    "robot": {"type": "string"},  # 명시적 robot 오버라이드
+    # FCNT 매핑 선언 — representation latest/both에서만 (loader 교차검증)
+    "flexcontainer": {
+        "type": "dict",
+        "schema": {
+            "type": {"type": "string", "required": True, "empty": False},
+            "cnd": {"type": "string", "required": True, "empty": False},
+            "field_map": {
+                "type": "dict",
+                "required": True,
+                "minlength": 1,
+                "keysrules": {"type": "string"},
+                "valuesrules": {"type": "string"},
+            },
+        },
+    },
+}
+
+SERVICE_ITEM_SCHEMA: dict[str, Any] = {
+    "name": {"type": "string", "empty": False},
+    "match": {"type": "string", "empty": False},
+    "type": {"type": "string"},
+    "timeout_ms": {"type": "integer", "min": 0},
+    "qos": _QOS_FIELD,  # rclpy Client의 qos_profile
+    "request_fields": {"type": "list", "schema": {"type": "string"}},
+    "response_fields": {"type": "list", "schema": {"type": "string"}, "nullable": True},
+    "request_template": {"type": "dict"},
+    "alias": {"type": "string"},
+    "path": {"type": "string"},
+    "access": {"type": "dict", "schema": ACCESS_SCHEMA},
+    "robot": {"type": "string"},
+}
+
+ACTION_QOS_SCHEMA: dict[str, Any] = {ch: _QOS_FIELD for ch in ACTION_QOS_CHANNELS}
+
+ACTION_ITEM_SCHEMA: dict[str, Any] = {
+    "name": {"type": "string", "empty": False},
+    "match": {"type": "string", "empty": False},
+    "type": {"type": "string"},
+    "feedback": {
+        "type": "string",
+        "allowed": ["log", "latest", "sampled", "combined"],
+    },
+    "feedback_sample": {"type": "dict", "schema": SAMPLE_SCHEMA},
+    "goal_fields": {"type": "list", "schema": {"type": "string"}},
+    "feedback_fields": {"type": "list", "schema": {"type": "string"}},
+    "result_fields": {"type": "list", "schema": {"type": "string"}},
+    "goal_template": {"type": "dict"},
+    "timeout_ms": {"type": "integer", "min": 0},
+    "qos": {"type": "dict", "schema": ACTION_QOS_SCHEMA},
+    "alias": {"type": "string"},
+    "path": {"type": "string"},
+    "access": {"type": "dict", "schema": ACCESS_SCHEMA},
+    "robot": {"type": "string"},
+}
+
+_NOT_IN_DEFAULTS = (
+    "name",
+    "match",
+    "robot",
+    "path",
+    "alias",
+    "alias_template",
+    "direction",
+    "type",
+)
+
+
+def _defaults_fields(item_schema: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in item_schema.items() if k not in _NOT_IN_DEFAULTS}
+
+
+DEFAULTS_SCHEMA: dict[str, Any] = {
+    "topic_observe": {"type": "dict", "schema": _defaults_fields(TOPIC_ITEM_SCHEMA)},
+    "topic_command": {"type": "dict", "schema": _defaults_fields(TOPIC_ITEM_SCHEMA)},
+    "service": {"type": "dict", "schema": _defaults_fields(SERVICE_ITEM_SCHEMA)},
+    "action": {"type": "dict", "schema": _defaults_fields(ACTION_ITEM_SCHEMA)},
+}

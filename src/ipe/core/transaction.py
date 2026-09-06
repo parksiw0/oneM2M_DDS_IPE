@@ -8,7 +8,7 @@ actionStatusEvent 페이로드로 되돌아갈 수 있게 한다. timeout_ms=0�
 from __future__ import annotations
 
 from collections.abc import Collection
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ipe.core.vocab import (
     ACTION_STATES,
@@ -103,3 +103,20 @@ def _sweep(state: StatePersistence, kind: str, terminal: set[str] | frozenset[st
             state.update_transaction(t["corr_id"], "timeout", now)
             timed_out.append(t["corr_id"])
     return timed_out
+
+
+def termination_violation(timeout_ms: Any, refresh_sec: Any) -> bool:
+    return timeout_ms == 0 and not (refresh_sec and refresh_sec > 0)
+
+def termination_load_message(where: str, label: str) -> str:
+    return (
+        f"{where} '{label}': timeout_ms 0 (unbounded) requires "
+        f"discovery.refresh_sec > 0 — at least one termination mechanism "
+        f"must exist (§18.4 ⑧)."
+    )
+
+def termination_resolve_message(kind: str, interface: str) -> str:
+    return (
+        f"{kind} '{interface}': timeout_ms 0 requires discovery.refresh_sec "
+        f"> 0 — termination invariant (§18.4 ⑧)"
+    )

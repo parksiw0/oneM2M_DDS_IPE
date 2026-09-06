@@ -12,10 +12,10 @@ from collections.abc import Callable
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
-from ipe.config.spec import TopicSpec
 from ipe.core.common import TokenBucket
-from ipe.core.policy import Op, Pipeline
+from ipe.core.pipeline import Op, Pipeline
 from ipe.core.vocab import CLASS_OBSERVE_BULK, CLASS_TERMINAL
+from ipe.models import TopicSpec
 from ipe.onem2m.client import (
     OneM2MResponse,
     OversizeError,
