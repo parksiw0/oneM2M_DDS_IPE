@@ -41,9 +41,9 @@ class ServiceTransactionManager:
             return "duplicate"
         return "pending"
 
-    def set_state(self, corr_id: str, st: str, now: float) -> None:
+    def set_state(self, corr_id: str, st: str, now: float) -> bool:
         _check(st, SERVICE_STATES, "service")
-        self.state.update_transaction(corr_id, st, now)
+        return self.state.update_transaction(corr_id, st, now)
 
     def state_of(self, corr_id: str) -> str | None:
         t = self.state.get_transaction(corr_id)
@@ -69,9 +69,9 @@ class ActionTransactionManager:
             return "duplicate"
         return "goalPending"
 
-    def set_state(self, goal_id: str, st: str, now: float) -> None:
+    def set_state(self, goal_id: str, st: str, now: float) -> bool:
         _check(st, ACTION_STATES, "action")
-        self.state.update_transaction(goal_id, st, now)
+        return self.state.update_transaction(goal_id, st, now)
 
     def next_feedback_seq(self, goal_id: str, now: float) -> int:
         return self.state.next_seq(goal_id, now)
@@ -99,8 +99,8 @@ def _sweep(state: StatePersistence, kind: str, terminal: set[str] | frozenset[st
             timeout_ms = default_timeout_ms
         if timeout_ms == 0:   # 0 = IPE 측 타임아웃 없음 (설정 검증이 보장)
             continue
-        if (now - t["started"]) * 1000.0 >= timeout_ms:
-            state.update_transaction(t["corr_id"], "timeout", now)
+        if ((now - t["started"]) * 1000.0 >= timeout_ms
+                and state.update_transaction(t["corr_id"], "timeout", now)):
             timed_out.append(t["corr_id"])
     return timed_out
 

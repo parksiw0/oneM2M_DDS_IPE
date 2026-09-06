@@ -289,6 +289,9 @@ class BindingManager:
         self.outbound.emit_event("provisioningStatus", "info", {"event": event, **payload})
 
     def absorb_provision(self, result: Any) -> None:
+        if not result.ok:
+            self.finish_staging()
+            raise RuntimeError(f"provisioning failed; active routes retained: {result.errors}")
         # 새 generation의 경로 사전을 먼저 완성한 뒤 참조를 교체한다. Pipeline도
         # 같은 사전을 보게 해 clear/update 중간 상태가 노출되지 않게 한다.
         self.registry.path_map = dict(result.path_map)

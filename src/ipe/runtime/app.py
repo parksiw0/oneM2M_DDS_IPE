@@ -96,6 +96,18 @@ class IPEApp:
         self._shutdown = threading.Event()
 
     def run(self) -> int:
+        try:
+            return self._run()
+        except (Exception, KeyboardInterrupt) as exc:
+            with suppress(Exception):
+                self.lifecycle.set(
+                    IPEState.NOT_READY, self.lifecycle_phase,
+                    health=IPEHealth.FAILED, detail=str(exc),
+                )
+            log.exception("IPE startup or execution failed")
+            return self._abort_bootstrap()
+
+    def _run(self) -> int:
         """Start transport, discover the ROS graph, and run the bridge lifecycle."""
         rc = self.registry.rc
         target = self.poa if self.protocol == "mqtt" else rc.cse.endpoint
@@ -287,27 +299,34 @@ class IPEApp:
         self.bindings.attach_adapter(self.adapter)
 
     def _abort_bootstrap(self, code: int = 2) -> int:
-        self.bindings.finish_staging()
-        self.inbound.close()
-        server = getattr(self, "server", None)
-        if server is not None:
-            server.stop()
-        if self.adapter is not None:
-            with suppress(Exception):
-                self.adapter.shutdown()
-        if self.executor is not None:
-            with suppress(Exception):
-                self.executor.shutdown()
-        if self.node is not None:
-            with suppress(Exception):
-                self.node.destroy_node()
+        # Stop every producer/worker before releasing ROS, clients, or the DB.
+        steps = [self.bindings.finish_staging]
+        if self.server is not None:
+            steps.append(self.server.stop)
+        steps.extend([
+            self.bindings.request_stop, self.bindings.join, self.inbound.close,
+            self.outbound.request_stop, self.outbound.join, self.outbound.persist_pending,
+        ])
+        for resource, method in (
+            (self.adapter, "shutdown"), (self.executor, "shutdown"),
+            (self.node, "destroy_node"),
+        ):
+            if resource is not None:
+                steps.append(getattr(resource, method))
+        for step in steps:
+            try:
+                step()
+            except Exception:
+                log.exception("startup cleanup step failed (continuing)")
         with suppress(Exception):
             import rclpy
 
             if rclpy.ok():
                 rclpy.shutdown()
-        self._stop_clients()
-        self.state.close()
+        try:
+            self._stop_clients()
+        finally:
+            self.state.close()
         return code
 
     def _make_listener(self) -> Any:
@@ -335,8 +354,10 @@ class IPEApp:
     def _stop_clients(self) -> None:
         clients = [*getattr(self, "worker_clients", []), getattr(self, "prov_client", None)]
         for c in {id(c): c for c in clients if c is not None}.values():
-            if c is not None:
+            try:
                 c.stop()
+            except Exception:
+                log.exception("transport cleanup failed (continuing)")
 
     def _tick_1s(self) -> None:
         self.status.tick()

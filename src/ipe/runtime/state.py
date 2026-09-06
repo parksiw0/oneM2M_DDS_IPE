@@ -395,21 +395,22 @@ class StatePersistence:
         except self._integrity_errors:
             return False
 
-    def update_transaction(self, corr_id: str, state: str, ts: float) -> None:
-        """트랜잭션 상태 설정. 해당 kind 어휘에 속한 상태만 허용."""
+    def update_transaction(self, corr_id: str, state: str, ts: float) -> bool:
+        """Transition an active transaction; terminal rows are immutable."""
         with self._tx() as conn:
             row = conn.execute(
                 "SELECT kind FROM transactions WHERE corr_id=?", (corr_id,)
             ).fetchone()
             if row is None:
-                return
+                return False
             allowed = TRANSACTION_KINDS[row[0]]
             if state not in allowed:
                 raise ValueError(f"state {state!r} not allowed for kind {row[0]!r}")
-            conn.execute(
-                "UPDATE transactions SET state=?, updated=? WHERE corr_id=?",
+            cur = conn.execute(
+                f"UPDATE transactions SET state=?, updated=? WHERE corr_id=? AND ({_ACTIVE_TX_WHERE})",
                 (state, ts, corr_id),
             )
+            return int(cur.rowcount) == 1
 
     def next_seq(self, corr_id: str, ts: float) -> int:
         with self._tx() as conn:
@@ -456,10 +457,12 @@ class StatePersistence:
             ).fetchall()
             swept = []
             for r in rows:
-                conn.execute(
-                    "UPDATE transactions SET state='timeout', updated=? WHERE corr_id=?",
+                cur = conn.execute(
+                    f"UPDATE transactions SET state='timeout', updated=? WHERE corr_id=? AND ({_ACTIVE_TX_WHERE})",
                     (now, r[0]),
                 )
+                if cur.rowcount != 1:
+                    continue
                 d = _tx_row(r)
                 d["state"] = "timeout"
                 d["updated"] = now

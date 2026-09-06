@@ -92,13 +92,20 @@ class InboundProcessor:
     def sweep_timeouts(self) -> None:
         now = time.time()
         for corr in self.svc_tx.sweep_timeouts(now):
+            self._finish_timed_out(corr, now)
             self.outbound.emit_event(
                 "serviceStatus", "warning", {"event": "timeout", "requestId": corr}
             )
         for corr in self.act_tx.sweep_timeouts(now):
+            self._finish_timed_out(corr, now)
             self.outbound.emit_event(
                 "actionStatus", "warning", {"event": "timeout", "goalId": corr}
             )
+
+    def _finish_timed_out(self, corr: str, now: float) -> None:
+        for (robot, iface), requests in list(self._inflight.items()):
+            if corr in requests:
+                self._finish(robot, iface, corr, "failed", now)
 
     def shutdown(self, spin_once: Callable[[float], None]) -> None:
         now = time.time()
@@ -526,11 +533,13 @@ class InboundProcessor:
             # executor Task 컨텍스트: 상태 기록 + enqueue만 허용
             t = time.time()
             if err is not None:
-                self.svc_tx.set_state(_corr, "failed", t)
+                if not self.svc_tx.set_state(_corr, "failed", t):
+                    return
                 self._service_event(_ev, _corr, "failed", err)
                 self._finish(_ev.robot_id, _ev.interface, _corr, "failed", t)
                 return
-            self.svc_tx.set_state(_corr, "responded", t)
+            if not self.svc_tx.set_state(_corr, "responded", t):
+                return
             resp_path = self.registry.path_map.get((_ev.robot_id, _ev.interface, "response"))
             if resp_path:
                 if spec.response_fields:
@@ -611,15 +620,17 @@ class InboundProcessor:
 
         def on_goal_response(goal_id: str, accepted: bool) -> None:
             t = time.time()
+            if not self.act_tx.set_state(goal_id, "goalAccepted" if accepted else "goalRejected", t):
+                return
             if accepted:
-                self.act_tx.set_state(goal_id, "goalAccepted", t)
                 self._action_event(ev, goal_id, 2, None, "accepted")
             else:
-                self.act_tx.set_state(goal_id, "goalRejected", t)
                 self._action_event(ev, goal_id, 0, "goalRejected", "")
                 self._finish(ev.robot_id, ev.interface, goal_id, "rejected", t)
 
         def on_feedback(goal_id: str, fb: dict[str, Any]) -> None:
+            if goal_id not in self._inflight.get((ev.robot_id, ev.interface), ()):
+                return
             if spec.feedback != "log" and fb_interval:
                 now_m = time.monotonic()
                 if now_m - fb_last["t"] < fb_interval:
@@ -645,7 +656,8 @@ class InboundProcessor:
 
         def on_result(goal_id: str, status_int: int, result: dict[str, Any]) -> None:
             t = time.time()
-            self.act_tx.set_state(goal_id, "resultReceived", t)
+            if not self.act_tx.set_state(goal_id, "resultReceived", t):
+                return
             reason = GOAL_STATUS_TO_REASON.get(status_int, "failed")
             path = self.registry.path_map.get((ev.robot_id, ev.interface, "result"))
             if path:
@@ -998,7 +1010,11 @@ class InboundProcessor:
         )
 
     def _finish(self, robot: str, iface: str, corr: str, terminal: str, ts: float) -> bool:
-        self._inflight.get((robot, iface), set()).discard(corr)
+        requests = self._inflight.get((robot, iface))
+        if requests is not None:
+            requests.discard(corr)
+            if not requests:
+                self._inflight.pop((robot, iface), None)
         return bool(self.state.finish(robot, iface, corr, terminal, ts))
 
     @staticmethod
