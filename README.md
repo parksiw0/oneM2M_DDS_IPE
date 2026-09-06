@@ -72,10 +72,16 @@ LIFESPAN은 IPE 수신 시각을 기준으로 CIN 만료 시각에 매핑합니�
 
 ```bash
 source /opt/ros/humble/setup.bash
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
 python3 -m pip install --upgrade "pip>=24"
 python3 -m pip install -e .
 python3 main.py
 ```
+
+가상환경 생성에 필요한 시스템 패키지는 `python3-venv`입니다. 이미 생성한 `.venv`는
+활성화해서 재사용합니다. TurtleBot3 인터페이스 전체를 연결하려면 PC에도
+`ros-humble-turtlebot3-msgs`가 필요하며, `discovery.domain_id`는 로봇과 같아야 합니다.
 
 Docker는 `USE_DOCKER = True`, MQTT 의존성은 `python3 -m pip install -e ".[mqtt]"`로 설정합니다.
 

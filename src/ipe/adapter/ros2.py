@@ -282,8 +282,12 @@ class GenericROS2Adapter:
                     continue
         except Exception:
             pass
-        services = [(name, types) for name, types in services
-                    if name not in own_services or name in remote_services]
+        if hasattr(self.node, "get_service_names_and_types_by_node"):
+            # The graph-wide list also includes clients. Our own client must
+            # not keep a disappeared remote server in the discovery plan.
+            services = [(name, types) for name, types in services if name in remote_services]
+        else:
+            services = [(name, types) for name, types in services if name not in own_services]
         try:
             actions = get_action_names_and_types(self.node)
         except Exception:

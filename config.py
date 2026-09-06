@@ -62,7 +62,7 @@ CONFIG = {
     "robots_strict": False,
     "discovery": {
         "mode": "auto-expose",
-        "domain_id": 0,                              # 네이티브/Docker 공통 ROS_DOMAIN_ID
+        "domain_id": 30,                             # 현재 TurtleBot3와 동일한 ROS_DOMAIN_ID
         "ros_peer": "",                             # Cyclone DDS peer IP, 빈 값은 자동 발견
         "rmw_implementation": "",                   # 빈 값은 endpoint vendor에서 자동 선택
         "allow": ["/**"],
