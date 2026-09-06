@@ -182,8 +182,9 @@ class Provisioner:
     def _provision_observe(self, res: ProvisionResult, ae: str, t: Any) -> None:
         base = self._branch_root(ae, t.robot_id, "topics/observe")
         rep = t.representation
-        history_mni = t.qos_for("observe").depth \
-            if t.qos_for("observe").history == "KEEP_LAST" else None
+        from ipe.qos.history import container_attrs
+        history_mni = container_attrs(t.qos_for("observe"),
+            self.rc.policy.get("history_keep_all_limit", 1000))["mni"]
         if rep in ("latest",):
             if t.flexcontainer and self._try_fcnt_leaf(res, base, t):
                 # FCNT 표현 토픽도 qos가 붙는다(T2: FCNT 자식 허용) — 3.5절 #2 해소

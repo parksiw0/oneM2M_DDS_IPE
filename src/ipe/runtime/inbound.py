@@ -20,7 +20,7 @@ from ipe.models import ActionSpec, ServiceSpec, TopicSpec
 from ipe.onem2m.catchup import CatchUpSweeper
 from ipe.onem2m.notification import Notification
 from ipe.onem2m.resource_ops import ResourceOps
-from ipe.qos.requests import parse_cf_update, policy_changes_to_cf
+from ipe.qos.requests import fields_in_update, parse_cf_update, policy_changes_to_cf
 from ipe.runtime.dispatcher import InboundEvent
 from ipe.runtime.queues import InboundQueue
 from ipe.runtime.state import StatePersistence
@@ -741,6 +741,7 @@ class InboundProcessor:
         key: tuple[str, str],
         direction: str,
         candidate: Any,
+        explicit_fields: frozenset[str] | None = None,
     ) -> tuple[bool, str, list[str]]:
         """Validate, rebind, persist, and publish one topic-direction QoS change."""
         from ipe.qos.configuration import command_qos_violation
@@ -752,18 +753,18 @@ class InboundProcessor:
             )
             if violation:
                 return False, f"command qos violation: {violation} (§8.5)", []
-        ok, reasons = self.adapter.check_candidate(key, candidate, direction)
+        ok, reasons = self.adapter.check_candidate(key, candidate, direction, explicit_fields=explicit_fields)
         if not ok:
             return False, f"predicted incompatible: {'; '.join(reasons)}", reasons
         rebind = getattr(self.adapter, "rebind_direction", None)
         rebound = (
-            rebind(key, candidate, direction)
+            rebind(key, candidate, direction, explicit_fields=explicit_fields)
             if rebind is not None
             else self.adapter.rebind_interface(key, candidate)
         )
         if not rebound:
             return False, "rebind failed and the previous endpoint was restored", reasons
-        self._persist_qos_override(key[0], key[1], direction, candidate)
+        self._persist_qos_override(key[0], key[1], direction, candidate, spec.qos_explicit_fields)
         cache_key = (key[0], key[1], direction)
         self.status.invalidate_qos(cache_key)
         self.status.publish_qos(only_key=key)
@@ -775,9 +776,10 @@ class InboundProcessor:
         interface: str,
         direction: str,
         qos: Any,
+        explicit_fields: frozenset[str] = frozenset(),
     ) -> None:
         saved = self.state.get_kv("qos_overrides", {})
-        saved[f"{robot}|{direction}|{interface}"] = dict(qos.__dict__)
+        saved[f"{robot}|{direction}|{interface}"] = {**qos.__dict__, "_explicit_fields": sorted(explicit_fields)}
         self.state.set_kv("qos_overrides", saved)
 
     def apply_saved_qos_overrides(self, rc: Any) -> None:
@@ -795,7 +797,11 @@ class InboundProcessor:
                 if not isinstance(value, dict):
                     continue
                 try:
-                    spec.set_qos_for(direction, QoSSpec(**value))
+                    values = {key: item for key, item in value.items() if key != "_explicit_fields"}
+                    spec.set_qos_for(direction, QoSSpec(**values))
+                    if direction == "observe":
+                        spec.qos_explicit_fields |= frozenset(value.get("_explicit_fields", set(values) - {"profile"}))
+                        spec.qos_explicit = bool(spec.qos_explicit_fields)
                 except (TypeError, ValueError) as exc:
                     log.warning(
                         "ignored invalid saved QoS override for %s: %s", spec.interface, exc
@@ -839,7 +845,7 @@ class InboundProcessor:
             # 에코 가드: 자기 총함수 게시(또는 무변경 UPDATE)의 NOTIFY
             self._finish(ev.robot_id, ev.interface, corr, "succeeded", now)
             return
-        ok, why, reasons = self._apply_qos_candidate(spec, key, direction, candidate)
+        ok, why, reasons = self._apply_qos_candidate(spec, key, direction, candidate, fields_in_update(payload))
         if not ok:
             _reject(why)
             return
@@ -933,7 +939,10 @@ class InboundProcessor:
         if candidate is None:
             reject(why, robot=robot, interface=interface)
             return
-        if candidate == spec.qos_for(direction):
+        requested_fields = fields_in_update(translated)
+        if candidate == spec.qos_for(direction) and (
+            direction != "observe" or requested_fields <= spec.qos_explicit_fields
+        ):
             self.outbound.emit_event(
                 "qosStatus",
                 "info",
@@ -952,6 +961,7 @@ class InboundProcessor:
             (robot, interface),
             direction,
             candidate,
+            requested_fields,
         )
         if not ok:
             reject(why, robot=robot, interface=interface)

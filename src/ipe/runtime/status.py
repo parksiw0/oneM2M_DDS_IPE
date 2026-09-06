@@ -27,6 +27,7 @@ class StatusPublisher:
         self._qos_fcnt_revision: dict[tuple[str, str, str], int] = {}
         self._qos_resource_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._qos_republish = threading.Event()
+        self._qos_pending: set[tuple[str, str, str]] = set()
 
     def attach_adapter(self, adapter: Any) -> None:
         self.adapter = adapter
@@ -39,12 +40,19 @@ class StatusPublisher:
         self._qos_fcnt_cache.pop(key, None)
         self._qos_fcnt_last_pub.pop(key, None)
         self._qos_resource_cache.pop((key[0], key[1], "history"), None)
+        self._qos_pending.discard(key)
 
     def revision(self, key: tuple[str, str, str]) -> int:
         return self._qos_fcnt_revision.get(key, 0)
 
     def tick(self) -> None:
         self.adapter.tick()
+        now = time.monotonic()
+        interval = self.registry.rc.qos_fcnt.publish_min_interval_ms / 1000.0
+        due = {(robot, iface) for robot, iface, direction in self._qos_pending
+               if now - self._qos_fcnt_last_pub.get((robot, iface, direction), 0) >= interval}
+        for key in due:
+            self.publish_qos(only_key=key)
         for key in self.adapter.pop_qos_dirty():
             self.adapter.refresh_qos(key)
             self.publish_qos(only_key=key)
@@ -86,20 +94,20 @@ class StatusPublisher:
         applied: Any,
     ) -> None:
         """Apply Category A attributes without treating the management FCNT as enforcement."""
-        if direction != "observe" or applied.history != "KEEP_LAST":
+        if direction != "observe":
             return
         path = self.registry.path_map.get((robot, iface, "history"))
         if path is None:
             return
-        attrs = {"mni": applied.depth}
+        from ipe.qos.history import container_attrs
+        attrs = container_attrs(applied, self.registry.rc.policy.get("history_keep_all_limit", 1000))
         key = (robot, iface, "history")
         if self._qos_resource_cache.get(key) == attrs:
             return
-        self._qos_resource_cache[key] = attrs
-        self.outbound.queue.put(
-            Op("update_cnt", path, attrs, robot, iface, "historyQos", CLASS_TERMINAL),
-            CLASS_TERMINAL,
+        self.outbound.put_terminal(
+            Op("update_cnt", path, attrs, robot, iface, "historyQos", CLASS_TERMINAL)
         )
+        self._qos_resource_cache[key] = attrs
 
     def publish_qos(self, only_key: tuple[str, str] | None = None) -> None:
         """qos FCNT 총함수 게시 (QoS_FCNT_설계서 §4.5.2).
@@ -113,7 +121,11 @@ class StatusPublisher:
         qf = self.registry.rc.qos_fcnt
         smode = self.registry.rc.policy.get("qos_strictness", "reject")
         now = time.monotonic()
-        for stt in self.adapter.qos_states():
+        states = self.adapter.qos_states()
+        self._qos_pending.intersection_update(
+            (stt["robot_id"], stt["interface"], stt["direction"]) for stt in states
+        )
+        for stt in states:
             robot, iface, direction = stt["robot_id"], stt["interface"], stt["direction"]
             if only_key is not None and (robot, iface) != only_key:
                 continue
@@ -147,7 +159,9 @@ class StatusPublisher:
                         CLASS_OBSERVE_BULK,
                     )
 
+            ckey = (robot, iface, direction)
             if not qf.enabled or fcnt_path is None or applied is None:
+                self._qos_pending.discard(ckey)
                 continue  # 비활성/lbl-only/미바인딩 — FCNT 게시 없음
             spec = self.registry.specs_by_key.get(
                 (direction, robot, iface)
@@ -174,7 +188,6 @@ class StatusPublisher:
                     else "ROS2_RMW"
                 ),
             )
-            ckey = (robot, iface, direction)
             previous = self._qos_fcnt_cache.get(ckey)
             previous_body = (
                 {key: value for key, value in previous.items() if key != "rev"}
@@ -182,16 +195,18 @@ class StatusPublisher:
                 else None
             )
             if previous_body == rec:
+                self._qos_pending.discard(ckey)
                 continue
             last = self._qos_fcnt_last_pub.get(ckey)
             if last is not None and now - last < qf.publish_min_interval_ms / 1000.0:
-                continue  # 캐시 미갱신 — 다음 트리거가 재시도한다
+                self._qos_pending.add(ckey)
+                continue  # tick retries even when the graph remains unchanged
             revision = self._qos_fcnt_revision.get(ckey, 0) + 1
-            self._qos_fcnt_revision[ckey] = revision
             rec["rev"] = revision
+            self.outbound.put_terminal(
+                Op("update_fcnt", fcnt_path, {qf.type: rec}, robot, iface, view, CLASS_TERMINAL)
+            )
+            self._qos_fcnt_revision[ckey] = revision
             self._qos_fcnt_cache[ckey] = rec
             self._qos_fcnt_last_pub[ckey] = now
-            self.outbound.queue.put(
-                Op("update_fcnt", fcnt_path, {qf.type: rec}, robot, iface, view, CLASS_TERMINAL),
-                CLASS_TERMINAL,
-            )
+            self._qos_pending.discard(ckey)

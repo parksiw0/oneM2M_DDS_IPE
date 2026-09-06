@@ -24,7 +24,7 @@ from typing import Any
 from ipe.adapter.messages import TranscodeError, extract_source_ts, from_canonical, parse_message
 from ipe.adapter.qos import build_qos_profile, check_compatible
 from ipe.ir import TopicIR
-from ipe.models import ACTION_QOS_CHANNELS, ActionSpec, QoSSpec, ServiceSpec, TopicSpec
+from ipe.models import ACTION_QOS_CHANNELS, ActionSpec, ServiceSpec, TopicSpec
 from ipe.qos import engine as qosmod
 from ipe.qos.codec import endpoint_to_peer
 from ipe.qos.configuration import command_qos_violation
@@ -463,7 +463,7 @@ class GenericROS2Adapter:
         return True
 
     def check_candidate(self, key: tuple[str, str], candidate: Any,
-                        direction: str) -> tuple[bool, list[str]]:
+                        direction: str, explicit_fields: frozenset[str] | None = None) -> tuple[bool, list[str]]:
         """qos_update 후보의 예측 판정(§4.5.3-3) — reconcile+guard 재실행 후
         check_compatible. (False, 이유)=거부, (True, 이유)=수락(+경고)."""
         iface = key[1]
@@ -471,11 +471,10 @@ class GenericROS2Adapter:
             offered = [i.qos_profile for i in self._remote_endpoint_infos(
                 self.node.get_publishers_info_by_topic(iface)
             )]
-            resolved, _ = qosmod.reconcile_observe(offered, candidate,
-                                                   has_explicit=True,
-                                                   explicit_fields=frozenset(
-                                                       QoSSpec.__dataclass_fields__
-                                                   ) - {"profile"})
+            state = self.observes.get(key)
+            fields = self._candidate_fields(state.spec if state else None, candidate, explicit_fields)
+            resolved, _ = qosmod.reconcile_observe(
+                offered, candidate, has_explicit=bool(fields), explicit_fields=fields)
             guarded, strict = qosmod.strictness_guard(resolved, offered,
                                                       self.qos_strictness)
             if strict and self.qos_strictness == "reject":
@@ -501,20 +500,25 @@ class GenericROS2Adapter:
         return True, list(dict.fromkeys(warnings))
 
     def rebind_direction(self, key: tuple[str, str], new_qos: Any,
-                         direction: str) -> bool:
+                         direction: str, explicit_fields: frozenset[str] | None = None) -> bool:
         """Rebind only the endpoint direction whose configured QoS changed."""
         if direction == "observe":
             ost = self.observes.get(key)
             if ost is None:
                 return False
             old_qos = ost.spec.qos_for("observe")
+            old_explicit, old_fields = ost.spec.qos_explicit, ost.spec.qos_explicit_fields
+            fields = self._candidate_fields(ost.spec, new_qos, explicit_fields)
             ost.spec.set_qos_for("observe", new_qos)
+            ost.spec.qos_explicit = bool(fields)
+            ost.spec.qos_explicit_fields = fields
             seq = ost.seq
             self.unbind_observe(key)
             if self.bind_observe(ost.spec):
                 self.observes[key].seq = seq
                 return True
             ost.spec.set_qos_for("observe", old_qos)
+            ost.spec.qos_explicit, ost.spec.qos_explicit_fields = old_explicit, old_fields
             if self.bind_observe(ost.spec):
                 self.observes[key].seq = seq
             return False
@@ -530,6 +534,15 @@ class GenericROS2Adapter:
         self.bind_command(cst.spec)
         return False
 
+    @staticmethod
+    def _candidate_fields(spec, candidate, explicit_fields=None):
+        if spec is None:
+            return frozenset(candidate.__dataclass_fields__) - {"profile"}
+        fields = explicit_fields
+        if fields is None:
+            fields = frozenset(field for field in candidate.__dataclass_fields__
+                               if field != "profile" and getattr(candidate, field) != getattr(spec.qos_for("observe"), field))
+        return spec.qos_explicit_fields | fields
 
     def rebind_interface(self, key: tuple[str, str], new_qos: Any) -> bool:
         """Rebind every existing direction for legacy callers."""
