@@ -15,6 +15,7 @@ from ipe.onem2m.resource_ops import ResourceOps
 from ipe.runtime.dispatcher import InboundEvent, Route, RouteTable
 from ipe.runtime.lifecycle import IPEHealth, IPEPhase, IPEState, Lifecycle
 from ipe.runtime.provisioning import Provisioner
+from ipe.runtime.queues import ProvisioningQueue
 
 if TYPE_CHECKING:
     from ipe.runtime.inbound import InboundProcessor
@@ -139,7 +140,7 @@ class BindingManager:
         self.outbound = outbound
         self.status = status
         self.adapter: Any = None
-        self._jobs: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self._jobs = ProvisioningQueue()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._avail: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -174,6 +175,7 @@ class BindingManager:
             "aei": self.registry.aei,
             "bound": {f"{k[0]}:{k[1]}:{k[2]}": True for k in self.registry.specs_by_key},
             "routes": len(self.registry.routes),
+            "pending_jobs": self._jobs.qsize(),
             "availability": {f"{k[1]}:{k[2]}": v["state"] for k, v in self._avail.items()},
             "deferred_type_support": sorted(
                 self._deferred_type_support.values(),
@@ -535,6 +537,11 @@ class BindingManager:
                     self._reconcile_discovery(arg)
                 elif job == "remove_interfaces":
                     self._remove_interfaces(arg)
+                elif job == "cleanup":
+                    counts = self.inbound.state.cleanup(
+                        time.time(), self.registry.rc.recovery.get("dedup_retention_days", 7)
+                    )
+                    log.info("expired state rows removed: %s", counts)
             except Exception:
                 self.finish_staging()
                 log.exception("provisioning job %s failed", job)

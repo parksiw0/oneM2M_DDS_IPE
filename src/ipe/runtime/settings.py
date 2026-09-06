@@ -518,6 +518,7 @@ CONFIG_SCHEMA: dict[str, Any] = {
             "reconcile_sec": {"type": ["integer", "float"], "min": 0, "default": 0},
             "cancel_orphan_goals": {"type": "boolean", "default": False},
             "dedup_retention_days": {"type": "integer", "min": 0, "default": 7},
+            "cleanup_interval_sec": {"type": ["integer", "float"], "min": 1, "default": 3600},
         },
         "default": {},
     },

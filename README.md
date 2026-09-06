@@ -37,8 +37,9 @@ src/ipe/
 
 `runtime/app.py`가 실행을 조립하고, `inbound.py`는 요청 처리, `outbound.py`는 데이터 송신·재시도,
 `bindings.py`는 자동 발견·연결 변경, `status.py`는 QoS 상태 게시를 담당합니다.
-실패한 프로비저닝 결과는 기존 경로에 적용하지 않으며, 종료된 서비스·액션 요청은
-늦은 응답으로 다시 변경하지 않습니다.
+복구 작업은 종류별로 병합하고, 실패한 프로비저닝 결과는 기존 경로에 적용하지 않습니다.
+종료된 서비스·액션 요청은 늦은 응답으로 다시 변경하지 않습니다. 상태 DB의 종료 기록은
+`recovery.dedup_retention_days`에 따라 `cleanup_interval_sec` 간격으로 정리합니다.
 
 `qos/`는 `core/`와 같은 단계에 있습니다. `reliability.py`, `durability.py`, `history.py`,
 `deadline.py`, `lifespan.py`, `liveliness.py`가 정책별 판단과 매핑을 맡습니다.

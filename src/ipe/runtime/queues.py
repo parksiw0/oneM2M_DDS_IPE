@@ -23,6 +23,38 @@ from ipe.core.vocab import (  # 정본은 vocab — 재export(기존 import 경�
 )
 
 
+class ProvisioningQueue:
+    """Keep one pending job per kind; newer graph snapshots replace older ones."""
+
+    KINDS = frozenset({"recover", "reconcile", "catchup", "reconcile_discovery", "remove_interfaces", "cleanup"})
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._pending: OrderedDict[str, Any] = OrderedDict()
+
+    def put(self, item: tuple[str, Any]) -> None:
+        job, arg = item
+        if job not in self.KINDS:
+            raise ValueError(f"unknown provisioning job: {job!r}")
+        with self._condition:
+            if job == "remove_interfaces":
+                merged = dict(self._pending.get(job, []))
+                merged.update(arg)
+                arg = list(merged.items())
+            self._pending[job] = arg
+            self._condition.notify()
+
+    def get(self, timeout: float | None = None) -> tuple[str, Any]:
+        with self._condition:
+            if not self._condition.wait_for(lambda: bool(self._pending), timeout):
+                raise Empty
+            return self._pending.popitem(last=False)
+
+    def qsize(self) -> int:
+        with self._condition:
+            return len(self._pending)
+
+
 class InboundQueue:
     """유한 2레인 인바운드 큐 (control 레인을 normal보다 먼저 드레인)."""
 

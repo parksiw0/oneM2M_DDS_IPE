@@ -100,6 +100,7 @@ CONFIG = {
         "catch_up_sec": 0,                          # 0: 주기적 catch-up 비활성화
         "reconcile_sec": 0,                         # 0: 주기적 CSE reconcile 비활성화
         "dedup_retention_days": 7,
+        "cleanup_interval_sec": 3600,
     },
     "dispatch": {"drain_budget": 32},
     "policy": {

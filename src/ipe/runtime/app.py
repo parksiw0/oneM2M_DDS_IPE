@@ -236,6 +236,8 @@ class IPEApp:
         rcs = float(rc.recovery.get("reconcile_sec", 0) or 0)
         if rcs > 0:
             self.node.create_timer(rcs, lambda: self.bindings.request("reconcile"))
+        cleanup_interval = float(rc.recovery.get("cleanup_interval_sec", 3600))
+        self.node.create_timer(cleanup_interval, lambda: self.bindings.request("cleanup"))
 
         self.inbound.publish_contracts()
 
@@ -244,6 +246,7 @@ class IPEApp:
 
         self.inbound.boot_sweep()
         self.bindings.request("catchup", "boot")
+        self.bindings.request("cleanup")
 
         signal.signal(signal.SIGINT, lambda *_: self._shutdown.set())
         signal.signal(signal.SIGTERM, lambda *_: self._shutdown.set())
