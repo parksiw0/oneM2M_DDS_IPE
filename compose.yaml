@@ -1,0 +1,63 @@
+services:
+  mqtt:
+    # Optional broker for the design tool's Live Sync. The IPE still uses HTTP.
+    profiles: [live-sync]
+    image: eclipse-mosquitto:2
+    ports:
+      - "${DEMO_MQTT_BIND_IP:-127.0.0.1}:1883:1883"
+      - "${DEMO_MQTT_BIND_IP:-127.0.0.1}:9001:9001"
+    volumes:
+      - type: bind
+        source: ./deploy/mosquitto.conf
+        target: /mosquitto/config/mosquitto.conf
+        read_only: true
+        bind:
+          create_host_path: false
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  ipe:
+    build:
+      context: .
+    image: onem2m-dds-ipe:humble
+    # Docker Desktop >= 4.34: enable Settings > Resources > Network >
+    # Enable host networking. Robot DDS connectivity must be checked on the Mac.
+    network_mode: host
+    init: true
+    stop_grace_period: 60s
+    environment:
+      IPE_DEMO: ${IPE_DEMO:-0}
+      IPE_RUN_MODE: ${IPE_RUN_MODE:-run}
+      IPE_CSE_ENDPOINT: ${IPE_CSE_ENDPOINT:-http://127.0.0.1:3000}
+      IPE_CSE_POA: ${IPE_CSE_POA:-http://127.0.0.1:5050}
+      IPE_ROS_DOMAIN_ID: ${IPE_ROS_DOMAIN_ID:-30}
+      IPE_RMW_IMPLEMENTATION: ${IPE_RMW_IMPLEMENTATION:-}
+      IPE_ROS_PEER: ${IPE_ROS_PEER:-}
+      IPE_GRAPH_TIMEOUT_SEC: ${IPE_GRAPH_TIMEOUT_SEC:-30}
+      ROS_LOCALHOST_ONLY: "0"
+    volumes:
+      - ipe-state:/var/lib/ipe
+      - ./artifacts:/artifacts
+      - type: bind
+        source: ./config.py
+        target: /opt/ipe/base_config.py
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./deploy/compose_config.py
+        target: /etc/ipe/config.py
+        read_only: true
+        bind:
+          create_host_path: false
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  ipe-state:

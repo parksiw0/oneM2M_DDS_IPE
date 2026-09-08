@@ -2,7 +2,8 @@
 
 ROS 2의 토픽·서비스·액션을 자동 발견하고 oneM2M CSE와 연결하는 브리지입니다.
 
-**모든 실행 파라미터는 [config.py](config.py)에서 설정합니다.**
+**기본 실행 파라미터와 매핑 정책은 [config.py](config.py)에서 설정합니다.**
+Compose의 접속 주소와 데모 모드는 [.env.example](.env.example)을 복사한 `.env`에서 설정합니다.
 
 ## 사용 기술
 
@@ -89,6 +90,21 @@ python3 main.py
 `ros-humble-turtlebot3-msgs`가 필요하며, `discovery.domain_id`는 로봇과 같아야 합니다.
 
 Docker는 `USE_DOCKER = True`, MQTT 의존성은 `python3 -m pip install -e ".[mqtt]"`로 설정합니다.
+
+맥북에서 Compose로 실행하는 경우에는 [Docker Compose 실행 가이드](DOCKER_COMPOSE.md)를
+따릅니다. Docker Desktop의 host networking을 켜고 `.env`에 CSE 접속 주소와 알림
+수신 주소를 설정한 뒤 실행합니다. Compose는 IPE 내부 상태를 별도 SQLite 볼륨에
+저장하며, TinyIoT와 디자인 툴은 별도로 실행합니다.
+그래프 확인부터 양방향 로봇 제어까지의 시연 순서는 [TurtleBot 데모 가이드](demo/README.md)에 있습니다.
+
+```bash
+cp .env.example .env
+# .env의 접속 주소 설정 후, 로봇 bringup과 TinyIoT를 실행합니다.
+docker compose up --build
+```
+
+실로봇 DDS 연결은 맥북에서 사전 확인이 필요합니다. 기존 `python3 main.py`의
+네이티브/Docker 실행 방식과 `config.py`의 매핑 설정도 계속 사용할 수 있습니다.
 
 ## 검증
 

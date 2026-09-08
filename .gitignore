@@ -64,3 +64,5 @@ tools/
 *.db-shm
 *.db-wal
 .ipe-postgres-password
+.env
+artifacts/

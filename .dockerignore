@@ -16,3 +16,12 @@ dist/
 *.log
 tests/
 tools/
+.agents/
+.codex/
+.ipe-postgres-password
+.env
+.env.*
+logs/
+performance_results/
+performance_graphs/
+artifacts/
